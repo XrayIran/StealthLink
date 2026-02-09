@@ -1,0 +1,33 @@
+role: agent
+
+agent:
+  id: "agent-4b"
+  gateway_addr: "gateway.example.com:8443"
+
+transport:
+  type: uqsp
+  uqsp:
+    carrier:
+      type: rawtcp
+      rawtcp:
+        raw:
+          interface: "eth0"
+    obfuscation:
+      profile: adaptive
+      padding_min: 32
+      padding_max: 192
+      morphing_enabled: true
+    behaviors:
+      obfs4:
+        enabled: true
+        node_id: "replace-node-id"
+        public_key: "replace-public-key"
+        iat_mode: 1
+      awg:
+        enabled: true
+        junk_interval: 5s
+        junk_min_size: 64
+        junk_max_size: 1024
+
+security:
+  shared_key: "replace-with-secure-shared-key"

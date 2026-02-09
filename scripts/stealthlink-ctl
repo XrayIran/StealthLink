@@ -1,0 +1,1045 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#==============================================================================
+# StealthLink Service Control Script
+# Manages StealthLink gateway/client services
+#==============================================================================
+
+readonly SCRIPT_VERSION="1.0.0"
+readonly CONFIG_DIR="/opt/stealthlink"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+readonly BACKUP_DIR="${CONFIG_DIR}/backups"
+readonly BINARY_PATH="/usr/local/bin/stealthlink-gateway"
+readonly SERVICE_NAME="stealthlink"
+readonly GITHUB_REPO="stealthlink/stealthlink"
+
+#==============================================================================
+# Colors and Logging
+#==============================================================================
+
+if [[ -t 1 ]]; then
+    readonly COLOR_RESET='\033[0m'
+    readonly COLOR_RED='\033[0;31m'
+    readonly COLOR_GREEN='\033[0;32m'
+    readonly COLOR_YELLOW='\033[0;33m'
+    readonly COLOR_BLUE='\033[0;34m'
+    readonly COLOR_CYAN='\033[0;36m'
+    readonly COLOR_BOLD='\033[1m'
+else
+    readonly COLOR_RESET=''
+    readonly COLOR_RED=''
+    readonly COLOR_GREEN=''
+    readonly COLOR_YELLOW=''
+    readonly COLOR_BLUE=''
+    readonly COLOR_CYAN=''
+    readonly COLOR_BOLD=''
+fi
+
+log_info() {
+    echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*"
+}
+
+log_success() {
+    echo -e "${COLOR_GREEN}[SUCCESS]${COLOR_RESET} $*"
+}
+
+log_warn() {
+    echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"
+}
+
+log_error() {
+    echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2
+}
+
+#==============================================================================
+# Utility Functions
+#==============================================================================
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This command requires root privileges"
+        exit 1
+    fi
+}
+
+check_command() {
+    command -v "$1" &>/dev/null
+}
+
+get_service_manager() {
+    if check_command systemctl; then
+        echo "systemd"
+    elif check_command service; then
+        echo "sysvinit"
+    else
+        echo "unknown"
+    fi
+}
+
+is_service_active() {
+    local manager
+    manager=$(get_service_manager)
+
+    case "$manager" in
+        systemd)
+            systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null
+            ;;
+        sysvinit)
+            service "$SERVICE_NAME" status &>/dev/null
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+get_service_pid() {
+    if is_service_active; then
+        pgrep -f "stealthlink-gateway" | head -n1
+    fi
+}
+
+#==============================================================================
+# Network Detection
+#==============================================================================
+
+detect_network() {
+    local default_iface default_ip gateway_ip
+
+    # Detect default interface
+    if check_command ip; then
+        default_iface=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
+        default_ip=$(ip addr show "$default_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+        gateway_ip=$(ip route | grep '^default' | awk '{print $3}' | head -n1)
+    elif check_command ifconfig; then
+        default_iface=$(route -n | grep '^0.0.0.0' | awk '{print $8}' | head -n1)
+        default_ip=$(ifconfig "$default_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}')
+        gateway_ip=$(route -n | grep '^0.0.0.0' | awk '{print $2}' | head -n1)
+    fi
+
+    echo "Interface: ${default_iface:-unknown}"
+    echo "Local IP: ${default_ip:-unknown}"
+    echo "Gateway: ${gateway_ip:-unknown}"
+}
+
+#==============================================================================
+# Configuration Parsing
+#==============================================================================
+
+show_connection_info() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_warn "Config file not found: $CONFIG_FILE"
+        return 1
+    fi
+
+    echo -e "${COLOR_BOLD}Configuration:${COLOR_RESET}"
+
+    # Parse role
+    local role
+    role=$(grep -E '^\s*role:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+    echo "  Role: $role"
+
+    # Parse listen address
+    local listen_addr
+    listen_addr=$(grep -E '^\s*listen:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+    echo "  Listen: $listen_addr"
+
+    # Parse transport/carrier
+    local transport
+    transport=$(grep -E '^\s*carrier:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+    echo "  Carrier: $transport"
+
+    # Parse behaviors if any
+    local behaviors
+    behaviors=$(grep -A5 '^\s*behaviors:' "$CONFIG_FILE" | grep -E '^\s*-\s*' | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+    if [[ -n "$behaviors" ]]; then
+        echo "  Behaviors: $behaviors"
+    fi
+}
+
+#==============================================================================
+# Command Implementations
+#==============================================================================
+
+cmd_status() {
+    local manager pid cpu mem uptime state
+    manager=$(get_service_manager)
+
+    echo -e "${COLOR_BOLD}StealthLink Service Status${COLOR_RESET}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Service state
+    case "$manager" in
+        systemd)
+            state=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "inactive")
+            echo -e "Service: ${COLOR_CYAN}$state${COLOR_RESET}"
+            ;;
+        sysvinit)
+            if service "$SERVICE_NAME" status &>/dev/null; then
+                echo -e "Service: ${COLOR_GREEN}active${COLOR_RESET}"
+            else
+                echo -e "Service: ${COLOR_RED}inactive${COLOR_RESET}"
+            fi
+            ;;
+    esac
+
+    # PID and resource usage
+    pid=$(get_service_pid)
+    if [[ -n "$pid" ]]; then
+        echo "PID: $pid"
+
+        if check_command ps; then
+            cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | xargs)
+            mem=$(ps -p "$pid" -o %mem= 2>/dev/null | xargs)
+            uptime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs)
+            echo "CPU: ${cpu}%"
+            echo "Memory: ${mem}%"
+            echo "Uptime: $uptime"
+        fi
+    else
+        echo "PID: not running"
+    fi
+
+    # Version
+    if [[ -x "$BINARY_PATH" ]]; then
+        local version
+        version=$("$BINARY_PATH" version 2>/dev/null || echo "unknown")
+        echo "Version: $version"
+    fi
+
+    echo ""
+    show_connection_info
+
+    echo ""
+    echo -e "${COLOR_BOLD}Network:${COLOR_RESET}"
+    detect_network
+
+    # Try to query metrics endpoint if available
+    if check_command curl; then
+        local metrics_port
+        metrics_port=$(grep -E '^\s*metrics_port:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' || echo "9090")
+        if curl -s --max-time 2 "http://localhost:${metrics_port}/metrics" &>/dev/null; then
+            echo ""
+            echo -e "${COLOR_GREEN}Metrics endpoint available at :${metrics_port}${COLOR_RESET}"
+        fi
+    fi
+}
+
+cmd_start() {
+    require_root
+    local manager
+    manager=$(get_service_manager)
+
+    log_info "Starting StealthLink service..."
+
+    case "$manager" in
+        systemd)
+            systemctl start "$SERVICE_NAME"
+            ;;
+        sysvinit)
+            service "$SERVICE_NAME" start
+            ;;
+        *)
+            log_error "Unknown service manager"
+            exit 1
+            ;;
+    esac
+
+    sleep 1
+    if is_service_active; then
+        log_success "Service started successfully"
+    else
+        log_error "Failed to start service"
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    require_root
+    local manager
+    manager=$(get_service_manager)
+
+    log_info "Stopping StealthLink service..."
+
+    case "$manager" in
+        systemd)
+            systemctl stop "$SERVICE_NAME"
+            ;;
+        sysvinit)
+            service "$SERVICE_NAME" stop
+            ;;
+        *)
+            log_error "Unknown service manager"
+            exit 1
+            ;;
+    esac
+
+    sleep 1
+    if ! is_service_active; then
+        log_success "Service stopped successfully"
+    else
+        log_error "Failed to stop service"
+        exit 1
+    fi
+}
+
+cmd_restart() {
+    require_root
+    log_info "Restarting StealthLink service..."
+    cmd_stop
+    cmd_start
+}
+
+cmd_logs() {
+    local follow=false
+    local mode_filter=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow)
+                follow=true
+                ;;
+            --mode=*)
+                mode_filter="${1#*=}"
+                ;;
+            *)
+                ;;
+        esac
+        shift
+    done
+
+    local manager
+    manager=$(get_service_manager)
+
+    case "$manager" in
+        systemd)
+            if check_command journalctl; then
+                local args=(-u "$SERVICE_NAME")
+                if [[ "$follow" == true ]]; then
+                    args+=(-f)
+                else
+                    args+=(-n 200)
+                fi
+                if [[ -n "$mode_filter" ]]; then
+                    journalctl "${args[@]}" | grep -i "$mode_filter"
+                else
+                    journalctl "${args[@]}"
+                fi
+            else
+                log_error "journalctl not available"
+                exit 1
+            fi
+            ;;
+        *)
+            # Fallback to log files
+            local log_file="/var/log/stealthlink/stealthlink.log"
+            if [[ -f "$log_file" ]]; then
+                if [[ "$follow" == true ]]; then
+                    if [[ -n "$mode_filter" ]]; then
+                        tail -f "$log_file" | grep -i "$mode_filter"
+                    else
+                        tail -f "$log_file"
+                    fi
+                else
+                    if [[ -n "$mode_filter" ]]; then
+                        tail -n 200 "$log_file" | grep -i "$mode_filter"
+                    else
+                        tail -n 200 "$log_file"
+                    fi
+                fi
+            else
+                log_error "Log file not found: $log_file"
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+cmd_benchmark() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then
+        target="$(grep -E 'gateway_addr:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '\"' || true)"
+    fi
+    if [[ -z "$target" ]]; then
+        log_error "Usage: stealthlink-ctl benchmark <target>"
+        exit 1
+    fi
+
+    log_info "Running benchmark against $target"
+    if check_command python3 && [[ -f "/opt/stealthlink/tools/benchmark_runner.py" ]]; then
+        python3 /opt/stealthlink/tools/benchmark_runner.py "$target"
+    elif check_command iperf3; then
+        iperf3 -c "$target" -t 10 || true
+    else
+        log_warn "No benchmark runner available (python tool or iperf3 missing)"
+    fi
+}
+
+cmd_rotate_keys() {
+    require_root
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Config file not found: $CONFIG_FILE"
+        exit 1
+    fi
+    local new_key
+    if check_command stealthlink-tools; then
+        new_key="$(stealthlink-tools secret)"
+    else
+        new_key="$(openssl rand -hex 32)"
+    fi
+    cmd_backup >/dev/null 2>&1 || true
+    if grep -q 'shared_key:' "$CONFIG_FILE"; then
+        sed -i -E "s|(^[[:space:]]*shared_key:[[:space:]]*).*$|\\1\"${new_key}\"|g" "$CONFIG_FILE"
+    else
+        printf "\nsecurity:\n  shared_key: \"%s\"\n" "$new_key" >> "$CONFIG_FILE"
+    fi
+    log_success "Shared key rotated in config"
+    log_info "Restart service to apply: stealthlink-ctl restart"
+}
+
+cmd_switch_mode() {
+    require_root
+    local mode="${1:-}"
+    if [[ -z "$mode" ]]; then
+        log_error "Usage: stealthlink-ctl switch-mode <4a|4b|4c|4d|4e>"
+        exit 1
+    fi
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Config file not found: $CONFIG_FILE"
+        exit 1
+    fi
+
+    local carrier=""
+    case "$mode" in
+        4a) carrier="xhttp" ;;
+        4b) carrier="rawtcp" ;;
+        4c) carrier="xhttp" ;;
+        4d) carrier="quic" ;;
+        4e) carrier="trusttunnel" ;;
+        *)
+            log_error "Invalid mode: $mode (expected 4a..4e)"
+            exit 1
+            ;;
+    esac
+
+    cmd_backup >/dev/null 2>&1 || true
+    if grep -q 'carrier:' "$CONFIG_FILE"; then
+        awk -v c="$carrier" '
+            BEGIN{in_carrier=0}
+            /^[[:space:]]*carrier:[[:space:]]*$/ {in_carrier=1; print; next}
+            in_carrier==1 && /^[[:space:]]*type:[[:space:]]*/ {
+                sub(/type:[[:space:]]*.*/, "type: " c)
+                print
+                in_carrier=0
+                next
+            }
+            in_carrier==1 && /^[[:space:]]*[a-zA-Z_]+:/ {in_carrier=0}
+            {print}
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    fi
+    if grep -q 'variant:' "$CONFIG_FILE"; then
+        sed -i -E "s|(^[[:space:]]*variant:[[:space:]]*).*$|\\1\"${mode}\"|g" "$CONFIG_FILE"
+    else
+        printf "\nvariant: \"%s\"\n" "$mode" >> "$CONFIG_FILE"
+    fi
+    log_success "Switched mode to $mode (carrier=$carrier)"
+    log_info "Restart service to apply: stealthlink-ctl restart"
+}
+
+cmd_health() {
+    local exit_code=0
+
+    echo -e "${COLOR_BOLD}StealthLink Health Check${COLOR_RESET}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Check binary exists
+    if [[ -f "$BINARY_PATH" ]]; then
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} Binary exists: $BINARY_PATH"
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET} Binary not found: $BINARY_PATH"
+        exit_code=1
+    fi
+
+    # Check binary executable
+    if [[ -x "$BINARY_PATH" ]]; then
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} Binary is executable"
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET} Binary is not executable"
+        exit_code=1
+    fi
+
+    # Check config exists
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} Config exists: $CONFIG_FILE"
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET} Config not found: $CONFIG_FILE"
+        exit_code=1
+    fi
+
+    # Validate config syntax (basic YAML check)
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if grep -q 'role:' "$CONFIG_FILE" && grep -q 'listen:' "$CONFIG_FILE"; then
+            echo -e "${COLOR_GREEN}✓${COLOR_RESET} Config appears valid"
+        else
+            echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} Config may be incomplete"
+        fi
+    fi
+
+    # Check process running
+    if is_service_active; then
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} Service is running"
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET} Service is not running"
+        exit_code=1
+    fi
+
+    # Check service status
+    local manager
+    manager=$(get_service_manager)
+    if [[ "$manager" != "unknown" ]]; then
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} Service manager: $manager"
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET} No service manager detected"
+        exit_code=1
+    fi
+
+    # Network connectivity check
+    if check_command curl; then
+        local metrics_port
+        metrics_port=$(grep -E '^\s*metrics_port:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' || echo "9090")
+        if curl -s --max-time 2 "http://localhost:${metrics_port}/metrics" &>/dev/null; then
+            echo -e "${COLOR_GREEN}✓${COLOR_RESET} Metrics endpoint responding"
+        else
+            echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} Metrics endpoint not responding"
+        fi
+    fi
+
+    # Check firewall rules (basic iptables check)
+    if check_command iptables && [[ $EUID -eq 0 ]]; then
+        local listen_port
+        listen_port=$(grep -E '^\s*listen:' "$CONFIG_FILE" | awk '{print $2}' | cut -d: -f2 || echo "")
+        if [[ -n "$listen_port" ]]; then
+            if iptables -L INPUT -n | grep -q "$listen_port"; then
+                echo -e "${COLOR_GREEN}✓${COLOR_RESET} Firewall rules detected for port $listen_port"
+            else
+                echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} No firewall rules found for port $listen_port"
+            fi
+        fi
+    fi
+
+    echo ""
+    if [[ $exit_code -eq 0 ]]; then
+        log_success "All health checks passed"
+    else
+        log_error "Some health checks failed"
+    fi
+
+    return $exit_code
+}
+
+cmd_update() {
+    require_root
+    local force=false
+
+    if [[ "${1:-}" == "--force" ]]; then
+        force=true
+    fi
+
+    log_info "Checking for updates from GitHub..."
+
+    if ! check_command curl; then
+        log_error "curl is required for updates"
+        exit 1
+    fi
+
+    # Query GitHub API
+    local latest_release
+    latest_release=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest")
+
+    if [[ -z "$latest_release" ]] || echo "$latest_release" | grep -q "Not Found"; then
+        log_error "Failed to fetch release information"
+        exit 1
+    fi
+
+    local latest_version
+    latest_version=$(echo "$latest_release" | grep '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/' | head -n1)
+
+    if [[ -z "$latest_version" ]]; then
+        log_error "Failed to parse latest version"
+        exit 1
+    fi
+
+    # Get current version
+    local current_version
+    if [[ -x "$BINARY_PATH" ]]; then
+        current_version=$("$BINARY_PATH" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
+    else
+        current_version="0.0.0"
+    fi
+
+    log_info "Current version: $current_version"
+    log_info "Latest version: $latest_version"
+
+    if [[ "$current_version" == "$latest_version" ]] && [[ "$force" != true ]]; then
+        log_success "Already on latest version"
+        return 0
+    fi
+
+    # Download new binary
+    local download_url
+    download_url=$(echo "$latest_release" | grep '"browser_download_url"' | grep 'stealthlink-gateway' | grep 'linux' | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)
+
+    if [[ -z "$download_url" ]]; then
+        log_error "Failed to find download URL"
+        exit 1
+    fi
+
+    log_info "Downloading from: $download_url"
+
+    local temp_file="/tmp/stealthlink-gateway.new"
+    local retry_count=3
+    local retry=0
+
+    while [[ $retry -lt $retry_count ]]; do
+        if curl -L -f -o "$temp_file" "$download_url"; then
+            break
+        fi
+        retry=$((retry + 1))
+        log_warn "Download failed, retrying ($retry/$retry_count)..."
+        sleep 2
+    done
+
+    if [[ ! -f "$temp_file" ]]; then
+        log_error "Download failed after $retry_count attempts"
+        exit 1
+    fi
+
+    chmod +x "$temp_file"
+
+    # Backup current binary
+    mkdir -p "$BACKUP_DIR"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/stealthlink-gateway.${timestamp}"
+
+    if [[ -f "$BINARY_PATH" ]]; then
+        log_info "Backing up current binary to: $backup_file"
+        cp "$BINARY_PATH" "$backup_file"
+    fi
+
+    # Replace binary
+    log_info "Installing new binary..."
+    mv "$temp_file" "$BINARY_PATH"
+    chmod +x "$BINARY_PATH"
+
+    log_success "Update complete: $current_version -> $latest_version"
+
+    # Restart service
+    read -p "Restart service now? [Y/n] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+        cmd_restart
+    fi
+}
+
+cmd_rollback() {
+    require_root
+
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_error "No backup directory found: $BACKUP_DIR"
+        exit 1
+    fi
+
+    local backups
+    mapfile -t backups < <(ls -1t "$BACKUP_DIR"/stealthlink-gateway.* 2>/dev/null || true)
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        log_error "No backup binaries found"
+        exit 1
+    fi
+
+    echo -e "${COLOR_BOLD}Available Backups:${COLOR_RESET}"
+    local i=1
+    for backup in "${backups[@]}"; do
+        local backup_name
+        backup_name=$(basename "$backup")
+        local backup_date
+        backup_date=$(stat -c %y "$backup" 2>/dev/null | cut -d. -f1 || echo "unknown")
+        echo "  $i) $backup_name ($backup_date)"
+        i=$((i + 1))
+    done
+
+    read -p "Select backup to restore [1-${#backups[@]}]: " selection
+
+    if [[ ! "$selection" =~ ^[0-9]+$ ]] || [[ $selection -lt 1 ]] || [[ $selection -gt ${#backups[@]} ]]; then
+        log_error "Invalid selection"
+        exit 1
+    fi
+
+    local selected_backup="${backups[$((selection - 1))]}"
+
+    log_info "Restoring: $(basename "$selected_backup")"
+    cp "$selected_backup" "$BINARY_PATH"
+    chmod +x "$BINARY_PATH"
+
+    log_success "Rollback complete"
+
+    read -p "Restart service now? [Y/n] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+        cmd_restart
+    fi
+}
+
+cmd_backup() {
+    require_root
+
+    mkdir -p "$BACKUP_DIR"
+
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/config-backup-${timestamp}.tar.gz"
+
+    log_info "Creating config backup..."
+
+    tar -czf "$backup_file" -C "$CONFIG_DIR" config.yaml 2>/dev/null || {
+        log_error "Backup failed"
+        exit 1
+    }
+
+    log_success "Backup created: $backup_file"
+}
+
+cmd_restore() {
+    require_root
+
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_error "No backup directory found: $BACKUP_DIR"
+        exit 1
+    fi
+
+    local backups
+    mapfile -t backups < <(ls -1t "$BACKUP_DIR"/config-backup-*.tar.gz 2>/dev/null || true)
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        log_error "No config backups found"
+        exit 1
+    fi
+
+    echo -e "${COLOR_BOLD}Available Backups:${COLOR_RESET}"
+    local i=1
+    for backup in "${backups[@]}"; do
+        local backup_name
+        backup_name=$(basename "$backup")
+        local backup_date
+        backup_date=$(stat -c %y "$backup" 2>/dev/null | cut -d. -f1 || echo "unknown")
+        echo "  $i) $backup_name ($backup_date)"
+        i=$((i + 1))
+    done
+
+    read -p "Select backup to restore [1-${#backups[@]}]: " selection
+
+    if [[ ! "$selection" =~ ^[0-9]+$ ]] || [[ $selection -lt 1 ]] || [[ $selection -gt ${#backups[@]} ]]; then
+        log_error "Invalid selection"
+        exit 1
+    fi
+
+    local selected_backup="${backups[$((selection - 1))]}"
+
+    log_info "Restoring: $(basename "$selected_backup")"
+    tar -xzf "$selected_backup" -C "$CONFIG_DIR" || {
+        log_error "Restore failed"
+        exit 1
+    }
+
+    log_success "Config restored"
+
+    read -p "Restart service now? [Y/n] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+        cmd_restart
+    fi
+}
+
+cmd_config() {
+    local editor="${EDITOR:-nano}"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Config file not found: $CONFIG_FILE"
+        exit 1
+    fi
+
+    "$editor" "$CONFIG_FILE"
+}
+
+cmd_secret() {
+    if check_command stealthlink-tools; then
+        stealthlink-tools secret
+    else
+        log_error "stealthlink-tools not found in PATH"
+        exit 1
+    fi
+}
+
+cmd_firewall() {
+    local action="${1:-}"
+    local port="${2:-}"
+
+    if [[ ! -x "${CONFIG_DIR}/scripts/stealthlink-iptables.sh" ]]; then
+        log_error "Firewall script not found: ${CONFIG_DIR}/scripts/stealthlink-iptables.sh"
+        exit 1
+    fi
+
+    if [[ -z "$action" ]]; then
+        "${CONFIG_DIR}/scripts/stealthlink-iptables.sh" status
+    elif [[ -z "$port" ]]; then
+        "${CONFIG_DIR}/scripts/stealthlink-iptables.sh" "$action"
+    else
+        "${CONFIG_DIR}/scripts/stealthlink-iptables.sh" "$action" "$port"
+    fi
+}
+
+cmd_version() {
+    echo -e "${COLOR_BOLD}StealthLink Version Information${COLOR_RESET}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    if [[ -x "$BINARY_PATH" ]]; then
+        echo -n "Gateway: "
+        "$BINARY_PATH" version 2>/dev/null || echo "unknown"
+    else
+        echo "Gateway: not installed"
+    fi
+
+    if check_command stealthlink-tools; then
+        echo -n "Tools: "
+        stealthlink-tools version 2>/dev/null || echo "unknown"
+    else
+        echo "Tools: not installed"
+    fi
+
+    echo "Control Script: $SCRIPT_VERSION"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local role
+        role=$(grep -E '^\s*role:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+        echo "Config Role: $role"
+    fi
+}
+
+cmd_uninstall() {
+    require_root
+
+    log_warn "This will remove StealthLink from your system"
+    read -p "Are you sure? [y/N] " -n 1 -r
+    echo
+
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Uninstall cancelled"
+        exit 0
+    fi
+
+    # Stop service
+    if is_service_active; then
+        log_info "Stopping service..."
+        cmd_stop
+    fi
+
+    # Run installer uninstall if available
+    if [[ -x "${CONFIG_DIR}/scripts/installer.sh" ]]; then
+        "${CONFIG_DIR}/scripts/installer.sh" --uninstall
+    else
+        log_warn "Installer script not found, manual cleanup required"
+    fi
+
+    log_success "Uninstall complete"
+}
+
+cmd_help() {
+    cat <<EOF
+${COLOR_BOLD}StealthLink Service Control (stealthlink-ctl)${COLOR_RESET}
+Version: $SCRIPT_VERSION
+
+${COLOR_BOLD}USAGE:${COLOR_RESET}
+    stealthlink-ctl [COMMAND] [OPTIONS]
+
+${COLOR_BOLD}COMMANDS:${COLOR_RESET}
+    status              Show service status, metrics, and configuration
+    start               Start the StealthLink service
+    stop                Stop the StealthLink service
+    restart             Restart the StealthLink service
+    logs [-f] [--mode=] Show/follow logs with optional mode filter
+    health              Run comprehensive health checks
+    benchmark [target]  Run quick throughput benchmark
+    rotate-keys         Rotate shared key in config
+    switch-mode <mode>  Switch runtime mode (4a..4e)
+    update [--force]    Check and install updates from GitHub
+    rollback            Restore a previous binary version
+    backup              Create timestamped config backup
+    restore             Restore config from backup
+    config              Edit configuration file
+    secret              Generate new secret key
+    firewall [ACTION]   Manage firewall rules
+                        Actions: apply, remove, persist, status
+    version             Show version information
+    uninstall           Uninstall StealthLink
+    menu                Interactive menu (default if no command)
+    help                Show this help message
+
+${COLOR_BOLD}EXAMPLES:${COLOR_RESET}
+    stealthlink-ctl status
+    stealthlink-ctl restart
+    stealthlink-ctl update --force
+    stealthlink-ctl firewall apply 8443
+    stealthlink-ctl logs -f --mode=uqsp
+    stealthlink-ctl benchmark 1.2.3.4
+    stealthlink-ctl rotate-keys
+    stealthlink-ctl switch-mode 4d
+
+${COLOR_BOLD}FILES:${COLOR_RESET}
+    Config:  $CONFIG_FILE
+    Binary:  $BINARY_PATH
+    Backups: $BACKUP_DIR
+
+For more information, visit: https://github.com/${GITHUB_REPO}
+EOF
+}
+
+cmd_menu() {
+    while true; do
+        echo ""
+        echo -e "${COLOR_BOLD}StealthLink Service Control${COLOR_RESET}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  1) Status"
+        echo "  2) Logs"
+        echo "  3) Health Check"
+        echo "  4) Benchmark"
+        echo "  5) Rotate Keys"
+        echo "  6) Switch Mode"
+        echo "  7) Restart Service"
+        echo "  8) Update"
+        echo "  9) Edit Config"
+        echo " 10) Backup Config"
+        echo " 11) Restore Config"
+        echo " 12) Firewall Management"
+        echo " 13) Version Info"
+        echo "  0) Exit"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        read -p "Select option: " choice
+
+        case "$choice" in
+            1) cmd_status ;;
+            2) cmd_logs ;;
+            3) cmd_health ;;
+            4) cmd_benchmark ;;
+            5) cmd_rotate_keys ;;
+            6)
+                read -p "Mode (4a..4e): " m
+                cmd_switch_mode "$m"
+                ;;
+            7) cmd_restart ;;
+            8) cmd_update ;;
+            9) cmd_config ;;
+            10) cmd_backup ;;
+            11) cmd_restore ;;
+            12)
+                echo ""
+                echo "Firewall Actions: apply, remove, persist, status"
+                read -p "Action: " fw_action
+                read -p "Port (optional): " fw_port
+                cmd_firewall "$fw_action" "$fw_port"
+                ;;
+            13) cmd_version ;;
+            0) exit 0 ;;
+            *) log_error "Invalid option" ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+#==============================================================================
+# Main Command Router
+#==============================================================================
+
+main() {
+    local command="${1:-menu}"
+
+    case "$command" in
+        status)
+            cmd_status
+            ;;
+        start)
+            cmd_start
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        restart)
+            cmd_restart
+            ;;
+        logs)
+            shift
+            cmd_logs "$@"
+            ;;
+        health)
+            cmd_health
+            ;;
+        benchmark)
+            shift
+            cmd_benchmark "$@"
+            ;;
+        rotate-keys)
+            cmd_rotate_keys
+            ;;
+        switch-mode)
+            shift
+            cmd_switch_mode "$@"
+            ;;
+        update)
+            shift
+            cmd_update "$@"
+            ;;
+        rollback)
+            cmd_rollback
+            ;;
+        backup)
+            cmd_backup
+            ;;
+        restore)
+            cmd_restore
+            ;;
+        config)
+            cmd_config
+            ;;
+        secret)
+            cmd_secret
+            ;;
+        firewall)
+            shift
+            cmd_firewall "$@"
+            ;;
+        version)
+            cmd_version
+            ;;
+        uninstall)
+            cmd_uninstall
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        menu)
+            cmd_menu
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+# Run main with all arguments
+main "$@"

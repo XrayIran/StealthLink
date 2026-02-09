@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StealthLink Status</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            line-height: 1.6;
+            padding: 2rem;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #00d4aa;
+            margin-bottom: 1rem;
+            font-size: 2rem;
+        }
+        h2 {
+            color: #00d4aa;
+            margin: 2rem 0 1rem;
+            font-size: 1.5rem;
+            border-bottom: 2px solid #00d4aa;
+            padding-bottom: 0.5rem;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 1.5rem;
+            border: 1px solid #0f3460;
+        }
+        .card h3 {
+            color: #e94560;
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
+        }
+        .card .value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #00d4aa;
+        }
+        .status-healthy { color: #00d4aa; }
+        .status-degraded { color: #f39c12; }
+        .status-unhealthy { color: #e94560; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #16213e;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        th, td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid #0f3460;
+        }
+        th {
+            background: #0f3460;
+            color: #00d4aa;
+            font-weight: 600;
+        }
+        tr:hover {
+            background: #1a1a2e;
+        }
+        .footer {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid #0f3460;
+            color: #666;
+            font-size: 0.875rem;
+        }
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .badge-success { background: #00d4aa; color: #1a1a2e; }
+        .badge-warning { background: #f39c12; color: #1a1a2e; }
+        .badge-error { background: #e94560; color: #fff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>StealthLink Status</h1>
+
+        <div class="grid">
+            <div class="card">
+                <h3>Version</h3>
+                <div class="value">{{.Version}}</div>
+            </div>
+            <div class="card">
+                <h3>Go Version</h3>
+                <div class="value">{{.GoVersion}}</div>
+            </div>
+            <div class="card">
+                <h3>Goroutines</h3>
+                <div class="value">{{.NumGoroutines}}</div>
+            </div>
+            <div class="card">
+                <h3>Uptime</h3>
+                <div class="value">{{.Uptime}}</div>
+            </div>
+        </div>
+
+        <h2>Memory Usage</h2>
+        <div class="grid">
+            <div class="card">
+                <h3>Allocated</h3>
+                <div class="value">{{.MemoryUsage.Alloc}}</div>
+            </div>
+            <div class="card">
+                <h3>Total Allocated</h3>
+                <div class="value">{{.MemoryUsage.TotalAlloc}}</div>
+            </div>
+            <div class="card">
+                <h3>System</h3>
+                <div class="value">{{.MemoryUsage.Sys}}</div>
+            </div>
+            <div class="card">
+                <h3>GC Cycles</h3>
+                <div class="value">{{.MemoryUsage.NumGC}}</div>
+            </div>
+        </div>
+
+        <h2>Transports</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Status</th>
+                    <th>Connections</th>
+                    <th>Latency</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .Transports}}
+                <tr>
+                    <td>{{.Name}}</td>
+                    <td><span class="badge badge-success">{{.Status}}</span></td>
+                    <td>{{.Conns}}</td>
+                    <td>{{.Latency}}</td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
+
+        <div class="footer">
+            <p>Timestamp: {{.Timestamp}}</p>
+        </div>
+    </div>
+</body>
+</html>

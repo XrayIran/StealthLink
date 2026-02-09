@@ -1,0 +1,34 @@
+role: agent
+
+agent:
+  id: "agent-4a"
+  gateway_addr: "gateway.example.com:8443"
+
+transport:
+  type: uqsp
+  uqsp:
+    carrier:
+      type: xhttp
+      xhttp:
+        server: "cdn.example.com:443"
+        mode: stream-one
+        tls_fingerprint: "chrome_auto"
+    behaviors:
+      ech:
+        enabled: true
+        public_name: "cloudflare-ech.com"
+        inner_sni: "real.example.com"
+        require_ech: true
+      domainfront:
+        enabled: true
+        front_domain: "cdn.cloudflare.com"
+        real_host: "real.example.com"
+        rotate_ips: true
+      vision:
+        enabled: true
+      tlsfrag:
+        enabled: true
+        strategy: sni_split
+
+security:
+  shared_key: "replace-with-secure-shared-key"

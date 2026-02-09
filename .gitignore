@@ -1,0 +1,41 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs/temp
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Go
+bin/
+*.test
+*.out
+coverage.out
+
+# Rust
+target/
+
+# Local agent/tooling state
+.claude/
+.zencoder/
+.zenflow/

@@ -1,0 +1,132 @@
+role: agent
+
+agent:
+  id: "agent-1"
+  gateway_addr: "gateway.example.com:8443"
+  reconnect_backoff: "3s"
+
+transport:
+  type: rawtcp
+  # experimental: true
+  # type: awg_obfs
+  # awg_obfs:
+  #   private_key: "<base64-32-byte-key>"
+  #   peer_public_key: "<base64-32-byte-key>"
+  #   endpoint: "gateway.example.com:8443"
+  #   protocol_ver: 2
+  #   junk_count: 10
+  #   junk_min_size: 64
+  #   junk_max_size: 1024
+  #   junk_interval: "5s"
+  # type: raw_adapter
+  # raw_adapter:
+  #   mode: "rawtcp" # rawtcp|icmp|faketcp
+  #   replay_window: 64
+  #   auto_firewall: true
+  # type: tlsmirror # requires transport.experimental: true
+  # type: auto
+  # auto:
+  #   candidates: ["wss", "h2", "xhttp", "quic", "shadowtls", "reality", "dtls", "kcp", "rawtcp", "masque"]
+  #   probe_timeout: "4s"
+  # xhttp:
+  #   mode: "stream-one"
+  #   path: "/_sl"
+  #   keep_alive: "30s"
+  #   max_connections: 2
+  #   packet_size: 1024
+  kcp:
+    key: "change-me"
+    block: "aes"
+    packet_guard: true
+    packet_guard_magic: "PQT1"
+    packet_guard_window: 30
+    packet_guard_skew: 1
+  rawtcp:
+    interface: "eth0"
+    ipv4:
+      addr: "192.168.1.100:0"
+      router_mac: "aa:bb:cc:dd:ee:ff"
+    pcap:
+      sockbuf: 4194304
+    tcp:
+      local_flag: ["PA"]
+      remote_flag: ["PA"]
+  noize:
+    enabled: false
+    preset: "medium"
+    burst_packets: 2
+    burst_interval: 15s
+    max_junk_percent: 30
+  # pipeline:
+  #   enabled: true
+  #   nodes:
+  #     - id: "obfs1"
+  #       type: "noize"
+  #     - id: "frame1"
+  #       type: "frame"
+  #   edges:
+  #     - from: "obfs1"
+  #       to: "frame1"
+
+mux:
+  max_streams_per_session: 2048
+  header_timeout: "10s"
+  smux_keepalive_interval: "2s"
+  smux_keepalive_timeout: "8s"
+
+security:
+  shared_key: "change-me"
+
+auth:
+  strict: true
+  providers:
+    - name: "static-main"
+      type: "static"
+      enabled: true
+      static:
+        agent_tokens:
+          agent-1: "change-me"
+
+transparent_proxy:
+  mode: "off"      # off|redirect|tproxy|tun_system|tun_gvisor
+  backend: "auto"  # auto|iptables|nftables
+  whitelist_cidrs: []
+
+host_opt:
+  profile: "balanced"
+  dry_run: true
+  rollback_token: ""
+
+metrics:
+  listen: "127.0.0.1:9092"
+  auth_token: ""
+
+services:
+  - name: "ssh"
+    protocol: "tcp"
+    target: "127.0.0.1:22"
+    host:
+      sni: "gateway.example.com"
+      host: "cdn.example.com"
+      connect_ip: "203.0.113.10"
+      fingerprint: "chrome"
+      origin: "https://cdn.example.com"
+      path: "/_sl"
+      max_conns: 2
+
+  - name: "dns"
+    protocol: "udp"
+    target: "127.0.0.1:53"
+    udp:
+      read_buffer: 1048576
+      write_buffer: 1048576
+      max_pps: 5000
+      max_bps: 5000000
+      burst: 5000000
+      mode: "drop"
+
+  - name: "vnet"
+    protocol: "tun"
+    tun:
+      name: "sl0"
+      mtu: 1500

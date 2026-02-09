@@ -1,0 +1,46 @@
+:root {
+  --bg: #eef5f8;
+  --fg: #142127;
+  --card: #ffffff;
+  --line: #c7d4dd;
+  --accent: #1b6a8f;
+}
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  background: radial-gradient(circle at top left, #dbe9f1, var(--bg));
+  color: var(--fg);
+}
+
+.layout {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+h1 {
+  margin: 0 0 16px;
+  color: var(--accent);
+}
+
+section {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin-bottom: 12px;
+  padding: 12px;
+}
+
+pre {
+  overflow: auto;
+  max-height: 260px;
+  background: #f8fcff;
+  border: 1px dashed var(--line);
+  padding: 10px;
+}
+
+.err {
+  color: #a72020;
+  font-weight: 600;
+}

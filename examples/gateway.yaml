@@ -1,0 +1,119 @@
+role: gateway
+
+gateway:
+  listen: ":8443"
+
+transport:
+  type: rawtcp
+  # experimental: true
+  # type: xhttp
+  # xhttp:
+  #   path: "/_sl"
+  # type: awg_obfs
+  # awg_obfs:
+  #   private_key: "<base64-32-byte-key>"
+  #   peer_public_key: "<base64-32-byte-key>"
+  #   endpoint: "0.0.0.0:8443"
+  #   protocol_ver: 2
+  # type: raw_adapter
+  # raw_adapter:
+  #   mode: "rawtcp" # rawtcp|icmp|faketcp
+  # type: tlsmirror # requires transport.experimental: true
+  kcp:
+    key: "change-me"
+    block: "aes"
+    packet_guard: true
+    packet_guard_magic: "PQT1"
+    packet_guard_window: 30
+    packet_guard_skew: 1
+  rawtcp:
+    interface: "eth0"
+    ipv4:
+      addr: "10.0.0.10:8443"
+      router_mac: "aa:bb:cc:dd:ee:ff"
+    pcap:
+      sockbuf: 8388608
+    tcp:
+      local_flag: ["PA"]
+      remote_flag: ["PA"]
+  # pipeline:
+  #   enabled: true
+  #   nodes:
+  #     - id: "obfs1"
+  #       type: "noize"
+  #   edges: []
+
+mux:
+  max_streams_per_session: 2048
+  header_timeout: "10s"
+  smux_keepalive_interval: "2s"
+  smux_keepalive_timeout: "8s"
+
+security:
+  shared_key: "change-me"
+
+auth:
+  strict: true
+  providers:
+    - name: "static-main"
+      type: "static"
+      enabled: true
+      static:
+        agent_tokens:
+          agent-1: "change-me"
+    # - name: "oidc-main"
+    #   type: "oidc"
+    #   enabled: true
+    #   oidc:
+    #     issuer: "https://issuer.example.com"
+    #     audience: "stealthlink"
+    #     hs256_secret: "change-me"
+    #     required_groups: ["ops"]
+    # - name: "radius-main"
+    #   type: "radius"
+    #   enabled: false
+    #   radius:
+    #     shared_secret: "change-me"
+    #     timeout: "2s"
+
+transparent_proxy:
+  mode: "off"      # off|redirect|tproxy|tun_system|tun_gvisor
+  backend: "auto"  # auto|iptables|nftables
+  whitelist_cidrs: []
+
+host_opt:
+  profile: "balanced"
+  dry_run: true
+  rollback_token: ""
+
+metrics:
+  listen: "127.0.0.1:9091"
+  auth_token: ""
+
+services:
+  - name: "ssh"
+    protocol: "tcp"
+    listen: ":2222"
+    max_streams: 256
+    allow_cidrs:
+      - "0.0.0.0/0"
+
+  - name: "dns"
+    protocol: "udp"
+    listen: ":5353"
+    max_streams: 512
+    allow_cidrs:
+      - "0.0.0.0/0"
+    udp:
+      read_buffer: 1048576
+      write_buffer: 1048576
+      max_pps: 5000
+      max_bps: 5000000
+      burst: 5000000
+      mode: "drop"
+
+  - name: "vnet"
+    protocol: "tun"
+    tun:
+      name: "sl0"
+      mtu: 1500

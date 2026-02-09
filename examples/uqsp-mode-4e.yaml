@@ -1,0 +1,48 @@
+role: gateway
+
+gateway:
+  listen: "0.0.0.0:8443"
+
+transport:
+  type: uqsp
+  uqsp:
+    carrier:
+      type: trusttunnel
+      trusttunnel:
+        server: "https://gateway.example.com:443"
+        version: h2
+        dtls_fallback: true
+        dpd_interval: 15s
+        mtu_discovery: true
+        split_include:
+          - "10.0.0.0/8"
+        split_exclude:
+          - "0.0.0.0/0"
+    behaviors:
+      cstp:
+        enabled: true
+        dpd_interval: 15s
+        mtu: 1350
+        enable_split_tunnel: true
+        split_include:
+          - "10.0.0.0/8"
+        split_exclude:
+          - "0.0.0.0/0"
+    reverse:
+      enabled: true
+      role: listener
+      server_address: "0.0.0.0:9443"
+      heartbeat_interval: 15s
+      reconnect_delay: 5s
+      max_retries: 20
+      auth_token: "replace-reverse-auth-token"
+
+warp:
+  enabled: true
+  mode: builtin
+  endpoint: "engage.cloudflareclient.com:2408"
+  routing_mode: vpn_only
+  vpn_subnet: "10.8.0.0/24"
+
+security:
+  shared_key: "replace-with-secure-shared-key"

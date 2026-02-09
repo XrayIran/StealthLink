@@ -1,0 +1,799 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# StealthLink Configuration Wizard
+# Interactive TUI for generating StealthLink YAML configs
+
+CONFIG_DIR="${CONFIG_DIR:-/opt/stealthlink}"
+OUTPUT="${OUTPUT:-${CONFIG_DIR}/config.yaml}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# TUI backend detection
+TUI_BACKEND=""
+
+detect_tui() {
+    if command -v whiptail &> /dev/null; then
+        TUI_BACKEND="whiptail"
+    elif command -v dialog &> /dev/null; then
+        TUI_BACKEND="dialog"
+    else
+        TUI_BACKEND="plain"
+    fi
+}
+
+# Wrapper functions for TUI operations
+ask_yesno() {
+    local title="$1"
+    local message="$2"
+    local default="${3:-yes}"
+
+    case "$TUI_BACKEND" in
+        whiptail)
+            if [ "$default" = "yes" ]; then
+                whiptail --title "$title" --yesno "$message" 10 60 --defaultno
+            else
+                whiptail --title "$title" --yesno "$message" 10 60
+            fi
+            ;;
+        dialog)
+            if [ "$default" = "yes" ]; then
+                dialog --title "$title" --defaultno --yesno "$message" 10 60
+            else
+                dialog --title "$title" --yesno "$message" 10 60
+            fi
+            ;;
+        plain)
+            local prompt="yes/no"
+            [ "$default" = "yes" ] && prompt="[Y/n]" || prompt="[y/N]"
+            read -p "$message $prompt: " answer
+            answer="${answer:-$default}"
+            [[ "$answer" =~ ^[Yy] ]]
+            ;;
+    esac
+}
+
+ask_input() {
+    local title="$1"
+    local message="$2"
+    local default="$3"
+    local result
+
+    case "$TUI_BACKEND" in
+        whiptail)
+            result=$(whiptail --title "$title" --inputbox "$message" 10 60 "$default" 3>&1 1>&2 2>&3)
+            ;;
+        dialog)
+            result=$(dialog --title "$title" --inputbox "$message" 10 60 "$default" 3>&1 1>&2 2>&3)
+            ;;
+        plain)
+            read -p "$message [$default]: " result
+            result="${result:-$default}"
+            ;;
+    esac
+
+    echo "$result"
+}
+
+ask_menu() {
+    local title="$1"
+    local message="$2"
+    shift 2
+    local options=("$@")
+    local result
+
+    case "$TUI_BACKEND" in
+        whiptail)
+            result=$(whiptail --title "$title" --menu "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3)
+            ;;
+        dialog)
+            result=$(dialog --title "$title" --menu "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3)
+            ;;
+        plain)
+            echo "$message"
+            local i=1
+            while [ $i -le ${#options[@]} ]; do
+                echo "  $i) ${options[$i]}"
+                i=$((i + 2))
+            done
+            read -p "Select option: " selection
+            result="${options[$((selection * 2 - 1))]}"
+            ;;
+    esac
+
+    echo "$result"
+}
+
+ask_checklist() {
+    local title="$1"
+    local message="$2"
+    shift 2
+    local options=("$@")
+    local result
+
+    case "$TUI_BACKEND" in
+        whiptail)
+            result=$(whiptail --title "$title" --checklist "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3)
+            ;;
+        dialog)
+            result=$(dialog --title "$title" --checklist "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3)
+            ;;
+        plain)
+            echo "$message"
+            echo "Enter space-separated numbers for your selections:"
+            local i=1
+            while [ $i -le ${#options[@]} ]; do
+                echo "  $((i/3 + 1))) ${options[$i]}"
+                i=$((i + 3))
+            done
+            read -p "Selections: " selections
+            result=""
+            for sel in $selections; do
+                idx=$(((sel - 1) * 3))
+                result="$result \"${options[$idx]}\""
+            done
+            ;;
+    esac
+
+    echo "$result"
+}
+
+msgbox() {
+    local title="$1"
+    local message="$2"
+
+    case "$TUI_BACKEND" in
+        whiptail)
+            whiptail --title "$title" --msgbox "$message" 15 70
+            ;;
+        dialog)
+            dialog --title "$title" --msgbox "$message" 15 70
+            ;;
+        plain)
+            echo -e "${BLUE}=== $title ===${NC}"
+            echo "$message"
+            read -p "Press Enter to continue..."
+            ;;
+    esac
+}
+
+# Network detection functions
+detect_interfaces() {
+    ip -o link show | grep -v "lo:" | awk -F': ' '{print $2}' | sort
+}
+
+detect_interface() {
+    local interfaces
+    mapfile -t interfaces < <(detect_interfaces)
+
+    if [ ${#interfaces[@]} -eq 0 ]; then
+        echo "eth0"  # fallback
+        return
+    fi
+
+    if [ ${#interfaces[@]} -eq 1 ]; then
+        echo "${interfaces[0]}"
+        return
+    fi
+
+    # Build menu options
+    local menu_items=()
+    for iface in "${interfaces[@]}"; do
+        menu_items+=("$iface" "Network interface")
+    done
+
+    ask_menu "Network Interface" "Select network interface for RawTCP:" "${menu_items[@]}"
+}
+
+detect_ip() {
+    local iface="$1"
+    ip -4 addr show "$iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1
+}
+
+detect_gateway_mac() {
+    local iface="$1"
+    local gateway_ip
+    gateway_ip=$(ip route | grep "default.*$iface" | awk '{print $3}' | head -n1)
+
+    if [ -z "$gateway_ip" ]; then
+        echo "00:00:00:00:00:00"
+        return
+    fi
+
+    # Try to ping gateway to populate ARP cache
+    ping -c 1 -W 1 "$gateway_ip" &>/dev/null || true
+
+    # Get MAC from ARP table
+    local mac
+    mac=$(ip neigh show "$gateway_ip" dev "$iface" | awk '{print $5}' | head -n1)
+    echo "${mac:-00:00:00:00:00:00}"
+}
+
+# Secret generation
+generate_secret() {
+    if [ -f "${SCRIPT_DIR}/stealthlink-tools" ]; then
+        "${SCRIPT_DIR}/stealthlink-tools" secret
+    elif command -v openssl &> /dev/null; then
+        openssl rand -hex 32
+    else
+        # Fallback to /dev/urandom
+        head -c 32 /dev/urandom | xxd -p -c 32
+    fi
+}
+
+# Configuration variables
+ROLE=""
+TRANSPORT=""
+CARRIER=""
+BEHAVIORS=()
+SHARED_KEY=""
+AUTH_MODE="key"
+SERVICES=()
+GATEWAY_ADDR=""
+AGENT_ID=""
+METRICS_ENABLED="false"
+METRICS_ADDR="127.0.0.1:9090"
+WARP_ENABLED="false"
+WARP_ROUTING_MODE="vpn_only"
+WARP_VPN_SUBNET="10.8.0.0/24"
+REVERSE_ENABLED="false"
+REVERSE_ROLE=""
+REVERSE_CLIENT_ADDR=""
+REVERSE_SERVER_ADDR=""
+TLS_CERT_FILE=""
+TLS_KEY_FILE=""
+
+# RawTCP specific
+RAWTCP_INTERFACE=""
+RAWTCP_LOCAL_IP=""
+RAWTCP_GATEWAY_MAC=""
+RAWTCP_PORT="443"
+RAWTCP_SETUP_FIREWALL="false"
+
+# Main wizard flow
+wizard_welcome() {
+    msgbox "StealthLink Configuration Wizard" \
+"Welcome to the StealthLink Configuration Wizard!
+
+This interactive tool will guide you through setting up your StealthLink configuration.
+
+Features:
+- Role-based setup (Gateway or Agent)
+- Multiple transport carriers
+- Behavior overlay selection
+- Automatic network detection
+- Service configuration
+
+Press OK to begin."
+}
+
+wizard_role() {
+    ROLE=$(ask_menu "Role Selection" "Select the role for this StealthLink instance:" \
+        "gateway" "Gateway - Accepts connections from agents" \
+        "agent" "Agent - Connects to gateway")
+}
+
+wizard_transport() {
+    TRANSPORT=$(ask_menu "Transport Selection" "Select transport protocol:" \
+        "uqsp" "UQSP - Unified QUIC Superset Protocol (recommended)" \
+        "direct" "Direct - Simple TCP/UDP transport")
+}
+
+wizard_carrier() {
+    if [ "$TRANSPORT" != "uqsp" ]; then
+        CARRIER="tcp"
+        return
+    fi
+
+    CARRIER=$(ask_menu "Carrier Selection" "Select UQSP carrier:" \
+        "quic" "QUIC - Standard QUIC protocol (default)" \
+        "rawtcp" "RawTCP - Raw TCP with custom framing" \
+        "icmptun" "ICMPTun - ICMP tunnel" \
+        "webtunnel" "WebTunnel - HTTP/WebSocket tunnel" \
+        "chisel" "Chisel - Fast TCP/UDP tunnel over HTTP" \
+        "xhttp" "XHTTP - Extended HTTP transport" \
+        "trusttunnel" "TrustTunnel - TLS-based tunnel")
+}
+
+wizard_variant() {
+    if [ "$TRANSPORT" != "uqsp" ]; then
+        return
+    fi
+
+    local variant_desc
+    variant_desc=$(ask_menu "Protocol Variant" "Select UQSP protocol variant (optimized presets):
+
+Variant 4a (xhttp-tls):  Maximum stealth with CDN/Cloudflare cover
+Variant 4b (raw-tcp):    Low latency, high throughput for gaming/realtime
+Variant 4c (tls-mirror): TLS fingerprint resistance with post-quantum security
+Variant 4d (udp):        QUIC/UDP-based with anti-DPI (Hysteria2-style)
+Variant 4e (trust):      HTTP-compatible for corporate/restricted networks
+
+Select variant:" \
+        "4a" "xhttp-tls: XHTTP + TLS + Domain Fronting + ECH" \
+        "4b" "raw-tcp: Raw TCP + obfs4 + AmneziaWG padding" \
+        "4c" "tls-mirror: REALITY/ShadowTLS + XTLS Vision + PQ" \
+        "4d" "udp: QUIC + Hysteria2 CC + Salamander (recommended)" \
+        "4e" "trust: WebTunnel + HTTP/2 + HTTP/3 compatibility" \
+        "custom" "Custom: Manual carrier and behavior selection")
+
+    case "$variant_desc" in
+        4a)
+            CARRIER="xhttp"
+            BEHAVIORS=("ech" "domainfront" "vision" "tlsfrag")
+            msgbox "Variant 4a - XHTTP+TLS" \
+"Configuration preset applied:
+- Carrier: XHTTP (HTTP/2 streaming)
+- Behaviors: ECH, Domain Fronting, XTLS Vision, TLS Fragmentation
+
+Best for: Maximum stealth with CDN cover (Cloudflare, etc.)
+Use case: High-censorship environments"
+            ;;
+        4b)
+            CARRIER="rawtcp"
+            BEHAVIORS=("obfs4" "awg")
+            msgbox "Variant 4b - Raw TCP" \
+"Configuration preset applied:
+- Carrier: RawTCP (direct TCP)
+- Behaviors: obfs4, AmneziaWG padding
+
+Best for: Low-latency, high-throughput scenarios
+Use case: Gaming, real-time applications, minimal overhead"
+            ;;
+        4c)
+            CARRIER="quic"
+            BEHAVIORS=("reality" "vision" "tlsmirror")
+            msgbox "Variant 4c - TLS Mirror" \
+"Configuration preset applied:
+- Carrier: QUIC (standard)
+- Behaviors: REALITY, XTLS Vision, TLS Mirroring
+
+Best for: TLS fingerprint resistance
+Use case: Defeating deep packet inspection, post-quantum security"
+            ;;
+        4d)
+            CARRIER="quic"
+            BEHAVIORS=("vision" "awg")
+            msgbox "Variant 4d - UDP/QUIC" \
+"Configuration preset applied:
+- Carrier: QUIC (Hysteria2-style congestion control)
+- Behaviors: XTLS Vision, AmneziaWG padding
+
+Best for: UDP-based protocols with anti-DPI
+Use case: General-purpose, excellent performance"
+            ;;
+        4e)
+            CARRIER="webtunnel"
+            BEHAVIORS=("tlsfrag")
+            msgbox "Variant 4e - Trust Tunnel" \
+"Configuration preset applied:
+- Carrier: WebTunnel (HTTP/WebSocket)
+- Behaviors: TLS Fragmentation
+
+Best for: HTTP-constrained environments
+Use case: Corporate firewalls, restricted networks"
+            ;;
+        custom)
+            msgbox "Custom Configuration" \
+"You selected custom configuration.
+The wizard will now ask for individual carrier and behavior settings."
+            ;;
+    esac
+}
+
+wizard_rawtcp_config() {
+    if [ "$CARRIER" != "rawtcp" ]; then
+        return
+    fi
+
+    msgbox "RawTCP Configuration" \
+"RawTCP requires network interface configuration and may need firewall rules.
+
+The wizard will auto-detect your network settings."
+
+    RAWTCP_INTERFACE=$(detect_interface)
+    RAWTCP_LOCAL_IP=$(detect_ip "$RAWTCP_INTERFACE")
+    RAWTCP_GATEWAY_MAC=$(detect_gateway_mac "$RAWTCP_INTERFACE")
+
+    # Allow user to override
+    RAWTCP_INTERFACE=$(ask_input "Interface" "Network interface:" "$RAWTCP_INTERFACE")
+    RAWTCP_LOCAL_IP=$(ask_input "Local IP" "Local IP address:" "$RAWTCP_LOCAL_IP")
+    RAWTCP_GATEWAY_MAC=$(ask_input "Gateway MAC" "Gateway MAC address:" "$RAWTCP_GATEWAY_MAC")
+    RAWTCP_PORT=$(ask_input "Port" "RawTCP port:" "$RAWTCP_PORT")
+
+    if ask_yesno "Firewall Setup" "Do you want to setup firewall rules now?" "no"; then
+        RAWTCP_SETUP_FIREWALL="true"
+    fi
+}
+
+wizard_behaviors() {
+    local selected
+    selected=$(ask_checklist "Behavior Overlays" "Select optional behavior overlays (space to select):" \
+        "shadowtls" "ShadowTLS - TLS camouflage" off \
+        "reality" "Reality - Advanced TLS masquerading" off \
+        "ech" "ECH - Encrypted Client Hello" off \
+        "tlsfrag" "TLSFrag - TLS fragmentation" off \
+        "domainfront" "DomainFront - Domain fronting" off \
+        "awg" "AWG - AmneziaWG obfuscation" off \
+        "vision" "Vision - Traffic shaping" off \
+        "obfs4" "Obfs4 - obfs4proxy integration" off \
+        "tlsmirror" "TLSMirror - TLS mirroring" off)
+
+    # Parse selected items
+    BEHAVIORS=()
+    for item in $selected; do
+        BEHAVIORS+=("${item//\"/}")
+    done
+}
+
+wizard_security() {
+    if ask_yesno "Security - Secret Key" "Generate a new shared secret key?" "yes"; then
+        SHARED_KEY=$(generate_secret)
+        msgbox "Generated Key" "Your shared secret key is:\n\n$SHARED_KEY\n\nPlease save this key securely. You'll need it on both gateway and agents."
+    else
+        SHARED_KEY=$(ask_input "Security - Secret Key" "Enter shared secret key:" "")
+    fi
+
+    AUTH_MODE=$(ask_menu "Authentication Mode" "Select authentication mode:" \
+        "key" "Shared Key - Simple pre-shared key" \
+        "token" "Token - JWT token-based auth" \
+        "mtls" "mTLS - Mutual TLS authentication")
+}
+
+wizard_services() {
+    if [ "$ROLE" != "gateway" ]; then
+        return
+    fi
+
+    if ! ask_yesno "Services" "Do you want to add services now?" "yes"; then
+        return
+    fi
+
+    while true; do
+        local svc_type
+        svc_type=$(ask_menu "Service Type" "Select service type:" \
+            "tcp" "TCP - TCP port forwarding" \
+            "udp" "UDP - UDP port forwarding" \
+            "socks5" "SOCKS5 - SOCKS5 proxy server" \
+            "done" "Finish adding services")
+
+        if [ "$svc_type" = "done" ]; then
+            break
+        fi
+
+        local listen_addr
+        local target_addr=""
+
+        case "$svc_type" in
+            tcp|udp)
+                listen_addr=$(ask_input "Listen Address" "Listen address (e.g., 0.0.0.0:8080):" "0.0.0.0:8080")
+                target_addr=$(ask_input "Target Address" "Target address (e.g., 192.168.1.10:80):" "192.168.1.10:80")
+                ;;
+            socks5)
+                listen_addr=$(ask_input "Listen Address" "SOCKS5 listen address:" "0.0.0.0:1080")
+                ;;
+        esac
+
+        SERVICES+=("$svc_type|$listen_addr|$target_addr")
+    done
+}
+
+wizard_agent_config() {
+    if [ "$ROLE" != "agent" ]; then
+        return
+    fi
+
+    GATEWAY_ADDR=$(ask_input "Gateway Address" "Gateway address (host:port):" "gateway.example.com:443")
+    AGENT_ID=$(ask_input "Agent ID" "Agent identifier:" "agent-$(hostname)")
+}
+
+wizard_metrics() {
+    if ask_yesno "Metrics" "Enable metrics endpoint?" "no"; then
+        METRICS_ENABLED="true"
+        METRICS_ADDR=$(ask_input "Metrics Address" "Metrics listen address:" "127.0.0.1:9090")
+    fi
+}
+
+wizard_warp_reverse_tls() {
+    if ask_yesno "WARP" "Enable WARP server IP hiding?" "no"; then
+        WARP_ENABLED="true"
+        WARP_ROUTING_MODE=$(ask_menu "WARP Routing" "Select WARP routing mode:" \
+            "vpn_only" "Route VPN return traffic only (recommended)" \
+            "all" "Route all traffic via WARP")
+        WARP_VPN_SUBNET=$(ask_input "WARP Subnet" "VPN subnet for split routing:" "10.8.0.0/24")
+    fi
+
+    if ask_yesno "Reverse Mode" "Enable reverse proxy mode?" "no"; then
+        REVERSE_ENABLED="true"
+        if [ "$ROLE" = "gateway" ]; then
+            REVERSE_ROLE="dialer"
+            REVERSE_CLIENT_ADDR=$(ask_input "Reverse Client Address" "Client listener address:" "127.0.0.1:9443")
+        else
+            REVERSE_ROLE="listener"
+            REVERSE_SERVER_ADDR=$(ask_input "Reverse Server Address" "Server dial target:" "0.0.0.0:9443")
+        fi
+    fi
+
+    if ask_yesno "TLS Certificates" "Configure TLS certificate paths?" "no"; then
+        TLS_CERT_FILE=$(ask_input "TLS Cert" "TLS cert file path:" "/etc/letsencrypt/live/example/fullchain.pem")
+        TLS_KEY_FILE=$(ask_input "TLS Key" "TLS key file path:" "/etc/letsencrypt/live/example/privkey.pem")
+    elif ask_yesno "ACME" "Use acme.sh defaults for Let's Encrypt?" "no"; then
+        local domain
+        domain=$(ask_input "ACME Domain" "Primary certificate domain:" "example.com")
+        TLS_CERT_FILE="$HOME/.acme.sh/${domain}/fullchain.cer"
+        TLS_KEY_FILE="$HOME/.acme.sh/${domain}/${domain}.key"
+    fi
+}
+
+wizard_review() {
+    local yaml_content
+    yaml_content=$(generate_yaml)
+
+    if [ "$TUI_BACKEND" = "plain" ]; then
+        echo -e "${YELLOW}=== Configuration Review ===${NC}"
+        echo "$yaml_content"
+        echo ""
+        read -p "Save this configuration? [Y/n]: " answer
+        answer="${answer:-y}"
+        [[ "$answer" =~ ^[Yy] ]]
+    else
+        if ! whiptail --title "Configuration Review" --yesno "$(echo -e "Review your configuration:\n\n$yaml_content\n\nSave this configuration?")" 25 80 --scrolltext; then
+            return 1
+        fi
+    fi
+}
+
+generate_yaml() {
+    local yaml=""
+
+    # Header
+    yaml+="# StealthLink Configuration\n"
+    yaml+="# Generated by stealthlink-wizard on $(date)\n\n"
+
+    # Role
+    yaml+="role: $ROLE\n\n"
+
+    # Transport
+    yaml+="transport:\n"
+    yaml+="  type: $TRANSPORT\n"
+    if [ -n "$TLS_CERT_FILE" ] || [ -n "$TLS_KEY_FILE" ]; then
+        yaml+="  tls:\n"
+        [ -n "$TLS_CERT_FILE" ] && yaml+="    cert_file: \"$TLS_CERT_FILE\"\n"
+        [ -n "$TLS_KEY_FILE" ] && yaml+="    key_file: \"$TLS_KEY_FILE\"\n"
+    fi
+
+    if [ "$TRANSPORT" = "uqsp" ]; then
+        yaml+="  uqsp:\n"
+        yaml+="    carrier:\n"
+        yaml+="      type: $CARRIER\n"
+
+        # Carrier-specific config
+        case "$CARRIER" in
+            rawtcp)
+                yaml+="      rawtcp:\n"
+                yaml+="        raw:\n"
+                yaml+="          interface: \"$RAWTCP_INTERFACE\"\n"
+                yaml+="          local_ip: \"$RAWTCP_LOCAL_IP\"\n"
+                yaml+="          gateway_mac: \"$RAWTCP_GATEWAY_MAC\"\n"
+                yaml+="          port: $RAWTCP_PORT\n"
+                ;;
+            quic)
+                yaml+="    congestion:\n"
+                yaml+="      algorithm: bbr\n"
+                ;;
+            xhttp)
+                yaml+="      xhttp:\n"
+                yaml+="        mode: stream-up\n"
+                yaml+="        max_connections: 4\n"
+                ;;
+            webtunnel)
+                yaml+="      webtunnel:\n"
+                yaml+="        path: \"/tunnel\"\n"
+                ;;
+        esac
+
+        # Behaviors
+        if [ ${#BEHAVIORS[@]} -gt 0 ]; then
+            yaml+="    behaviors:\n"
+            for behavior in "${BEHAVIORS[@]}"; do
+                case "$behavior" in
+                    ech)
+                        yaml+="      ech:\n"
+                        yaml+="        enabled: true\n"
+                        yaml+="        public_name: \"cloudflare.com\"\n"
+                        ;;
+                    domainfront)
+                        yaml+="      domainfront:\n"
+                        yaml+="        enabled: true\n"
+                        yaml+="        front_domain: \"cloudflare.com\"\n"
+                        ;;
+                    reality)
+                        yaml+="      reality:\n"
+                        yaml+="        enabled: true\n"
+                        yaml+="        dest: \"www.microsoft.com:443\"\n"
+                        ;;
+                    shadowtls)
+                        yaml+="      shadowtls:\n"
+                        yaml+="        enabled: true\n"
+                        yaml+="        version: 3\n"
+                        ;;
+                    vision)
+                        yaml+="      vision:\n"
+                        yaml+="        enabled: true\n"
+                        yaml+="        flow_auto_detect: true\n"
+                        ;;
+                    tlsfrag)
+                        yaml+="      tlsfrag:\n"
+                        yaml+="        enabled: true\n"
+                        yaml+="        strategy: sni_split\n"
+                        ;;
+                    awg)
+                        yaml+="      awg:\n"
+                        yaml+="        enabled: true\n"
+                        ;;
+                    obfs4)
+                        yaml+="      obfs4:\n"
+                        yaml+="        enabled: true\n"
+                        ;;
+                    tlsmirror)
+                        yaml+="      tlsmirror:\n"
+                        yaml+="        enabled: true\n"
+                        ;;
+                    *)
+                        yaml+="      $behavior:\n"
+                        yaml+="        enabled: true\n"
+                        ;;
+                esac
+            done
+        fi
+
+        if [ "$REVERSE_ENABLED" = "true" ]; then
+            yaml+="    reverse:\n"
+            yaml+="      enabled: true\n"
+            yaml+="      role: \"$REVERSE_ROLE\"\n"
+            [ -n "$REVERSE_CLIENT_ADDR" ] && yaml+="      client_address: \"$REVERSE_CLIENT_ADDR\"\n"
+            [ -n "$REVERSE_SERVER_ADDR" ] && yaml+="      server_address: \"$REVERSE_SERVER_ADDR\"\n"
+            yaml+="      heartbeat_interval: 10s\n"
+            yaml+="      reconnect_delay: 5s\n"
+            yaml+="      max_retries: 10\n"
+        fi
+    fi
+
+    yaml+="\n"
+
+    if [ "$WARP_ENABLED" = "true" ]; then
+        yaml+="warp:\n"
+        yaml+="  enabled: true\n"
+        yaml+="  mode: builtin\n"
+        yaml+="  endpoint: \"engage.cloudflareclient.com:2408\"\n"
+        yaml+="  routing_mode: \"$WARP_ROUTING_MODE\"\n"
+        yaml+="  vpn_subnet: \"$WARP_VPN_SUBNET\"\n\n"
+    fi
+
+    # Security
+    yaml+="security:\n"
+    yaml+="  auth_mode: $AUTH_MODE\n"
+    yaml+="  shared_key: \"$SHARED_KEY\"\n\n"
+
+    # Role-specific config
+    if [ "$ROLE" = "gateway" ]; then
+        yaml+="gateway:\n"
+        yaml+="  listen: 0.0.0.0:443\n"
+
+        if [ ${#SERVICES[@]} -gt 0 ]; then
+            yaml+="  services:\n"
+            for svc in "${SERVICES[@]}"; do
+                IFS='|' read -r svc_type listen_addr target_addr <<< "$svc"
+                yaml+="    - type: $svc_type\n"
+                yaml+="      listen: \"$listen_addr\"\n"
+                [ -n "$target_addr" ] && yaml+="      target: \"$target_addr\"\n"
+            done
+        fi
+    else
+        yaml+="agent:\n"
+        yaml+="  gateway: \"$GATEWAY_ADDR\"\n"
+        yaml+="  id: \"$AGENT_ID\"\n"
+        yaml+="  reconnect_interval: 5s\n"
+    fi
+
+    yaml+="\n"
+
+    # Metrics
+    if [ "$METRICS_ENABLED" = "true" ]; then
+        yaml+="metrics:\n"
+        yaml+="  enabled: true\n"
+        yaml+="  listen: \"$METRICS_ADDR\"\n\n"
+    fi
+
+    # Logging
+    yaml+="logging:\n"
+    yaml+="  level: info\n"
+    yaml+="  format: json\n"
+
+    echo -e "$yaml"
+}
+
+write_config() {
+    local yaml_content
+    yaml_content=$(generate_yaml)
+
+    # Create config directory if it doesn't exist
+    mkdir -p "$CONFIG_DIR"
+
+    # Backup existing config
+    if [ -f "$OUTPUT" ]; then
+        local backup="${OUTPUT}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$OUTPUT" "$backup"
+        echo -e "${YELLOW}Existing config backed up to: $backup${NC}"
+    fi
+
+    # Write new config
+    echo -e "$yaml_content" > "$OUTPUT"
+    chmod 600 "$OUTPUT"
+
+    echo -e "${GREEN}Configuration written to: $OUTPUT${NC}"
+
+    # Apply firewall rules if requested
+    if [ "$RAWTCP_SETUP_FIREWALL" = "true" ]; then
+        if [ -f "${SCRIPT_DIR}/stealthlink-iptables.sh" ]; then
+            echo -e "${BLUE}Applying firewall rules...${NC}"
+            sudo "${SCRIPT_DIR}/stealthlink-iptables.sh" apply
+        else
+            echo -e "${YELLOW}Warning: stealthlink-iptables.sh not found, skipping firewall setup${NC}"
+        fi
+    fi
+}
+
+wizard_complete() {
+    msgbox "Setup Complete" \
+"StealthLink configuration has been created successfully!
+
+Configuration file: $OUTPUT
+
+Next steps:
+1. Review the configuration file
+2. Start StealthLink: systemctl start stealthlink
+3. Check status: systemctl status stealthlink
+4. View logs: journalctl -u stealthlink -f
+
+For the agent role, ensure you use the same shared key on the gateway.
+
+Thank you for using StealthLink!"
+}
+
+# Main execution
+main() {
+    detect_tui
+
+    wizard_welcome
+    wizard_role
+    wizard_transport
+    wizard_carrier
+    wizard_variant
+    wizard_rawtcp_config
+    wizard_behaviors
+    wizard_security
+    wizard_services
+    wizard_agent_config
+    wizard_metrics
+    wizard_warp_reverse_tls
+
+    if wizard_review; then
+        write_config
+        wizard_complete
+    else
+        echo -e "${RED}Configuration cancelled.${NC}"
+        exit 1
+    fi
+}
+
+# Run main if executed directly
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
