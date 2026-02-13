@@ -154,6 +154,15 @@ func (c *cstpConn) writeFrame(ft byte, payload []byte) error {
 
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	// Check if connection is closed before writing
+	select {
+	case <-c.stop:
+		return fmt.Errorf("cstp: connection closed")
+	default:
+	}
+	if c.Conn == nil {
+		return fmt.Errorf("cstp: underlying connection is nil")
+	}
 	_, err := c.Conn.Write(frame)
 	return err
 }

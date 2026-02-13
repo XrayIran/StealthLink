@@ -1,3 +1,6 @@
+//go:build cgo
+// +build cgo
+
 package rawtcp
 
 import (
@@ -28,15 +31,46 @@ func NewRecvHandle(cfg *packetConfig) (*RecvHandle, error) {
 		}
 	}
 
-	filter := fmt.Sprintf("tcp and dst port %d", cfg.port)
+	filter := buildBPFFilter(cfg)
 	if err := handle.SetBPFFilter(filter); err != nil {
 		return nil, fmt.Errorf("set BPF filter: %w", err)
 	}
 
-	return &RecvHandle{
+	rh := &RecvHandle{
 		handle:    handle,
 		addrCache: make(map[addrKey]*net.UDPAddr, 1024),
-	}, nil
+	}
+	return rh, nil
+}
+
+// buildBPFFilter constructs a BPF filter appropriate for the configured profile.
+// Profiles:
+//   - "basic" (default): tcp and dst port N
+//   - "strict": keeps likely transport frames (ACK/PSH-bearing segments)
+//   - "stealth": strict + drops obvious scanner flag patterns without
+//     blacklisting source ports used by legitimate deployments (e.g. 443).
+func buildBPFFilter(cfg *packetConfig) string {
+	base := fmt.Sprintf("tcp and dst port %d", cfg.port)
+
+	bpfProfile := "basic"
+	if len(cfg.bpfProfile) > 0 {
+		bpfProfile = cfg.bpfProfile
+	}
+
+	switch bpfProfile {
+	case "strict":
+		// Keep segments used by this transport while reducing unrelated noise.
+		return fmt.Sprintf("(%s) and (tcp[tcpflags] & (tcp-push|tcp-ack) != 0)", base)
+	case "stealth":
+		// Avoid source-port blacklists (they can break real tunnels on 443/80).
+		// Instead suppress common unsolicited probe signatures:
+		// - pure SYN (scan/init without data path semantics)
+		// - any RST segments
+		// - pure ECE / CWR probes (commonly used by scanners)
+		return fmt.Sprintf("(%s) and (tcp[tcpflags] & (tcp-push|tcp-ack) != 0) and not (tcp[tcpflags] & tcp-rst != 0) and not (tcp[tcpflags] = tcp-syn) and not (tcp[tcpflags] & 0xc0 != 0 and tcp[tcpflags] & (tcp-push|tcp-ack) = 0)", base)
+	default:
+		return base
+	}
 }
 
 func (h *RecvHandle) Read() ([]byte, net.Addr, error) {

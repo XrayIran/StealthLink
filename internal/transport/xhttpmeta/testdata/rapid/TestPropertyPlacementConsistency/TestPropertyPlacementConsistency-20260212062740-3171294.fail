@@ -1,0 +1,63 @@
+# 2026/02/12 06:27:40.378383 [TestPropertyPlacementConsistency] [rapid] draw session_placement: "header"
+# 2026/02/12 06:27:40.378413 [TestPropertyPlacementConsistency] [rapid] draw session_key: "00"
+# 2026/02/12 06:27:40.378415 [TestPropertyPlacementConsistency] [rapid] draw seq_placement: "path"
+# 2026/02/12 06:27:40.378420 [TestPropertyPlacementConsistency] [rapid] draw seq_key: "1"
+# 2026/02/12 06:27:40.378422 [TestPropertyPlacementConsistency] [rapid] draw mode_placement: "path"
+# 2026/02/12 06:27:40.378429 [TestPropertyPlacementConsistency] [rapid] draw mode_key: "0"
+# 2026/02/12 06:27:40.378431 [TestPropertyPlacementConsistency] [rapid] draw num_requests: 2
+# 2026/02/12 06:27:40.378435 [TestPropertyPlacementConsistency] [rapid] draw session_id: "-"
+# 2026/02/12 06:27:40.378436 [TestPropertyPlacementConsistency] [rapid] draw seq: 0x0
+# 2026/02/12 06:27:40.378440 [TestPropertyPlacementConsistency] [rapid] draw mode: "a"
+# 2026/02/12 06:27:40.378448 [TestPropertyPlacementConsistency] Request 0: Mode mismatch: got "0", want "a"
+# 2026/02/12 06:27:40.378451 [TestPropertyPlacementConsistency] [rapid] draw seq: 0x0
+# 2026/02/12 06:27:40.378454 [TestPropertyPlacementConsistency] [rapid] draw mode: "a"
+# 2026/02/12 06:27:40.378461 [TestPropertyPlacementConsistency] Request 1: Mode mismatch: got "0", want "a"
+# 
+v0.4.8#10331950660966169698
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x5555555555555
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x1
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0

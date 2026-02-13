@@ -1,0 +1,6 @@
+/dist
+/cmd/client/client
+/cmd/server/server
+*.exe
+*.zip
+.vscode

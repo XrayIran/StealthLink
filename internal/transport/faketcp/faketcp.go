@@ -15,7 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"stealthlink/internal/metrics"
 	"stealthlink/internal/transport"
+	"stealthlink/internal/transport/batch"
+	"stealthlink/internal/transport/kcpbase"
 
 	"github.com/xtaci/smux"
 )
@@ -31,16 +34,140 @@ const (
 	PacketTypeKeepalive = 0x07
 )
 
+type sessionCrypto struct {
+	enabled bool
+	send    *AEADEncryptor
+	recv    *AEADEncryptor
+}
+
+func buildSessionCrypto(cfg *Config, isClient bool) (*sessionCrypto, error) {
+	if cfg.CryptoKey == "" || cfg.AEADMode == "off" || cfg.AEADMode == "" {
+		return &sessionCrypto{enabled: false}, nil
+	}
+
+	keyLen := 32
+	if cfg.AEADMode == "aesgcm" {
+		keyLen = 16
+	}
+
+	kd := NewKeyDerivation(cfg.CryptoKey)
+	keys, err := kd.DeriveDirectionalKeys(keyLen)
+	if err != nil {
+		return nil, err
+	}
+
+	var sendKey, recvKey []byte
+	if isClient {
+		sendKey = keys.ClientToServer
+		recvKey = keys.ServerToClient
+	} else {
+		sendKey = keys.ServerToClient
+		recvKey = keys.ClientToServer
+	}
+
+	send, err := NewAEADEncryptor(cfg.AEADMode, sendKey)
+	if err != nil {
+		return nil, fmt.Errorf("create send AEAD: %w", err)
+	}
+
+	recv, err := NewAEADEncryptor(cfg.AEADMode, recvKey)
+	if err != nil {
+		return nil, fmt.Errorf("create recv AEAD: %w", err)
+	}
+
+	return &sessionCrypto{
+		enabled: true,
+		send:    send,
+		recv:    recv,
+	}, nil
+}
+
+func (s *fakeSession) encryptPacket(pkt *packet) {
+	if s.crypto == nil || !s.crypto.enabled || s.crypto.send == nil {
+		return
+	}
+	pkt.Payload = s.crypto.send.Seal(pkt.Payload, pkt)
+	direction := "s2c"
+	if s.isClient {
+		direction = "c2s"
+	}
+	metrics.AddFakeTCPEncryptedBytes(int64(len(pkt.Payload)), direction)
+}
+
+func (s *fakeSession) decryptPacket(pkt *packet) error {
+	if s.crypto == nil || !s.crypto.enabled || s.crypto.recv == nil || len(pkt.Payload) == 0 {
+		return nil
+	}
+	plaintext, err := s.crypto.recv.Open(pkt.Payload, pkt)
+	if err != nil {
+		return err
+	}
+	pkt.Payload = plaintext
+	return nil
+}
+
+func (s *fakeSession) effectiveMTU() int {
+	mtu := s.config.MTU
+	if mtu <= 0 {
+		mtu = 1400
+	}
+	// Subtract FakeTCP header (24) and AEAD tag (16)
+	mtu -= HeaderSize
+	if s.crypto != nil && s.crypto.enabled {
+		mtu -= 16
+	}
+	return mtu
+}
+
 // Header size for fake TCP packets.
 const HeaderSize = 24
 
+// TCPFingerprintProfile defines TCP option mimicry for DPI evasion.
+type TCPFingerprintProfile struct {
+	Name        string
+	MSS         uint16
+	WindowScale uint8
+	SACKPermit  uint8
+}
+
+var (
+	FPProfileLinuxDefault   = TCPFingerprintProfile{Name: "linux", MSS: 1460, WindowScale: 7, SACKPermit: 1}
+	FPProfileWindowsDefault = TCPFingerprintProfile{Name: "windows", MSS: 1440, WindowScale: 8, SACKPermit: 1}
+)
+
+func LookupFingerprintProfile(name string) TCPFingerprintProfile {
+	switch name {
+	case "windows":
+		return FPProfileWindowsDefault
+	default:
+		return FPProfileLinuxDefault
+	}
+}
+
+func resolveFingerprintProfile(cfg *Config) TCPFingerprintProfile {
+	return cfg.FingerprintProfile
+}
+
 // Config holds fake TCP configuration.
 type Config struct {
-	MTU           int           // Maximum transmission unit
-	WindowSize    int           // TCP window size
-	RTO           time.Duration // Retransmission timeout
-	Keepalive     time.Duration // Keepalive interval
-	KeepaliveIdle time.Duration // Idle time before keepalive
+	MTU                int                    // Maximum transmission unit
+	WindowSize         int                    // TCP window size
+	RTO                time.Duration          // Retransmission timeout
+	Keepalive          time.Duration          // Keepalive interval
+	KeepaliveIdle      time.Duration          // Idle time before keepalive
+	FingerprintProfile TCPFingerprintProfile  // TCP option mimicry profile
+	CryptoKey          string                 // Shared secret for directional key derivation
+	AEADMode           string                 // off, chacha20poly1305, aesgcm
+	FakeHTTPPreface    *FakeHTTPPrefaceConfig // Optional fake HTTP preface framing
+	Batch              batch.BatchConfig      // Batch I/O configuration
+}
+
+// FakeHTTPPrefaceConfig configures fake HTTP preface injected on first send/recv
+type FakeHTTPPrefaceConfig struct {
+	Enabled   bool   // Whether to inject fake HTTP preface
+	Host      string // Host header value
+	UserAgent string // User-Agent header value
+	Path      string // Request path
 }
 
 // DefaultConfig returns a default configuration.
@@ -71,6 +198,8 @@ type Listener struct {
 	acceptCh  chan *fakeSession
 	closeCh   chan struct{}
 	closeOnce sync.Once
+
+	batchMgr *batch.BatchIOManager // Batch I/O manager for UDP operations
 }
 
 // NewDialer creates a new fake TCP dialer.
@@ -116,56 +245,105 @@ func Listen(addr string, cfg *Config, smuxCfg *smux.Config, guard string) (*List
 		closeCh:  make(chan struct{}),
 	}
 
+	// Initialize batch manager
+	l.batchMgr = batch.NewBatchIOManager(cfg.Batch)
+
 	// Start the accept loop
 	go l.acceptLoop()
 
 	return l, nil
 }
 
+func (l *Listener) RecvBatch(buffers [][]byte) (int, []net.Addr, error) {
+	return l.batchMgr.RecvBatch(l.conn, buffers)
+}
+
 // acceptLoop handles incoming packets.
 func (l *Listener) acceptLoop() {
-	buf := make([]byte, 65536)
+	batchSize := l.batchMgr.BatchSize()
+	buffers := make([][]byte, batchSize)
+	for i := range buffers {
+		buffers[i] = make([]byte, 65536)
+	}
+
 	for {
-		n, addr, err := l.conn.ReadFromUDP(buf)
+		// Use RecvBatch for efficient multi-packet receive
+		nBatch, addrs, err := l.RecvBatch(buffers)
 		if err != nil {
-			return
-		}
-
-		if n < HeaderSize {
-			continue // Too small
-		}
-
-		// Parse header
-		pkt := parsePacket(buf[:n])
-		if pkt == nil {
+			select {
+			case <-l.closeCh:
+				return
+			default:
+			}
 			continue
 		}
 
-		// Find or create session
-		sessionKey := addr.String()
-		if val, ok := l.sessions.Load(sessionKey); ok {
-			session := val.(*fakeSession)
-			session.handlePacket(pkt)
-		} else if pkt.Type == PacketTypeSYN {
-			// New connection
-			session := l.newSession(addr)
-			session.handlePacket(pkt)
+		for i := 0; i < nBatch; i++ {
+			buf := buffers[i]
+			n := len(buf)
+			addr := addrs[i].(*net.UDPAddr)
+
+			if n < HeaderSize {
+				continue // Too small
+			}
+
+			// Parse header
+			pkt := parsePacket(buf)
+			if pkt == nil {
+				continue
+			}
+
+			// Find session
+			sessionKey := addr.String()
+			var session *fakeSession
+			if val, ok := l.sessions.Load(sessionKey); ok {
+				session = val.(*fakeSession)
+			} else if pkt.Type == PacketTypeSYN {
+				// New connection
+				session = l.newSession(addr)
+			}
+
+			if session != nil {
+				// Decrypt if necessary
+				if err := session.decryptPacket(pkt); err != nil {
+					continue // Auth failure, discard
+				}
+				session.handlePacket(pkt)
+			}
+		}
+
+		// Prepare buffers for next batch
+		for i := range buffers {
+			if cap(buffers[i]) < 65536 {
+				buffers[i] = make([]byte, 65536)
+			} else {
+				buffers[i] = buffers[i][:cap(buffers[i])]
+			}
 		}
 	}
 }
 
 // newSession creates a new fake TCP session.
 func (l *Listener) newSession(addr *net.UDPAddr) *fakeSession {
+	cryptoCtx, err := buildSessionCrypto(l.config, false)
+	if err != nil {
+		return nil
+	}
 	s := &fakeSession{
-		listener: l,
-		remote:   addr,
-		state:    StateListen,
-		window:   newWindow(l.config.WindowSize),
-		config:   l.config,
-		readCh:   make(chan *packet, 256),
-		writeCh:  make(chan []byte, 256),
-		closeCh:  make(chan struct{}),
-		readyCh:  make(chan struct{}, 1),
+		listener:  l,
+		conn:      nil,
+		remote:    addr,
+		state:     StateListen,
+		window:    newWindow(l.config.WindowSize),
+		config:    l.config,
+		fpProfile: l.config.FingerprintProfile,
+		crypto:    cryptoCtx,
+		readCh:    make(chan *packet, 256),
+		writeCh:   make(chan []byte, 256),
+		closeCh:   make(chan struct{}),
+		readyCh:   make(chan struct{}, 1),
+		batchMgr:  l.batchMgr,
+		sndNxt:    uint32(kcpbase.FastRandom.Int64n(1 << 32)),
 	}
 	l.sessions.Store(addr.String(), s)
 	return s
@@ -175,6 +353,7 @@ func (l *Listener) newSession(addr *net.UDPAddr) *fakeSession {
 func (l *Listener) Accept() (transport.Session, error) {
 	select {
 	case session := <-l.acceptCh:
+		// Send guard token if configured
 		if l.guard != "" {
 			guard := make([]byte, len(l.guard))
 			if _, err := io.ReadFull(session, guard); err != nil {
@@ -188,7 +367,9 @@ func (l *Listener) Accept() (transport.Session, error) {
 			}
 		}
 
-		smuxSession, err := smux.Server(session, l.smux)
+		smuxCfg := *l.smux
+		smuxCfg.MaxFrameSize = session.effectiveMTU()
+		smuxSession, err := smux.Server(session, &smuxCfg)
 		if err != nil {
 			_ = session.Close()
 			return nil, fmt.Errorf("smux: %w", err)
@@ -229,16 +410,28 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (transport.Session, erro
 	}
 
 	// Create session
-	session := &fakeSession{
-		conn:    conn,
-		config:  d.Config,
-		state:   StateClosed,
-		window:  newWindow(d.Config.WindowSize),
-		readCh:  make(chan *packet, 256),
-		writeCh: make(chan []byte, 256),
-		closeCh: make(chan struct{}),
-		readyCh: make(chan struct{}, 1),
+	cryptoCtx, err := buildSessionCrypto(d.Config, true)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("init session crypto: %w", err)
 	}
+	session := &fakeSession{
+		conn:      conn,
+		config:    d.Config,
+		state:     StateClosed,
+		window:    newWindow(d.Config.WindowSize),
+		fpProfile: d.Config.FingerprintProfile,
+		isClient:  true,
+		crypto:    cryptoCtx,
+		readCh:    make(chan *packet, 256),
+		writeCh:   make(chan []byte, 256),
+		closeCh:   make(chan struct{}),
+		readyCh:   make(chan struct{}, 1),
+		sndNxt:    uint32(kcpbase.FastRandom.Int64n(1 << 32)),
+	}
+
+	// Initialize batch manager
+	session.batchMgr = batch.NewBatchIOManager(d.Config.Batch)
 
 	// Perform handshake
 	if err := session.connect(); err != nil {
@@ -255,7 +448,9 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (transport.Session, erro
 	}
 
 	// Start smux
-	smuxSession, err := smux.Client(session, d.Smux)
+	smuxCfg := *d.Smux
+	smuxCfg.MaxFrameSize = session.effectiveMTU()
+	smuxSession, err := smux.Client(session, &smuxCfg)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("smux: %w", err)
@@ -269,17 +464,23 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (transport.Session, erro
 
 // fakeSession represents a fake TCP session.
 type fakeSession struct {
-	listener *Listener
-	conn     *net.UDPConn
-	remote   *net.UDPAddr
-	state    State
-	window   *window
-	config   *Config
+	listener  *Listener
+	conn      *net.UDPConn
+	remote    *net.UDPAddr
+	state     State
+	window    *window
+	config    *Config
+	fpProfile TCPFingerprintProfile
+	isClient  bool
+	crypto    *sessionCrypto
 
 	// Sequence numbers
 	sndUna uint32 // Send unacknowledged
 	sndNxt uint32 // Send next
 	rcvNxt uint32 // Receive next
+
+	// Reorder buffer for out-of-order packets (cap 64)
+	reorderBuf map[uint32]*packet
 
 	// Channels
 	readCh    chan *packet
@@ -291,6 +492,8 @@ type fakeSession struct {
 
 	// Guards
 	mu sync.RWMutex
+
+	batchMgr *batch.BatchIOManager // Batch I/O manager for UDP operations
 }
 
 // connect performs the client-side handshake.
@@ -325,12 +528,50 @@ func (s *fakeSession) connect() error {
 	return fmt.Errorf("handshake timeout after %d attempts", maxRetries)
 }
 
+func (s *fakeSession) SendBatch(msgs [][]byte) (int, error) {
+	conn := s.conn
+	if conn == nil && s.listener != nil {
+		conn = s.listener.conn
+	}
+	if conn == nil {
+		return 0, fmt.Errorf("nil connection")
+	}
+	return s.batchMgr.SendBatch(conn, msgs)
+}
+
+func (s *fakeSession) SendBatchAddr(msgs [][]byte, addrs []*net.UDPAddr) (int, error) {
+	conn := s.conn
+	if conn == nil && s.listener != nil {
+		conn = s.listener.conn
+	}
+	if conn == nil {
+		return 0, fmt.Errorf("nil connection")
+	}
+	return s.batchMgr.SendBatchAddr(conn, msgs, addrs)
+}
+
+func (s *fakeSession) RecvBatch(buffers [][]byte) (int, []net.Addr, error) {
+	conn := s.conn
+	if conn == nil && s.listener != nil {
+		conn = s.listener.conn
+	}
+	if conn == nil {
+		return 0, nil, fmt.Errorf("nil connection")
+	}
+	return s.batchMgr.RecvBatch(conn, buffers)
+}
+
 func (s *fakeSession) startClientReceiveLoop() {
 	if s.conn == nil {
 		return
 	}
 	go func() {
-		buf := make([]byte, 65536)
+		batchSize := s.batchMgr.BatchSize()
+		buffers := make([][]byte, batchSize)
+		for i := range buffers {
+			buffers[i] = make([]byte, 65536)
+		}
+
 		for {
 			select {
 			case <-s.closeCh:
@@ -339,7 +580,8 @@ func (s *fakeSession) startClientReceiveLoop() {
 			}
 
 			_ = s.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
-			n, err := s.conn.Read(buf)
+			// Use RecvBatch for efficient multi-packet receive
+			nBatch, _, err := s.RecvBatch(buffers)
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue
@@ -347,14 +589,31 @@ func (s *fakeSession) startClientReceiveLoop() {
 				s.handleRST(nil)
 				return
 			}
-			if n < HeaderSize {
-				continue
+
+			for i := 0; i < nBatch; i++ {
+				buf := buffers[i]
+				n := len(buf)
+				if n < HeaderSize {
+					continue
+				}
+				pkt := parsePacket(buf)
+				if pkt == nil {
+					continue
+				}
+				if err := s.decryptPacket(pkt); err != nil {
+					continue
+				}
+				s.handlePacket(pkt)
 			}
-			pkt := parsePacket(buf[:n])
-			if pkt == nil {
-				continue
+
+			// Prepare buffers for next batch
+			for i := range buffers {
+				if cap(buffers[i]) < 65536 {
+					buffers[i] = make([]byte, 65536)
+				} else {
+					buffers[i] = buffers[i][:cap(buffers[i])]
+				}
 			}
-			s.handlePacket(pkt)
 		}
 	}()
 }
@@ -463,13 +722,40 @@ func (s *fakeSession) handleData(pkt *packet) {
 
 	// Check sequence number
 	if pkt.Seq != s.rcvNxt {
-		// Out of order - queue or drop
+		// Out of order - queue (cap 64)
+		if s.reorderBuf == nil {
+			s.reorderBuf = make(map[uint32]*packet)
+		}
+		if len(s.reorderBuf) < 64 {
+			cp := &packet{Type: pkt.Type, Seq: pkt.Seq, Payload: make([]byte, len(pkt.Payload))}
+			copy(cp.Payload, pkt.Payload)
+			s.reorderBuf[pkt.Seq] = cp
+		}
 		s.mu.Unlock()
 		return
 	}
 
-	// Update receive sequence
+	// Deliver this packet and drain contiguous buffered packets
+	var toDeliver []*packet
+
 	s.rcvNxt += uint32(len(pkt.Payload))
+	payload := make([]byte, len(pkt.Payload))
+	copy(payload, pkt.Payload)
+	toDeliver = append(toDeliver, &packet{Type: PacketTypeData, Payload: payload})
+
+	// Drain contiguous reorder buffer entries
+	for {
+		if s.reorderBuf == nil {
+			break
+		}
+		next, ok := s.reorderBuf[s.rcvNxt]
+		if !ok {
+			break
+		}
+		delete(s.reorderBuf, s.rcvNxt)
+		s.rcvNxt += uint32(len(next.Payload))
+		toDeliver = append(toDeliver, next)
+	}
 
 	// Send ACK
 	ack := &packet{
@@ -477,14 +763,16 @@ func (s *fakeSession) handleData(pkt *packet) {
 		Seq:  s.sndNxt,
 		Ack:  s.rcvNxt,
 	}
-	payload := make([]byte, len(pkt.Payload))
-	copy(payload, pkt.Payload)
 	s.mu.Unlock()
 
 	_ = s.sendPacket(ack)
-	select {
-	case <-s.closeCh:
-	case s.readCh <- &packet{Type: PacketTypeData, Payload: payload}:
+
+	for _, dp := range toDeliver {
+		select {
+		case <-s.closeCh:
+			return
+		case s.readCh <- dp:
+		}
 	}
 }
 
@@ -514,19 +802,18 @@ func (s *fakeSession) handleRST(_ *packet) {
 
 // sendPacket sends a packet.
 func (s *fakeSession) sendPacket(pkt *packet) error {
-	data := encodePacket(pkt)
+	s.encryptPacket(pkt)
+	data := encodePacket(pkt, s.fpProfile)
 
-	if s.conn != nil {
-		_, err := s.conn.Write(data)
+	// Use SendBatch for efficient multi-packet send
+	if s.isClient {
+		// Connected socket
+		_, err := s.SendBatch([][]byte{data})
 		return err
 	}
-
-	if s.listener != nil {
-		_, err := s.listener.conn.WriteToUDP(data, s.remote)
-		return err
-	}
-
-	return fmt.Errorf("no connection")
+	// Shared listener socket
+	_, err := s.SendBatchAddr([][]byte{data}, []*net.UDPAddr{s.remote})
+	return err
 }
 
 // Read implements net.Conn.
@@ -571,10 +858,12 @@ func (s *fakeSession) Write(p []byte) (n int, err error) {
 	s.mu.RUnlock()
 
 	// Send data packet
+	payload := make([]byte, len(p))
+	copy(payload, p)
 	pkt := &packet{
 		Type:    PacketTypeData,
 		Seq:     atomic.AddUint32(&s.sndNxt, uint32(len(p))) - uint32(len(p)),
-		Payload: p,
+		Payload: payload,
 	}
 
 	if err := s.sendPacket(pkt); err != nil {
@@ -690,14 +979,20 @@ func parsePacket(data []byte) *packet {
 }
 
 // encodePacket encodes a packet to bytes.
-func encodePacket(pkt *packet) []byte {
+func encodePacket(pkt *packet, fp TCPFingerprintProfile) []byte {
 	data := make([]byte, HeaderSize+len(pkt.Payload))
 	data[0] = pkt.Type
 	data[1] = pkt.Flags
 	binary.BigEndian.PutUint32(data[2:6], pkt.Seq)
 	binary.BigEndian.PutUint32(data[6:10], pkt.Ack)
 	binary.BigEndian.PutUint16(data[10:12], pkt.Window)
-	// 12-23 reserved for future use
+
+	// Encode TCP options for DPI evasion
+	binary.BigEndian.PutUint16(data[12:14], fp.MSS)
+	data[14] = fp.WindowScale
+	data[15] = fp.SACKPermit
+	// 16-23 reserved for future use
+
 	copy(data[HeaderSize:], pkt.Payload)
 	return data
 }
@@ -725,3 +1020,35 @@ func (w *sessionWrapper) Close() error {
 
 func (w *sessionWrapper) LocalAddr() net.Addr  { return w.session.LocalAddr() }
 func (w *sessionWrapper) RemoteAddr() net.Addr { return w.session.RemoteAddr() }
+
+func defaultSendBatch(conn *net.UDPConn, msgs [][]byte, addrs []*net.UDPAddr) (int, error) {
+	sent := 0
+	for i, msg := range msgs {
+		var err error
+		if i < len(addrs) && addrs[i] != nil {
+			_, err = conn.WriteToUDP(msg, addrs[i])
+		} else {
+			_, err = conn.Write(msg)
+		}
+		if err != nil {
+			if sent > 0 {
+				return sent, nil
+			}
+			return 0, err
+		}
+		sent++
+	}
+	return sent, nil
+}
+
+func defaultRecvBatch(conn *net.UDPConn, buffers [][]byte) (int, []net.Addr, error) {
+	if len(buffers) == 0 {
+		return 0, nil, nil
+	}
+	n, addr, err := conn.ReadFromUDP(buffers[0])
+	if err != nil {
+		return 0, nil, err
+	}
+	buffers[0] = buffers[0][:n]
+	return 1, []net.Addr{addr}, nil
+}

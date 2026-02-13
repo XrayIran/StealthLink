@@ -21,8 +21,8 @@ type Config struct {
 	ServerNames []string // Allowed SNI values
 	PrivateKey  string   // X25519 private key (base64 or hex)
 	ShortIds    []string // Short IDs for session validation
-	SpiderX     string   // Crawling fallback behavior
-	Show        bool     // Show debug info
+	Spider      SpiderConfig
+	Show        bool // Show debug info
 }
 
 // Dialer implements transport.Dialer for REALITY.
@@ -77,6 +77,14 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (transport.Session, erro
 
 	// Connect to server
 	dialer := &net.Dialer{}
+	
+	// Start spider if enabled
+	if d.Config.Spider.Enabled {
+		spider := NewSpider(d.Config.Spider)
+		// Requirement 7.10: wait for spider or timeout
+		_ = spider.Start(ctx)
+	}
+
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial: %w", err)

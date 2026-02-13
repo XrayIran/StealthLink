@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"stealthlink/internal/transport/kcpbase"
 	"sync"
 	"time"
 )
@@ -125,7 +126,7 @@ func (c *JunkConfig) GenerateJunkPacket() []byte {
 	}
 
 	packet := make([]byte, size)
-	rand.Read(packet)
+	kcpbase.FastRandom.Read(packet)
 	return packet
 }
 
@@ -147,7 +148,7 @@ func (c *JunkConfig) GetInitJunk() []byte {
 		return nil
 	}
 	junk := make([]byte, c.S1)
-	rand.Read(junk)
+	kcpbase.FastRandom.Read(junk)
 	return junk
 }
 
@@ -158,7 +159,7 @@ func (c *JunkConfig) GetResponseJunk() []byte {
 		return nil
 	}
 	junk := make([]byte, c.S2)
-	rand.Read(junk)
+	kcpbase.FastRandom.Read(junk)
 	return junk
 }
 
@@ -169,7 +170,7 @@ func (c *JunkConfig) GetCookieReplyJunk() []byte {
 		return nil
 	}
 	junk := make([]byte, c.S3)
-	rand.Read(junk)
+	kcpbase.FastRandom.Read(junk)
 	return junk
 }
 
@@ -180,7 +181,7 @@ func (c *JunkConfig) GetTransportJunk() []byte {
 		return nil
 	}
 	junk := make([]byte, c.S4)
-	rand.Read(junk)
+	kcpbase.FastRandom.Read(junk)
 	return junk
 }
 
@@ -380,7 +381,7 @@ func (j *JunkInjector) GenerateDNSLikeJunk() []byte {
 		labelLen := 3 + makeRandomInt(10) // 3-12 bytes per label
 		packet = append(packet, byte(labelLen))
 		label := make([]byte, labelLen)
-		rand.Read(label)
+		kcpbase.FastRandom.Read(label)
 		// Make it look like valid DNS characters
 		for j := range label {
 			label[j] = 'a' + (label[j] % 26)
@@ -401,8 +402,7 @@ func makeRandomInt(max int) int {
 	if max <= 0 {
 		return 0
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max)))
-	return int(n.Int64())
+	return int(kcpbase.FastRandom.Int64n(int64(max)))
 }
 
 // AWGProfile represents a complete AmneziaWG configuration profile
@@ -496,8 +496,7 @@ func (t *TimingObfuscator) calculateNextInterval() time.Duration {
 
 	// Add jitter
 	jitter := float64(t.baseInterval) * t.jitterPercent
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(2*jitter)))
-	offset := time.Duration(n.Int64()) - time.Duration(jitter)
+	offset := time.Duration(kcpbase.FastRandom.Int64n(int64(2 * jitter))) - time.Duration(jitter)
 
 	return t.baseInterval + offset
 }
@@ -547,18 +546,17 @@ func (s *SizeRandomizer) uniformSize() int {
 	if range_ <= 0 {
 		return s.minSize
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(range_+1)))
-	return s.minSize + int(n.Int64())
+	return s.minSize + int(kcpbase.FastRandom.Int64n(int64(range_+1)))
 }
 
 // gaussianSize returns a gaussian distributed size (approximated)
 func (s *SizeRandomizer) gaussianSize() int {
 	// Box-Muller transform approximation
-	u1, _ := rand.Int(rand.Reader, big.NewInt(1000))
-	u2, _ := rand.Int(rand.Reader, big.NewInt(1000))
+	u1 := kcpbase.FastRandom.Int64n(1000)
+	u2 := kcpbase.FastRandom.Int64n(1000)
 
-	f1 := float64(u1.Int64()) / 1000.0
-	f2 := float64(u2.Int64()) / 1000.0
+	f1 := float64(u1) / 1000.0
+	f2 := float64(u2) / 1000.0
 
 	// Standard normal
 	z := math.Sqrt(-2*math.Log(f1+0.0001)) * math.Cos(2*math.Pi*f2)
@@ -580,8 +578,8 @@ func (s *SizeRandomizer) gaussianSize() int {
 // exponentialSize returns an exponentially distributed size
 func (s *SizeRandomizer) exponentialSize() int {
 	// Generate exponential random variable
-	u, _ := rand.Int(rand.Reader, big.NewInt(1000))
-	f := float64(u.Int64()) / 1000.0
+	u := kcpbase.FastRandom.Int64n(1000)
+	f := float64(u) / 1000.0
 	if f < 0.0001 {
 		f = 0.0001
 	}
@@ -604,7 +602,7 @@ func (s *SizeRandomizer) PadToSize(data []byte) []byte {
 	}
 
 	padding := make([]byte, targetSize-len(data))
-	rand.Read(padding)
+	kcpbase.FastRandom.Read(padding)
 	return append(data, padding...)
 }
 
@@ -725,8 +723,8 @@ func (s *SNIObfuscator) GetFakeSNI() string {
 	if len(s.fakeDomains) == 0 {
 		return ""
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(s.fakeDomains))))
-	return s.fakeDomains[n.Int64()]
+	n := kcpbase.FastRandom.Int64n(int64(len(s.fakeDomains)))
+	return s.fakeDomains[n]
 }
 
 // ObfuscateClientHello obfuscates TLS Client Hello SNI

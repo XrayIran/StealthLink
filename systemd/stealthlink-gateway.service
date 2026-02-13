@@ -1,0 +1,45 @@
+[Unit]
+Description=StealthLink Gateway
+Documentation=https://github.com/stealthlink/stealthlink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/usr/local/bin/stealthlink-gateway -config /etc/stealthlink/gateway.yaml -validate
+ExecStart=/usr/local/bin/stealthlink-gateway -config /etc/stealthlink/gateway.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# Security hardening (systemd.exec man page)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=false
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+
+# File system access
+ReadWritePaths=/var/log/stealthlink /var/lib/stealthlink /etc/stealthlink
+ReadOnlyPaths=/proc/sys/net
+
+# Capabilities (required for TUN/TAP and raw sockets)
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stealthlink-gateway
+
+[Install]
+WantedBy=multi-user.target

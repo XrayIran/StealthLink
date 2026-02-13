@@ -50,8 +50,7 @@ type HandshakeConfig struct {
 	PrivateKey     []byte // X25519 private key
 	PublicKey      []byte // X25519 public key (derived)
 	ShortIDs       [][]byte
-	SpiderX        string
-	SpiderY        string
+	Spider         SpiderConfig
 	Show           bool
 	SessionTickets bool
 }

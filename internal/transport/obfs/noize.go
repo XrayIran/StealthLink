@@ -1,10 +1,10 @@
 package obfs
 
 import (
-	"crypto/rand"
 	"encoding/base32"
 	"fmt"
 	"net"
+	"stealthlink/internal/transport/kcpbase"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -73,14 +73,14 @@ var _ Obfuscator = (*NoizeObfuscator)(nil)
 func (n *NoizeObfuscator) generateTLSJunk() []byte {
 	// Generate a fake TLS record
 	// Content type (1) + Version (2) + Length (2) + Data
-	length := 64 + randInt(192) // 64-256 bytes
+	length := 64 + int(kcpbase.FastRandom.Int64n(192)) // 64-256 bytes
 	record := make([]byte, 5+length)
 	record[0] = 0x17 // Application Data
 	record[1] = 0x03 // TLS 1.2
 	record[2] = 0x03
 	record[3] = byte(length >> 8)
 	record[4] = byte(length)
-	rand.Read(record[5:])
+	kcpbase.FastRandom.Read(record[5:])
 	return record
 }
 
@@ -93,14 +93,14 @@ func (n *NoizeObfuscator) generateHTTPJunk() []byte {
 		[]byte("Content-Length: "),
 		[]byte("Content-Type: "),
 	}
-	return templates[randInt(len(templates))]
+	return templates[kcpbase.FastRandom.Int64n(int64(len(templates)))]
 }
 
 func (n *NoizeObfuscator) generateDNSJunk() []byte {
 	// Generate a fake DNS query header
 	// Transaction ID (2) + Flags (2) + Questions (2) + Answer RRs (2) + Authority RRs (2) + Additional RRs (2)
 	header := make([]byte, 12)
-	rand.Read(header)
+	kcpbase.FastRandom.Read(header)
 	// Set QR=0 (query) and opcode=0
 	header[2] = 0x00
 	header[3] = 0x00
@@ -267,7 +267,7 @@ func encodeDNSQueryPayload(data []byte, domain string) []byte {
 	}
 
 	msg := new(dns.Msg)
-	msg.Id = uint16(randInt(1 << 16))
+	msg.Id = uint16(kcpbase.FastRandom.Int64n(1 << 16))
 	msg.RecursionDesired = true
 	msg.Question = []dns.Question{
 		{
@@ -325,13 +325,4 @@ func decodeDNSQueryPayload(data []byte) []byte {
 		return nil
 	}
 	return decoded
-}
-
-func randInt(max int) int {
-	if max <= 0 {
-		return 0
-	}
-	b := make([]byte, 4)
-	rand.Read(b)
-	return int(uint32(b[0])|uint32(b[1])<<8|uint32(b[2])<<16|uint32(b[3])<<24) % max
 }

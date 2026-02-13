@@ -49,6 +49,54 @@ func TestGFWResistTLSOverlayWrapsConn(t *testing.T) {
 	}
 }
 
+func TestGFWResistTLSOverlayNewFieldDefaults(t *testing.T) {
+	ov := NewGFWResistTLSOverlay()
+	if !ov.ExtensionRandomize {
+		t.Fatal("ExtensionRandomize should default to true")
+	}
+	if !ov.RecordPadding {
+		t.Fatal("RecordPadding should default to true")
+	}
+	if !ov.GREASEEnabled {
+		t.Fatal("GREASEEnabled should default to true")
+	}
+}
+
+func TestPadTLSRecordBuckets(t *testing.T) {
+	// Create a fake TLS ApplicationData record with 100 bytes payload
+	payload := make([]byte, 100)
+	record := make([]byte, 5+len(payload))
+	record[0] = 0x17
+	record[1] = 0x03
+	record[2] = 0x03
+	record[3] = 0x00
+	record[4] = byte(len(payload))
+
+	padded := padTLSRecord(record)
+	// Should be padded to 256 (next bucket)
+	if len(padded) != 5+256 {
+		t.Fatalf("expected padded to 256, got payload size %d", len(padded)-5)
+	}
+}
+
+func TestRandomizeExtensionsDoesNotCrash(t *testing.T) {
+	// Minimal well-formed ClientHello-like record
+	// This just verifies no panic on short/malformed data
+	short := make([]byte, 10)
+	result := randomizeExtensions(short)
+	if len(result) != len(short) {
+		t.Fatal("short record should be returned as-is")
+	}
+}
+
+func TestInsertGREASEDoesNotCrash(t *testing.T) {
+	short := make([]byte, 10)
+	result := insertGREASE(short)
+	if len(result) != len(short) {
+		t.Fatal("short record should be returned as-is")
+	}
+}
+
 func TestGFWResistTCPOverlayChunksWrites(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()

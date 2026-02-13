@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,57 @@ type Snapshot struct {
 	UQSPReplayDrops      int64 `json:"uqsp_replay_drops"`
 	UQSPHandshakeTotal   int64 `json:"uqsp_handshake_total"`
 	UQSPHandshakeAvgMs   int64 `json:"uqsp_handshake_avg_ms"`
+	RawENOBUFSTotal      int64 `json:"raw_enobufs_total"`
+	RawWriteRetriesTotal int64 `json:"raw_write_retries_total"`
+	RawDropsTotal        int64 `json:"raw_drops_total"`
+	UQSPReassemblyEvicts int64 `json:"uqsp_reassembly_evictions_total"`
+
+	// Reverse mode metrics
+	ReverseReconnectAttemptsTotal int64 `json:"reverse_reconnect_attempts_total"`
+	ReverseReconnectTimeout       int64 `json:"reverse_reconnect_timeout"`
+	ReverseReconnectRefused       int64 `json:"reverse_reconnect_refused"`
+	ReverseReconnectReset         int64 `json:"reverse_reconnect_reset"`
+	ReverseConnectionsActive      int64 `json:"reverse_connections_active"`
+
+	// Underlay dialer metrics
+	UnderlaySelected string `json:"underlay_selected"` // "direct" | "warp" | "socks"
+	WARPHealth       string `json:"warp_health"`       // "up" | "down"
+
+	// Xmux metrics
+	XmuxConnectionReusesTotal    int64            `json:"xmux_connection_reuses_total"`
+	XmuxConnectionRotationsTotal map[string]int64 `json:"xmux_connection_rotations_total"`
+	XmuxActiveConnections        int64            `json:"xmux_active_connections"`
+
+	// FakeTCP metrics
+	FakeTCPAEADAuthFailuresTotal int64            `json:"faketcp_aead_auth_failures_total"`
+	FakeTCPKeyDerivationsTotal   int64            `json:"faketcp_key_derivations_total"`
+	FakeTCPEncryptedBytesTotal   map[string]int64 `json:"faketcp_encrypted_bytes_total"`
+
+	// REALITY spider metrics
+	RealitySpiderFetchesTotal    int64   `json:"reality_spider_fetches_total"`
+	RealitySpiderDurationSeconds float64 `json:"reality_spider_duration_seconds"`
+	RealitySpiderURLsCrawled     int64   `json:"reality_spider_urls_crawled"`
+	// Entropy metrics
+	EntropyBytesGeneratedTotal map[string]int64 `json:"entropy_bytes_generated_total"`
+	EntropyReseedsTotal        int64            `json:"entropy_reseeds_total"`
+	EntropyMethod              map[string]int64 `json:"entropy_method"`
+
+	// KCP FEC metrics
+	KCPFECParitySkippedTotal       int64 `json:"kcp_fec_parity_skipped_total"`
+	KCPFECAutoTuneAdjustmentsTotal int64 `json:"kcp_fec_auto_tune_adjustments_total"`
+	KCPFECDataShards               int64 `json:"kcp_fec_data_shards"`
+	KCPFECParityShards             int64 `json:"kcp_fec_parity_shards"`
+
+	// Smux shaper metrics
+	SmuxShaperControlFramesTotal         int64 `json:"smux_shaper_control_frames_total"`
+	SmuxShaperDataFramesTotal            int64 `json:"smux_shaper_data_frames_total"`
+	SmuxShaperQueueSize                  int64 `json:"smux_shaper_queue_size"`
+	SmuxShaperStarvationPreventionsTotal int64 `json:"smux_shaper_starvation_preventions_total"`
+
+	// Connection pool metrics
+	PoolSize             int64            `json:"pool_size"`
+	PoolUtilization      float64          `json:"pool_utilization"`
+	PoolAdjustmentsTotal map[string]int64 `json:"pool_adjustments_total"`
 }
 
 var (
@@ -61,15 +113,78 @@ var (
 	transportActive sync.Map // transport -> *atomic.Int64
 
 	// UQSP-specific metrics
-	uqspSessionsTotal      atomic.Int64
-	uqspStreamsActive      atomic.Int64
-	uqspDatagramSessions   atomic.Int64
-	uqspCapsulesTotal      atomic.Int64
-	uqspObfuscationOps     atomic.Int64
-	uqspCongestionEvents   atomic.Int64
-	uqspReplayDrops        atomic.Int64
-	uqspHandshakeTotal     atomic.Int64
-	uqspHandshakeDuration  atomic.Int64 // nanoseconds, for histogram
+	uqspSessionsTotal     atomic.Int64
+	uqspStreamsActive     atomic.Int64
+	uqspDatagramSessions  atomic.Int64
+	uqspCapsulesTotal     atomic.Int64
+	uqspObfuscationOps    atomic.Int64
+	uqspCongestionEvents  atomic.Int64
+	uqspReplayDrops       atomic.Int64
+	uqspHandshakeTotal    atomic.Int64
+	uqspHandshakeDuration atomic.Int64 // nanoseconds, for histogram
+	rawENOBUFSTotal       atomic.Int64
+	rawWriteRetriesTotal  atomic.Int64
+	rawDropsTotal         atomic.Int64
+	uqspReassemblyEvicts  atomic.Int64
+
+	// Reverse mode metrics
+	reverseReconnectAttemptsTotal atomic.Int64
+	reverseReconnectTimeout       atomic.Int64
+	reverseReconnectRefused       atomic.Int64
+	reverseReconnectReset         atomic.Int64
+	reverseConnectionsActive      atomic.Int64
+
+	// Underlay dialer metrics
+	underlaySelected atomic.Value // string: "direct" | "warp" | "socks"
+	warpHealth       atomic.Value // string: "up" | "down"
+
+	// Xmux metrics
+	xmuxReuses            atomic.Int64
+	xmuxRotations         sync.Map // reason -> *atomic.Int64
+	xmuxActiveConnections atomic.Int64
+
+	// FakeTCP metrics
+	faketcpAEADAuthFailures atomic.Int64
+	faketcpKeyDerivations   atomic.Int64
+	faketcpEncryptedBytes   sync.Map // direction -> *atomic.Int64
+
+	// REALITY spider metrics
+	realitySpiderFetches       atomic.Int64
+	realitySpiderDurationNanos atomic.Int64
+	realitySpiderURLsCrawled   atomic.Int64
+
+	// Entropy metrics
+	entropyBytesGenerated sync.Map // class -> *atomic.Int64
+	entropyReseeds        atomic.Int64
+	entropyMethod         sync.Map // method -> *atomic.Int64
+
+	// KCP FEC metrics
+	kcpFECParitySkipped       atomic.Int64
+	kcpFECAutoTuneAdjustments atomic.Int64
+	kcpFECDataShards          atomic.Int64
+	kcpFECParityShards        atomic.Int64
+
+	// Smux shaper metrics
+	smuxShaperControlFrames         atomic.Int64
+	smuxShaperDataFrames            atomic.Int64
+	smuxShaperQueueSize             atomic.Int64
+	smuxShaperStarvationPreventions atomic.Int64
+
+	// Connection pool metrics
+	poolSize        atomic.Int64
+	poolUtilization atomic.Uint64 // bit-cast float64
+	poolAdjustments sync.Map      // direction -> *atomic.Int64
+
+	// Mesh networking metrics
+	meshNodeActive       atomic.Bool
+	meshNATType          atomic.Value // string
+	meshPeersTotal       atomic.Int64
+	meshPeersJoined      atomic.Int64
+	meshPeersLeft        atomic.Int64
+	meshRelayPackets     atomic.Int64
+	meshRouteUpdates     atomic.Int64
+	meshHolePunchSuccess atomic.Int64
+	meshHolePunchFail    atomic.Int64
 )
 
 func IncSessions()               { sessionsTotal.Add(1); sessionsActive.Add(1); openSockets.Add(1) }
@@ -139,24 +254,28 @@ func DecService(name string) {
 }
 
 // UQSP metrics functions
-func IncUQSPSessions()      { uqspSessionsTotal.Add(1) }
-func IncUQSPStreamsActive() { uqspStreamsActive.Add(1) }
-func DecUQSPStreamsActive() { uqspStreamsActive.Add(-1) }
+func IncUQSPSessions()                { uqspSessionsTotal.Add(1) }
+func IncUQSPStreamsActive()           { uqspStreamsActive.Add(1) }
+func DecUQSPStreamsActive()           { uqspStreamsActive.Add(-1) }
 func SetUQSPDatagramSessions(n int64) { uqspDatagramSessions.Store(n) }
-func IncUQSPDatagramSessions() { uqspDatagramSessions.Add(1) }
-func DecUQSPDatagramSessions() { uqspDatagramSessions.Add(-1) }
+func IncUQSPDatagramSessions()        { uqspDatagramSessions.Add(1) }
+func DecUQSPDatagramSessions()        { uqspDatagramSessions.Add(-1) }
 func IncUQSPcapsules(n int64) {
 	if n > 0 {
 		uqspCapsulesTotal.Add(n)
 	}
 }
-func IncUQSPobfuscationOps() { uqspObfuscationOps.Add(1) }
+func IncUQSPobfuscationOps()  { uqspObfuscationOps.Add(1) }
 func IncUQSPcongestionEvent() { uqspCongestionEvents.Add(1) }
-func IncUQSPreplayDrops() { uqspReplayDrops.Add(1) }
-func IncUQSPhandshake() { uqspHandshakeTotal.Add(1) }
+func IncUQSPreplayDrops()     { uqspReplayDrops.Add(1) }
+func IncUQSPhandshake()       { uqspHandshakeTotal.Add(1) }
 func AddUQSPhandshakeDuration(d time.Duration) {
 	uqspHandshakeDuration.Add(d.Nanoseconds())
 }
+func IncRawENOBUFS()             { rawENOBUFSTotal.Add(1) }
+func IncRawWriteRetry()          { rawWriteRetriesTotal.Add(1) }
+func IncRawDrop()                { rawDropsTotal.Add(1) }
+func IncUQSPReassemblyEviction() { uqspReassemblyEvicts.Add(1) }
 func GetUQSPhandshakeAvgMs() int64 {
 	total := uqspHandshakeTotal.Load()
 	if total == 0 {
@@ -165,11 +284,148 @@ func GetUQSPhandshakeAvgMs() int64 {
 	return uqspHandshakeDuration.Load() / total / 1e6
 }
 
+// Underlay dialer metrics functions
+func SetUnderlaySelected(dialerType string) {
+	underlaySelected.Store(dialerType)
+}
+
+func GetUnderlaySelected() string {
+	v := underlaySelected.Load()
+	if v == nil {
+		return "direct" // default
+	}
+	return v.(string)
+}
+
+func SetWARPHealth(status string) {
+	warpHealth.Store(status)
+}
+
+func GetWARPHealth() string {
+	v := warpHealth.Load()
+	if v == nil {
+		return "down" // default
+	}
+	return v.(string)
+}
+
+// Reverse mode metrics functions
+func IncReverseReconnectAttempts()            { reverseReconnectAttemptsTotal.Add(1) }
+func IncReverseReconnectTimeout()             { reverseReconnectTimeout.Add(1) }
+func IncReverseReconnectRefused()             { reverseReconnectRefused.Add(1) }
+func IncReverseReconnectReset()               { reverseReconnectReset.Add(1) }
+func IncReverseConnectionsActive()            { reverseConnectionsActive.Add(1) }
+func DecReverseConnectionsActive()            { reverseConnectionsActive.Add(-1) }
+func GetReverseReconnectAttemptsTotal() int64 { return reverseReconnectAttemptsTotal.Load() }
+func GetReverseReconnectTimeout() int64       { return reverseReconnectTimeout.Load() }
+func GetReverseReconnectRefused() int64       { return reverseReconnectRefused.Load() }
+func GetReverseReconnectReset() int64         { return reverseReconnectReset.Load() }
+func GetReverseConnectionsActive() int64      { return reverseConnectionsActive.Load() }
+
+// Xmux metrics functions
+func IncXmuxReuse() { xmuxReuses.Add(1) }
+func IncXmuxRotation(reason string) {
+	if reason == "" {
+		return
+	}
+	v, _ := xmuxRotations.LoadOrStore(reason, &atomic.Int64{})
+	v.(*atomic.Int64).Add(1)
+}
+func IncXmuxActiveConnections()        { xmuxActiveConnections.Add(1) }
+func DecXmuxActiveConnections()        { xmuxActiveConnections.Add(-1) }
+func SetXmuxActiveConnections(n int64) { xmuxActiveConnections.Store(n) }
+
+// FakeTCP metrics functions
+func IncFakeTCPAEADAuthFailures() { faketcpAEADAuthFailures.Add(1) }
+func IncFakeTCPKeyDerivations()   { faketcpKeyDerivations.Add(1) }
+func AddFakeTCPEncryptedBytes(n int64, direction string) {
+	if n <= 0 || direction == "" {
+		return
+	}
+	v, _ := faketcpEncryptedBytes.LoadOrStore(direction, &atomic.Int64{})
+	v.(*atomic.Int64).Add(n)
+}
+
+// REALITY spider metrics functions
+func IncRealitySpiderFetch() { realitySpiderFetches.Add(1) }
+func AddRealitySpiderDuration(d time.Duration) {
+	realitySpiderDurationNanos.Add(d.Nanoseconds())
+}
+func SetRealitySpiderURLsCrawled(n int64) { realitySpiderURLsCrawled.Store(n) }
+func IncRealitySpiderURLsCrawled()        { realitySpiderURLsCrawled.Add(1) }
+func DecRealitySpiderURLsCrawled()        { realitySpiderURLsCrawled.Add(-1) }
+
+// Entropy metrics functions
+func AddEntropyBytes(n int64, class string) {
+	if n <= 0 || class == "" {
+		return
+	}
+	v, _ := entropyBytesGenerated.LoadOrStore(class, &atomic.Int64{})
+	v.(*atomic.Int64).Add(n)
+}
+func IncEntropyReseeds() { entropyReseeds.Add(1) }
+func SetEntropyMethod(method string, active bool) {
+	if method == "" {
+		return
+	}
+	v, _ := entropyMethod.LoadOrStore(method, &atomic.Int64{})
+	if active {
+		v.(*atomic.Int64).Store(1)
+	} else {
+		v.(*atomic.Int64).Store(0)
+	}
+}
+
+// KCP FEC metrics functions
+func IncKCPFECParitySkipped()       { kcpFECParitySkipped.Add(1) }
+func IncKCPFECAutoTuneAdjustments() { kcpFECAutoTuneAdjustments.Add(1) }
+func SetKCPFECShards(data, parity int64) {
+	kcpFECDataShards.Store(data)
+	kcpFECParityShards.Store(parity)
+}
+
+// Smux shaper metrics functions
+func IncSmuxShaperControlFrames()         { smuxShaperControlFrames.Add(1) }
+func IncSmuxShaperDataFrames()            { smuxShaperDataFrames.Add(1) }
+func SetSmuxShaperQueueSize(n int64)      { smuxShaperQueueSize.Store(n) }
+func IncSmuxShaperStarvationPreventions() { smuxShaperStarvationPreventions.Add(1) }
+
+// Connection pool metrics functions
+func SetPoolSize(n int64) { poolSize.Store(n) }
+func SetPoolUtilization(u float64) {
+	poolUtilization.Store(uint64(u * 1e6)) // store as micros for precision
+}
+func IncPoolAdjustment(direction string) {
+	if direction == "" {
+		return
+	}
+	v, _ := poolAdjustments.LoadOrStore(direction, &atomic.Int64{})
+	v.(*atomic.Int64).Add(1)
+}
+
+// Mesh networking metrics functions
+func SetMeshNodeActive(active bool) { meshNodeActive.Store(active) }
+func SetMeshNATType(natType string) { meshNATType.Store(natType) }
+func SetMeshPeersTotal(n int64)     { meshPeersTotal.Store(n) }
+func IncMeshPeersJoined()           { meshPeersJoined.Add(1) }
+func IncMeshPeersLeft()             { meshPeersLeft.Add(1) }
+func IncMeshRelayPackets()          { meshRelayPackets.Add(1) }
+func IncMeshRouteUpdates()          { meshRouteUpdates.Add(1) }
+func IncMeshHolePunchSuccess()      { meshHolePunchSuccess.Add(1) }
+func IncMeshHolePunchFail()         { meshHolePunchFail.Add(1) }
+func GetMeshNATType() string {
+	v := meshNATType.Load()
+	if v == nil {
+		return "Unknown"
+	}
+	return v.(string)
+}
+
 // Getter functions for text status and status CLI.
-func GetSessionsTotal() int64    { return sessionsTotal.Load() }
-func GetSessionsActive() int64   { return sessionsActive.Load() }
-func GetStreamsTotal() int64     { return streamsTotal.Load() }
-func GetStreamsActive() int64    { return streamsActive.Load() }
+func GetSessionsTotal() int64   { return sessionsTotal.Load() }
+func GetSessionsActive() int64  { return sessionsActive.Load() }
+func GetStreamsTotal() int64    { return streamsTotal.Load() }
+func GetStreamsActive() int64   { return streamsActive.Load() }
 func GetErrorsTotal() int64     { return errorsTotal.Load() }
 func GetLastPingRTT() int64     { return lastPingRTTMs.Load() }
 func GetTrafficInbound() int64  { return trafficInBytes.Load() }
@@ -207,15 +463,98 @@ func SnapshotData() Snapshot {
 		TCPSessions:               GetAllTCPSessionMetrics(),
 		Carriers:                  GetCarrierMetrics(),
 		// UQSP metrics
-		UQSPSessionsTotal:     uqspSessionsTotal.Load(),
-		UQSPStreamsActive:     uqspStreamsActive.Load(),
-		UQSPDatagramSessions:  uqspDatagramSessions.Load(),
-		UQSPCapsulesTotal:     uqspCapsulesTotal.Load(),
-		UQSPObfuscationOps:    uqspObfuscationOps.Load(),
-		UQSPCongestionEvents:  uqspCongestionEvents.Load(),
-		UQSPReplayDrops:       uqspReplayDrops.Load(),
-		UQSPHandshakeTotal:    uqspHandshakeTotal.Load(),
-		UQSPHandshakeAvgMs:    GetUQSPhandshakeAvgMs(),
+		UQSPSessionsTotal:    uqspSessionsTotal.Load(),
+		UQSPStreamsActive:    uqspStreamsActive.Load(),
+		UQSPDatagramSessions: uqspDatagramSessions.Load(),
+		UQSPCapsulesTotal:    uqspCapsulesTotal.Load(),
+		UQSPObfuscationOps:   uqspObfuscationOps.Load(),
+		UQSPCongestionEvents: uqspCongestionEvents.Load(),
+		UQSPReplayDrops:      uqspReplayDrops.Load(),
+		UQSPHandshakeTotal:   uqspHandshakeTotal.Load(),
+		UQSPHandshakeAvgMs:   GetUQSPhandshakeAvgMs(),
+		RawENOBUFSTotal:      rawENOBUFSTotal.Load(),
+		RawWriteRetriesTotal: rawWriteRetriesTotal.Load(),
+		RawDropsTotal:        rawDropsTotal.Load(),
+		UQSPReassemblyEvicts: uqspReassemblyEvicts.Load(),
+		// Reverse mode metrics
+		ReverseReconnectAttemptsTotal: reverseReconnectAttemptsTotal.Load(),
+		ReverseReconnectTimeout:       reverseReconnectTimeout.Load(),
+		ReverseReconnectRefused:       reverseReconnectRefused.Load(),
+		ReverseReconnectReset:         reverseReconnectReset.Load(),
+		ReverseConnectionsActive:      reverseConnectionsActive.Load(),
+		// Underlay dialer metrics
+		UnderlaySelected: GetUnderlaySelected(),
+		WARPHealth:       GetWARPHealth(),
+		// Xmux metrics
+		XmuxConnectionReusesTotal: xmuxReuses.Load(),
+		XmuxConnectionRotationsTotal: func() map[string]int64 {
+			m := make(map[string]int64)
+			xmuxRotations.Range(func(k, v any) bool {
+				m[k.(string)] = v.(*atomic.Int64).Load()
+				return true
+			})
+			return m
+		}(),
+		XmuxActiveConnections: xmuxActiveConnections.Load(),
+
+		// FakeTCP metrics
+		FakeTCPAEADAuthFailuresTotal: faketcpAEADAuthFailures.Load(),
+		FakeTCPKeyDerivationsTotal:   faketcpKeyDerivations.Load(),
+		FakeTCPEncryptedBytesTotal: func() map[string]int64 {
+			m := make(map[string]int64)
+			faketcpEncryptedBytes.Range(func(k, v any) bool {
+				m[k.(string)] = v.(*atomic.Int64).Load()
+				return true
+			})
+			return m
+		}(),
+
+		// REALITY spider metrics
+		RealitySpiderFetchesTotal:    realitySpiderFetches.Load(),
+		RealitySpiderDurationSeconds: float64(realitySpiderDurationNanos.Load()) / 1e9,
+		RealitySpiderURLsCrawled:     realitySpiderURLsCrawled.Load(),
+
+		// Entropy metrics
+		EntropyBytesGeneratedTotal: func() map[string]int64 {
+			m := make(map[string]int64)
+			entropyBytesGenerated.Range(func(k, v any) bool {
+				m[k.(string)] = v.(*atomic.Int64).Load()
+				return true
+			})
+			return m
+		}(),
+		EntropyReseedsTotal: entropyReseeds.Load(),
+		EntropyMethod: func() map[string]int64 {
+			m := make(map[string]int64)
+			entropyMethod.Range(func(k, v any) bool {
+				m[k.(string)] = v.(*atomic.Int64).Load()
+				return true
+			})
+			return m
+		}(),
+		// KCP FEC metrics
+		KCPFECParitySkippedTotal:       kcpFECParitySkipped.Load(),
+		KCPFECAutoTuneAdjustmentsTotal: kcpFECAutoTuneAdjustments.Load(),
+		KCPFECDataShards:               kcpFECDataShards.Load(),
+		KCPFECParityShards:             kcpFECParityShards.Load(),
+
+		// Smux shaper metrics
+		SmuxShaperControlFramesTotal:         smuxShaperControlFrames.Load(),
+		SmuxShaperDataFramesTotal:            smuxShaperDataFrames.Load(),
+		SmuxShaperQueueSize:                  smuxShaperQueueSize.Load(),
+		SmuxShaperStarvationPreventionsTotal: smuxShaperStarvationPreventions.Load(),
+
+		// Connection pool metrics
+		PoolSize:        poolSize.Load(),
+		PoolUtilization: float64(poolUtilization.Load()) / 1e6,
+		PoolAdjustmentsTotal: func() map[string]int64 {
+			m := make(map[string]int64)
+			poolAdjustments.Range(func(k, v any) bool {
+				m[k.(string)] = v.(*atomic.Int64).Load()
+				return true
+			})
+			return m
+		}(),
 	}
 }
 
@@ -308,7 +647,7 @@ func GetServiceInfos() []ServiceInfo {
 	return result
 }
 
-func Start(addr string, authToken string) {
+func Start(addr string, authToken string, enablePprof bool) {
 	if addr == "" {
 		return
 	}
@@ -325,6 +664,15 @@ func Start(addr string, authToken string) {
 			}
 			next(w, r)
 		}
+	}
+
+	if enablePprof {
+		// pprof endpoints are served on the metrics listener and protected by the same auth gate.
+		mux.HandleFunc("/debug/pprof/", auth(pprof.Index))
+		mux.HandleFunc("/debug/pprof/cmdline", auth(pprof.Cmdline))
+		mux.HandleFunc("/debug/pprof/profile", auth(pprof.Profile))
+		mux.HandleFunc("/debug/pprof/symbol", auth(pprof.Symbol))
+		mux.HandleFunc("/debug/pprof/trace", auth(pprof.Trace))
 	}
 
 	// Legacy metrics endpoint

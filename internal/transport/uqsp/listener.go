@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"time"
 
@@ -15,7 +16,10 @@ import (
 	"github.com/xtaci/smux"
 )
 
-// Listener implements transport.Listener for UQSP
+// Deprecated: Listener is the legacy UQSP listener. Use RuntimeListener instead,
+// which routes traffic through the unified variant runtime (BuildVariantForRole).
+// Set runtime.mode=unified (the default) in your config to use RuntimeListener.
+// This type will be removed in a future release.
 type Listener struct {
 	// ln is the underlying QUIC listener (for native QUIC)
 	ln *quic.Listener
@@ -46,8 +50,9 @@ type Listener struct {
 	carrier carrier.Carrier
 }
 
-// NewListener creates a new UQSP listener
+// Deprecated: NewListener creates a legacy UQSP listener. Use NewRuntimeListener instead.
 func NewListener(addr string, cfg *config.UQSPConfig, tlsCfg *tls.Config, smuxCfg *smux.Config, authToken string) (*Listener, error) {
+	log.Println("WARNING: using deprecated legacy UQSP Listener; migrate to runtime.mode=unified (RuntimeListener) — legacy mode will be removed in a future release")
 	if cfg == nil {
 		cfg = &config.UQSPConfig{}
 	}
@@ -128,11 +133,17 @@ func (l *Listener) selectCarrier() (carrier.Carrier, error) {
 		return nil, nil // Use native QUIC
 
 	case "trusttunnel":
-		// TrustTunnel is client-only, cannot listen
-		return nil, nil
+		c := carrier.NewTrustTunnelCarrier(cfg.TrustTunnel, l.SmuxConfig)
+		l.carrier = c
+		return c, nil
 
 	case "rawtcp":
-		c := carrier.NewRawTCPCarrier(cfg.RawTCP.Raw, cfg.RawTCP.KCP, l.SmuxConfig)
+		c := carrier.NewRawTCPCarrier(cfg.RawTCP.Raw, cfg.RawTCP.KCP, l.SmuxConfig, l.AuthToken)
+		l.carrier = c
+		return c, nil
+
+	case "faketcp":
+		c := carrier.NewFakeTCPCarrier(cfg.FakeTCP, l.SmuxConfig, l.AuthToken)
 		l.carrier = c
 		return c, nil
 
@@ -226,6 +237,11 @@ func (l *Listener) handleCarrierConnection(conn net.Conn) (transport.Session, er
 		return nil, fmt.Errorf("guard recv: %w", err)
 	}
 	_ = conn.SetDeadline(time.Time{})
+
+	conn, err := l.applyCarrierOverlays(conn, true)
+	if err != nil {
+		return nil, fmt.Errorf("apply carrier overlays: %w", err)
+	}
 
 	// Create smux session
 	smuxSess, err := smux.Server(conn, l.SmuxConfig)
@@ -402,7 +418,8 @@ func ensureALPN(existing []string) []string {
 	return out
 }
 
-// Listen is a convenience function to create a UQSP listener
+// Deprecated: Listen is a convenience function for the legacy UQSP listener.
+// Use NewRuntimeListener instead.
 func Listen(addr string, cfg *config.UQSPConfig, tlsCfg *tls.Config, smuxCfg *smux.Config, authToken string) (*Listener, error) {
 	return NewListener(addr, cfg, tlsCfg, smuxCfg, authToken)
 }

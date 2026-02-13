@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"net"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -18,4 +19,20 @@ func Config(keepAliveInterval, keepAliveTimeout time.Duration, maxStreams int, m
 		cfg.MaxReceiveBuffer = maxRecvBuf
 	}
 	return cfg
+}
+
+// NewClient creates a new smux client session with optional priority shaper.
+func NewClient(conn net.Conn, smuxCfg *smux.Config, shaperCfg ShaperConfig) (*smux.Session, error) {
+	if shaperCfg.Enabled {
+		conn = NewPriorityShaper(conn, shaperCfg)
+	}
+	return smux.Client(conn, smuxCfg)
+}
+
+// NewServer creates a new smux server session with optional priority shaper.
+func NewServer(conn net.Conn, smuxCfg *smux.Config, shaperCfg ShaperConfig) (*smux.Session, error) {
+	if shaperCfg.Enabled {
+		conn = NewPriorityShaper(conn, shaperCfg)
+	}
+	return smux.Server(conn, smuxCfg)
 }

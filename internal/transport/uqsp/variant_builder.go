@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,8 +16,10 @@ import (
 	"stealthlink/internal/crypto/pqsig"
 	"stealthlink/internal/transport/noize"
 	"stealthlink/internal/transport/obfs"
+	"stealthlink/internal/transport/underlay"
 	"stealthlink/internal/transport/uqsp/behavior"
 	"stealthlink/internal/transport/uqsp/carrier"
+	"stealthlink/internal/transport/kcpbase"
 	"stealthlink/internal/warp"
 
 	"github.com/xtaci/smux"
@@ -59,9 +62,9 @@ func (b *VariantBuilder) BuildVariantXHTTPTLS() (*UnifiedProtocol, error) {
 	variantCfg := VariantConfig{
 		Variant:       VariantXHTTP_TLS,
 		TLSConfig:     b.tlsCfg,
-		EnableWARP:    b.cfg.WARP.Enabled,
+		EnableWARP:    b.warpEnabledForVariant(VariantXHTTP_TLS),
 		WARPConfig:    b.copyWARPConfig(),
-		EnableReverse: b.cfg.IsReverseModeEnabled(),
+		EnableReverse: b.reverseEnabledForVariant(VariantXHTTP_TLS),
 		ReverseMode:   b.buildReverseMode(VariantXHTTP_TLS),
 		Behaviors:     []behavior.Overlay{},
 	}
@@ -106,9 +109,8 @@ func (b *VariantBuilder) BuildVariantXHTTPTLS() (*UnifiedProtocol, error) {
 		variantCfg.Behaviors = append(variantCfg.Behaviors, echOverlay)
 	}
 
-	if b.cfg.Transport.UQSP.Obfuscation.Profile == "adaptive" {
-		variantCfg.Behaviors = append(variantCfg.Behaviors, behavior.NewGFWResistTLSOverlay())
-	}
+	// 4a baseline includes TLS-level anti-DPI resistance.
+	variantCfg.Behaviors = append(variantCfg.Behaviors, behavior.NewGFWResistTLSOverlay())
 
 	if behaviorsCfg.DomainFront.Enabled {
 		dfOverlay := &behavior.DomainFrontOverlay{
@@ -145,16 +147,32 @@ func (b *VariantBuilder) BuildVariantXHTTPTLS() (*UnifiedProtocol, error) {
 		variantCfg.Behaviors = append(variantCfg.Behaviors, tlsfragOverlay)
 	}
 
+	b.wireQPPAndViolatedTCP(&variantCfg)
+
 	return NewUnifiedProtocol(variantCfg)
+}
+
+func (b *VariantBuilder) wireQPPAndViolatedTCP(variantCfg *VariantConfig) {
+	behaviorsCfg := b.cfg.Transport.UQSP.Behaviors
+
+	if behaviorsCfg.QPP.Enabled && behaviorsCfg.QPP.Key != "" {
+		qppOverlay := behavior.NewQPPOverlay(behaviorsCfg.QPP)
+		variantCfg.Behaviors = append(variantCfg.Behaviors, qppOverlay)
+	}
+
+	if behaviorsCfg.ViolatedTCP.Enabled {
+		violatedTCPOverlay := behavior.NewViolatedTCPOverlay(behaviorsCfg.ViolatedTCP)
+		variantCfg.Behaviors = append(variantCfg.Behaviors, violatedTCPOverlay)
+	}
 }
 
 func (b *VariantBuilder) BuildVariantRawTCP() (*UnifiedProtocol, error) {
 	variantCfg := VariantConfig{
 		Variant:       VariantRawTCP,
 		TLSConfig:     nil,
-		EnableWARP:    b.cfg.WARP.Enabled,
+		EnableWARP:    b.warpEnabledForVariant(VariantRawTCP),
 		WARPConfig:    b.copyWARPConfig(),
-		EnableReverse: b.cfg.IsReverseModeEnabled(),
+		EnableReverse: b.reverseEnabledForVariant(VariantRawTCP),
 		ReverseMode:   b.buildReverseMode(VariantRawTCP),
 		Behaviors:     []behavior.Overlay{},
 	}
@@ -202,14 +220,15 @@ func (b *VariantBuilder) BuildVariantRawTCP() (*UnifiedProtocol, error) {
 		}
 		variantCfg.Behaviors = append(variantCfg.Behaviors, noizeOverlay)
 	}
-	if obfsCfg.Profile == "adaptive" {
-		variantCfg.Behaviors = append(variantCfg.Behaviors, behavior.NewGFWResistTCPOverlay())
-	}
+	// 4b baseline includes TCP-level anti-DPI resistance.
+	variantCfg.Behaviors = append(variantCfg.Behaviors, behavior.NewGFWResistTCPOverlay())
 
 	if behaviorsCfg.AWG.Enabled {
 		awgOverlay := behavior.NewAWGOverlay(behaviorsCfg.AWG)
 		variantCfg.Behaviors = append(variantCfg.Behaviors, awgOverlay)
 	}
+
+	b.wireQPPAndViolatedTCP(&variantCfg)
 
 	return NewUnifiedProtocol(variantCfg)
 }
@@ -218,9 +237,9 @@ func (b *VariantBuilder) BuildVariantTLSMirror() (*UnifiedProtocol, error) {
 	variantCfg := VariantConfig{
 		Variant:       VariantTLSMirror,
 		TLSConfig:     b.tlsCfg,
-		EnableWARP:    b.cfg.WARP.Enabled,
+		EnableWARP:    b.warpEnabledForVariant(VariantTLSMirror),
 		WARPConfig:    b.copyWARPConfig(),
-		EnableReverse: b.cfg.IsReverseModeEnabled(),
+		EnableReverse: b.reverseEnabledForVariant(VariantTLSMirror),
 		ReverseMode:   b.buildReverseMode(VariantTLSMirror),
 		Behaviors:     []behavior.Overlay{},
 	}
@@ -255,15 +274,34 @@ func (b *VariantBuilder) BuildVariantTLSMirror() (*UnifiedProtocol, error) {
 
 	behaviorsCfg := b.cfg.Transport.UQSP.Behaviors
 
+	lookalikeCount := 0
 	if behaviorsCfg.Reality.Enabled {
 		realityOverlay := behavior.NewRealityOverlay(behaviorsCfg.Reality)
 		variantCfg.Behaviors = append(variantCfg.Behaviors, realityOverlay)
-	} else if behaviorsCfg.ShadowTLS.Enabled {
+		lookalikeCount++
+	}
+	if behaviorsCfg.ShadowTLS.Enabled {
 		shadowOverlay := behavior.NewShadowTLSOverlay(behaviorsCfg.ShadowTLS)
 		variantCfg.Behaviors = append(variantCfg.Behaviors, shadowOverlay)
-	} else if behaviorsCfg.TLSMirror.Enabled {
+		lookalikeCount++
+	}
+	if behaviorsCfg.TLSMirror.Enabled {
 		mirrorOverlay := behavior.NewTLSMirrorOverlay(behaviorsCfg.TLSMirror)
 		variantCfg.Behaviors = append(variantCfg.Behaviors, mirrorOverlay)
+		lookalikeCount++
+	}
+	if behaviorsCfg.AnyTLS.Enabled {
+		anyTLSOverlay := behavior.NewAnyTLSOverlay(behaviorsCfg.AnyTLS)
+		variantCfg.Behaviors = append(variantCfg.Behaviors, anyTLSOverlay)
+		lookalikeCount++
+	}
+	// If none is explicitly selected, default to TLSMirror to keep 4c semantics.
+	if lookalikeCount == 0 {
+		variantCfg.Behaviors = append(variantCfg.Behaviors, &behavior.TLSMirrorOverlay{
+			EnabledField:       true,
+			ControlChannel:     behaviorsCfg.TLSMirror.ControlChannel,
+			EnrollmentRequired: behaviorsCfg.TLSMirror.EnrollmentRequired,
+		})
 	}
 
 	if behaviorsCfg.Vision.Enabled {
@@ -278,8 +316,10 @@ func (b *VariantBuilder) BuildVariantTLSMirror() (*UnifiedProtocol, error) {
 	}
 
 	if b.cfg.Transport.UQSP.Security.PQKEM {
-		variantCfg.Behaviors = append(variantCfg.Behaviors, NewPQSigOverlay())
+		variantCfg.Behaviors = append(variantCfg.Behaviors, NewPQSigOverlayWithEnforce(b.cfg.Transport.UQSP.Security.PQEnforce))
 	}
+
+	b.wireQPPAndViolatedTCP(&variantCfg)
 
 	return NewUnifiedProtocol(variantCfg)
 }
@@ -288,9 +328,9 @@ func (b *VariantBuilder) BuildVariantUDP() (*UnifiedProtocol, error) {
 	variantCfg := VariantConfig{
 		Variant:       VariantUDP,
 		TLSConfig:     b.tlsCfg,
-		EnableWARP:    b.cfg.WARP.Enabled,
+		EnableWARP:    b.warpEnabledForVariant(VariantUDP),
 		WARPConfig:    b.copyWARPConfig(),
-		EnableReverse: b.cfg.IsReverseModeEnabled(),
+		EnableReverse: b.reverseEnabledForVariant(VariantUDP),
 		ReverseMode:   b.buildReverseMode(VariantUDP),
 		Behaviors:     []behavior.Overlay{},
 	}
@@ -326,7 +366,7 @@ func (b *VariantBuilder) BuildVariantUDP() (*UnifiedProtocol, error) {
 	behaviorsCfg := b.cfg.Transport.UQSP.Behaviors
 	obfsCfg := b.cfg.Transport.UQSP.Obfuscation
 
-	if obfsCfg.Profile == "salamander" || obfsCfg.Profile == "adaptive" {
+	if (obfsCfg.Profile == "salamander" || obfsCfg.Profile == "adaptive") && obfsCfg.SalamanderKey != "" {
 		salamanderOverlay := &SalamanderOverlay{
 			EnabledField: true,
 			Key:          obfsCfg.SalamanderKey,
@@ -348,6 +388,8 @@ func (b *VariantBuilder) BuildVariantUDP() (*UnifiedProtocol, error) {
 		variantCfg.Behaviors = append(variantCfg.Behaviors, morphOverlay)
 	}
 
+	b.wireQPPAndViolatedTCP(&variantCfg)
+
 	return NewUnifiedProtocol(variantCfg)
 }
 
@@ -355,16 +397,16 @@ func (b *VariantBuilder) BuildVariantTrust() (*UnifiedProtocol, error) {
 	variantCfg := VariantConfig{
 		Variant:       VariantTrust,
 		TLSConfig:     b.tlsCfg,
-		EnableWARP:    b.cfg.WARP.Enabled,
+		EnableWARP:    b.warpEnabledForVariant(VariantTrust),
 		WARPConfig:    b.copyWARPConfig(),
-		EnableReverse: b.cfg.IsReverseModeEnabled(),
+		EnableReverse: b.reverseEnabledForVariant(VariantTrust),
 		ReverseMode:   b.buildReverseMode(VariantTrust),
 		Behaviors:     []behavior.Overlay{},
 	}
 
 	carrierType := b.cfg.Transport.UQSP.Carrier.Type
 	if carrierType == "" {
-		carrierType = "webtunnel"
+		carrierType = "trusttunnel"
 	}
 
 	carrierCfg := b.cfg.Transport.UQSP.Carrier
@@ -400,8 +442,41 @@ func (b *VariantBuilder) BuildVariantTrust() (*UnifiedProtocol, error) {
 	if behaviorsCfg.CSTP.Enabled {
 		variantCfg.Behaviors = append(variantCfg.Behaviors, behavior.NewCSTPOverlay(behaviorsCfg.CSTP))
 	}
+	if behaviorsCfg.AnyTLS.Enabled {
+		variantCfg.Behaviors = append(variantCfg.Behaviors, behavior.NewAnyTLSOverlay(behaviorsCfg.AnyTLS))
+	}
+
+	b.wireQPPAndViolatedTCP(&variantCfg)
 
 	return NewUnifiedProtocol(variantCfg)
+}
+
+// variantPolicyKey maps a ProtocolVariant to its YAML config key.
+func variantPolicyKey(v ProtocolVariant) string {
+	switch v {
+	case VariantXHTTP_TLS:
+		return "4a"
+	case VariantRawTCP:
+		return "4b"
+	case VariantTLSMirror:
+		return "4c"
+	case VariantUDP:
+		return "4d"
+	case VariantTrust:
+		return "4e"
+	default:
+		return ""
+	}
+}
+
+// warpEnabledForVariant checks per-variant policy, falling back to global WARP config.
+func (b *VariantBuilder) warpEnabledForVariant(v ProtocolVariant) bool {
+	return b.cfg.Transport.UQSP.WARPEnabledForVariant(variantPolicyKey(v), b.cfg.WARP.Enabled)
+}
+
+// reverseEnabledForVariant checks per-variant policy, falling back to global reverse config.
+func (b *VariantBuilder) reverseEnabledForVariant(v ProtocolVariant) bool {
+	return b.cfg.Transport.UQSP.ReverseEnabledForVariant(variantPolicyKey(v))
 }
 
 func (b *VariantBuilder) copyWARPConfig() *warp.Config {
@@ -413,7 +488,7 @@ func (b *VariantBuilder) copyWARPConfig() *warp.Config {
 }
 
 func (b *VariantBuilder) buildReverseMode(variant ProtocolVariant) *ReverseMode {
-	if b.cfg == nil || !b.cfg.IsReverseModeEnabled() {
+	if b.cfg == nil || !b.reverseEnabledForVariant(variant) {
 		return nil
 	}
 	rev := b.cfg.Transport.UQSP.Reverse
@@ -446,42 +521,75 @@ func BuildVariantForRole(cfg *config.Config, tlsCfg *tls.Config, smuxCfg *smux.C
 		return nil, variant, fmt.Errorf("build variant %s: %w", VariantName(variant), err)
 	}
 
+	// Underlay dialer is the single place we decide how TCP dials are made
+	// (direct, WARP, SOCKS). Carriers that use tlsutil.DialUTLS will pick it up
+	// via context injection in UnifiedProtocol.Dial.
+	d, err := underlay.NewDialer(&cfg.Transport)
+	if err != nil {
+		_ = proto.Close()
+		return nil, variant, fmt.Errorf("underlay dialer: %w", err)
+	}
+	proto.variant.UnderlayDialer = d
+
+	// Enforce deterministic overlay execution order across all variants.
+	proto.variant.Behaviors = behavior.SortBehaviors(proto.variant.Behaviors)
+
+	// Validate carrier role capability: if this node is a listener (gateway),
+	// ensure the carrier supports Listen.  Client-only carriers that cannot
+	// listen will error immediately rather than at runtime.
+	carrierType := effectiveCarrierType(cfg, variant)
+	if cfg.Role == "gateway" || cfg.Role == "server" {
+		if !proto.variant.EnableReverse && !carrier.SupportsListen(carrierType) {
+			return nil, variant, fmt.Errorf("carrier %q does not support listen role; choose quic/trusttunnel/rawtcp/faketcp/icmptun/webtunnel or enable reverse mode", carrierType)
+		}
+	}
+	if cfg.Role == "agent" || cfg.Role == "client" {
+		if !carrier.SupportsDial(carrierType) {
+			return nil, variant, fmt.Errorf("carrier %q does not support dial role", carrierType)
+		}
+	}
+
 	return proto, variant, nil
 }
 
+func effectiveCarrierType(cfg *config.Config, variant ProtocolVariant) string {
+	if cfg == nil {
+		return "quic"
+	}
+
+	carrierType := strings.ToLower(strings.TrimSpace(cfg.Transport.UQSP.Carrier.Type))
+	if carrierType != "" {
+		return carrierType
+	}
+
+	switch variant {
+	case VariantXHTTP_TLS:
+		return "xhttp"
+	case VariantRawTCP:
+		return "rawtcp"
+	case VariantTLSMirror:
+		return "xhttp"
+	case VariantUDP:
+		return "quic"
+	case VariantTrust:
+		return "trusttunnel"
+	default:
+		return "quic"
+	}
+}
+
 func DetectVariant(cfg *config.Config) ProtocolVariant {
-	carrierType := cfg.Transport.UQSP.Carrier.Type
-	if carrierType == "" {
-		carrierType = "quic"
-	}
-
-	behaviorsCfg := cfg.Transport.UQSP.Behaviors
-
-	if behaviorsCfg.ECH.Enabled || behaviorsCfg.DomainFront.Enabled {
+	switch cfg.GetVariant() {
+	case 0:
 		return VariantXHTTP_TLS
-	}
-
-	if behaviorsCfg.Reality.Enabled || behaviorsCfg.ShadowTLS.Enabled || behaviorsCfg.TLSMirror.Enabled {
+	case 1:
+		return VariantRawTCP
+	case 2:
 		return VariantTLSMirror
-	}
-
-	if behaviorsCfg.Obfs4.Enabled {
-		return VariantRawTCP
-	}
-
-	if behaviorsCfg.AWG.Enabled || cfg.Transport.UQSP.Obfuscation.Profile == "salamander" {
+	case 3:
 		return VariantUDP
-	}
-
-	switch carrierType {
-	case "xhttp":
-		return VariantXHTTP_TLS
-	case "rawtcp", "icmptun":
-		return VariantRawTCP
-	case "webtunnel", "chisel", "trusttunnel":
+	case 4:
 		return VariantTrust
-	case "quic", "":
-		return VariantUDP
 	default:
 		return VariantUDP
 	}
@@ -634,13 +742,18 @@ func (o *MorphingOverlay) Apply(conn net.Conn) (net.Conn, error) {
 	}, nil
 }
 
-type PQSigOverlay struct{}
+type PQSigOverlay struct {
+	enforce bool
+}
 
-func NewPQSigOverlay() *PQSigOverlay  { return &PQSigOverlay{} }
+func NewPQSigOverlay() *PQSigOverlay { return &PQSigOverlay{} }
+func NewPQSigOverlayWithEnforce(enforce bool) *PQSigOverlay {
+	return &PQSigOverlay{enforce: enforce}
+}
 func (o *PQSigOverlay) Name() string  { return "pqsig" }
 func (o *PQSigOverlay) Enabled() bool { return true }
 func (o *PQSigOverlay) Apply(conn net.Conn) (net.Conn, error) {
-	return &pqSigConn{Conn: conn}, nil
+	return &pqSigConn{Conn: conn, enforce: o.enforce}, nil
 }
 
 type morphingConn struct {
@@ -657,14 +770,14 @@ func (c *morphingConn) Write(p []byte) (int, error) {
 
 	padLen := c.minPad
 	if c.maxPad > c.minPad {
-		padLen += secureRandInt(c.maxPad - c.minPad + 1)
+		padLen += int(kcpbase.FastRandom.Int64n(int64(c.maxPad - c.minPad + 1)))
 	}
 	frame := make([]byte, 4+len(p)+padLen)
 	binary.BigEndian.PutUint16(frame[0:2], uint16(len(p)))
 	binary.BigEndian.PutUint16(frame[2:4], uint16(padLen))
 	copy(frame[4:], p)
 	if padLen > 0 {
-		_, _ = rand.Read(frame[4+len(p):])
+		kcpbase.FastRandom.Read(frame[4+len(p):])
 	}
 	if _, err := c.Conn.Write(frame); err != nil {
 		return 0, err
@@ -703,6 +816,7 @@ type pqSigConn struct {
 	net.Conn
 	once         sync.Once
 	handshakeErr error
+	enforce      bool
 }
 
 func (c *pqSigConn) Read(p []byte) (int, error) {
@@ -792,9 +906,11 @@ func (c *pqSigConn) handshake() error {
 	if err != nil {
 		return err
 	}
-	// Keep verification best-effort to preserve interoperability while
-	// rolling PQ signature support out across mixed versions.
-	_ = verifier.Verify(peerChallenge, peerSig)
+	if err := verifier.Verify(peerChallenge, peerSig); err != nil {
+		if c.enforce {
+			return fmt.Errorf("PQ signature verification failed (enforced): %w", err)
+		}
+	}
 	return nil
 }
 
@@ -802,11 +918,7 @@ func secureRandInt(max int) int {
 	if max <= 1 {
 		return 0
 	}
-	var b [4]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return 0
-	}
-	return int(binary.BigEndian.Uint32(b[:]) % uint32(max))
+	return int(kcpbase.FastRandom.Int64n(int64(max)))
 }
 
 type noizeConn struct {

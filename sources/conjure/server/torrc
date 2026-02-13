@@ -1,0 +1,9 @@
+SocksPort 0
+ORPort 9001
+ExtORPort auto
+BridgeRelay 1
+
+ServerTransportListenAddr conjure 0.0.0.0:8080
+ServerTransportPlugin conjure exec ./server --allowed-stations 192.168.122.2 -log server.log -unsafe-logging
+
+PublishServerDescriptor 0

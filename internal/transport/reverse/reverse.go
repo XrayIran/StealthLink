@@ -338,7 +338,13 @@ func (rc *reverseConn) isAlive() bool {
 }
 
 func (rc *reverseConn) Close() error {
-	close(rc.closeCh)
+	select {
+	case <-rc.closeCh:
+		// Already closed
+		return nil
+	default:
+		close(rc.closeCh)
+	}
 
 	if rc.session != nil {
 		_ = rc.session.Close()

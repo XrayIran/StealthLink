@@ -16,8 +16,16 @@ import (
 )
 
 func DialUTLS(ctx context.Context, network, addr string, cfg *tls.Config, fingerprint string) (net.Conn, error) {
-	d := &net.Dialer{}
-	conn, err := d.DialContext(ctx, network, addr)
+	var (
+		conn net.Conn
+		err  error
+	)
+	if fn, ok := BaseDialFuncFromContext(ctx); ok {
+		conn, err = fn(ctx, network, addr)
+	} else {
+		d := &net.Dialer{}
+		conn, err = d.DialContext(ctx, network, addr)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -32,8 +40,16 @@ func DialUTLSWithFragmentation(ctx context.Context, network, addr string, cfg *t
 
 	fragConfig.ApplyDefaults()
 
-	d := &net.Dialer{}
-	conn, err := d.DialContext(ctx, network, addr)
+	var (
+		conn net.Conn
+		err  error
+	)
+	if fn, ok := BaseDialFuncFromContext(ctx); ok {
+		conn, err = fn(ctx, network, addr)
+	} else {
+		d := &net.Dialer{}
+		conn, err = d.DialContext(ctx, network, addr)
+	}
 	if err != nil {
 		return nil, err
 	}

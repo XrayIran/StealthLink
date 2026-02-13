@@ -19,6 +19,22 @@ type UQSPConfig struct {
 	Carrier     UQSPCarrierConfig     `yaml:"carrier"`
 	Behaviors   UQSPBehaviorConfig    `yaml:"behaviors"`
 	Reverse     UQSPReverseConfig     `yaml:"reverse"`
+	Runtime     UQSPRuntimeConfig     `yaml:"runtime"`
+	// VariantProfile is an optional in-transport preset selector.
+	// Top-level "variant" remains the primary selector.
+	VariantProfile string `yaml:"variant_profile"`
+
+	// VariantPolicy allows per-mode overrides for WARP and reverse.
+	// Keys are variant names: "4a", "4b", "4c", "4d", "4e".
+	// A nil or missing entry means "use global config".
+	VariantPolicy map[string]UQSPVariantPolicy `yaml:"variant_policy"`
+}
+
+// UQSPVariantPolicy holds per-variant overrides for WARP and reverse mode.
+// Pointer fields are nil = "inherit global", non-nil = "use this value".
+type UQSPVariantPolicy struct {
+	WARPEnabled    *bool `yaml:"warp_enabled"`
+	ReverseEnabled *bool `yaml:"reverse_enabled"`
 }
 
 // UQSPHandshakeConfig configures the UQSP handshake behavior.
@@ -38,10 +54,12 @@ type UQSPStreamsConfig struct {
 
 // UQSPDatagramsConfig configures UQSP datagram (UDP) behavior.
 type UQSPDatagramsConfig struct {
-	MaxSize              int    `yaml:"max_size"`
-	EnableFragmentation  bool   `yaml:"enable_fragmentation"`
-	RelayMode            string `yaml:"relay_mode"` // native, capsule
-	MaxIncomingDatagrams int    `yaml:"max_incoming_datagrams"`
+	MaxSize              int           `yaml:"max_size"`
+	EnableFragmentation  bool          `yaml:"enable_fragmentation"`
+	RelayMode            string        `yaml:"relay_mode"` // native, capsule
+	MaxIncomingDatagrams int           `yaml:"max_incoming_datagrams"`
+	ReassemblyTimeout    time.Duration `yaml:"reassembly_timeout"`
+	MaxReassemblyBytes   int           `yaml:"max_reassembly_bytes"`
 }
 
 // UQSPCapsulesConfig configures CONNECT-UDP/IP capsule behavior.
@@ -89,8 +107,17 @@ type UQSPAWGProfileConfig struct {
 // UQSPSecurityConfig configures UQSP security settings.
 type UQSPSecurityConfig struct {
 	TLSMinVersion string        `yaml:"tls_min_version"`
-	PQKEM         bool          `yaml:"pq_kem"` // post-quantum key exchange
+	PQKEM         bool          `yaml:"pq_kem"`     // post-quantum key exchange
+	PQEnforce     bool          `yaml:"pq_enforce"` // enforce PQ signature verification (fail if peer doesn't support)
 	KeyRotation   time.Duration `yaml:"key_rotation"`
+}
+
+// UQSPRuntimeConfig configures runtime path behavior.
+type UQSPRuntimeConfig struct {
+	// Mode can be:
+	// - "unified" (default): BuildVariantForRole -> UnifiedProtocol runtime
+	// - "legacy": historical NewDialer/NewListener path
+	Mode string `yaml:"mode"`
 }
 
 // ApplyUQSPDefaults applies default values to UQSP configuration.
@@ -128,6 +155,12 @@ func (c *Config) ApplyUQSPDefaults() {
 	}
 	if u.Datagrams.MaxIncomingDatagrams == 0 {
 		u.Datagrams.MaxIncomingDatagrams = 1024
+	}
+	if u.Datagrams.ReassemblyTimeout == 0 {
+		u.Datagrams.ReassemblyTimeout = 30 * time.Second
+	}
+	if u.Datagrams.MaxReassemblyBytes == 0 {
+		u.Datagrams.MaxReassemblyBytes = 4 << 20
 	}
 
 	// Capsules defaults
@@ -177,6 +210,34 @@ func (c *Config) ApplyUQSPDefaults() {
 	if u.Carrier.Type == "" {
 		u.Carrier.Type = "quic"
 	}
+	u.Carrier.RawTCP.Raw.applyDefaults(c.Role)
+	if u.Carrier.RawTCP.KCP.Block == "" {
+		u.Carrier.RawTCP.KCP.Block = "aes"
+	}
+	if u.Carrier.RawTCP.KCP.PacketGuardMagic == "" {
+		u.Carrier.RawTCP.KCP.PacketGuardMagic = "PQT1"
+	}
+	if u.Carrier.RawTCP.KCP.PacketGuardWindow == 0 {
+		u.Carrier.RawTCP.KCP.PacketGuardWindow = 30
+	}
+	if u.Carrier.RawTCP.KCP.PacketGuardSkew == 0 {
+		u.Carrier.RawTCP.KCP.PacketGuardSkew = 1
+	}
+	if u.Carrier.FakeTCP.MTU == 0 {
+		u.Carrier.FakeTCP.MTU = 1400
+	}
+	if u.Carrier.FakeTCP.WindowSize == 0 {
+		u.Carrier.FakeTCP.WindowSize = 65535
+	}
+	if u.Carrier.FakeTCP.RTO == 0 {
+		u.Carrier.FakeTCP.RTO = 200 * time.Millisecond
+	}
+	if u.Carrier.FakeTCP.Keepalive == 0 {
+		u.Carrier.FakeTCP.Keepalive = 30 * time.Second
+	}
+	if u.Carrier.FakeTCP.KeepaliveIdle == 0 {
+		u.Carrier.FakeTCP.KeepaliveIdle = 60 * time.Second
+	}
 	if u.Carrier.WebTunnel.TLSFingerprint == "" {
 		u.Carrier.WebTunnel.TLSFingerprint = "chrome_auto"
 	}
@@ -194,8 +255,89 @@ func (c *Config) ApplyUQSPDefaults() {
 	if u.Reverse.ReconnectDelay == 0 {
 		u.Reverse.ReconnectDelay = 5 * time.Second
 	}
+	if u.Reverse.ReconnectBackoff == 0 {
+		u.Reverse.ReconnectBackoff = 1 * time.Second
+	}
+	if u.Reverse.MaxReconnectDelay == 0 {
+		u.Reverse.MaxReconnectDelay = 60 * time.Second
+	}
 	if u.Reverse.MaxRetries == 0 {
 		u.Reverse.MaxRetries = 10
+	}
+	if u.Reverse.KeepaliveInterval == 0 {
+		u.Reverse.KeepaliveInterval = 30 * time.Second
+	}
+
+	// Behavior defaults
+	// AWG's special-junk packets are optional by default for compatibility
+	// with peers that only advertise magic headers + core junk controls.
+	if u.Behaviors.AWG.SpecialJunkOptional == nil {
+		v := true
+		u.Behaviors.AWG.SpecialJunkOptional = &v
+	}
+	// FakeTCP fake-HTTP preface is enabled by default for 4b stealth posture,
+	// while retaining an explicit opt-out via fake_http.enabled: false.
+	if u.Carrier.FakeTCP.FakeHTTP.Enabled == nil {
+		v := true
+		u.Carrier.FakeTCP.FakeHTTP.Enabled = &v
+	}
+	if u.Carrier.FakeTCP.FakeHTTP.IsEnabled() {
+		if strings.TrimSpace(u.Carrier.FakeTCP.FakeHTTP.Host) == "" {
+			u.Carrier.FakeTCP.FakeHTTP.Host = "cdn.cloudflare.com"
+		}
+		if strings.TrimSpace(u.Carrier.FakeTCP.FakeHTTP.UserAgent) == "" {
+			u.Carrier.FakeTCP.FakeHTTP.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		}
+		if strings.TrimSpace(u.Carrier.FakeTCP.FakeHTTP.Path) == "" {
+			u.Carrier.FakeTCP.FakeHTTP.Path = "/"
+		}
+	}
+	if u.Behaviors.ViolatedTCP.FakeHTTPEnabled {
+		if strings.TrimSpace(u.Behaviors.ViolatedTCP.FakeHTTPHost) == "" {
+			u.Behaviors.ViolatedTCP.FakeHTTPHost = "cdn.cloudflare.com"
+		}
+		if strings.TrimSpace(u.Behaviors.ViolatedTCP.FakeHTTPUserAgent) == "" {
+			u.Behaviors.ViolatedTCP.FakeHTTPUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		}
+	}
+
+	// AnyTLS defaults
+	if u.Carrier.AnyTLS.PaddingScheme == "" {
+		u.Carrier.AnyTLS.PaddingScheme = "random"
+	}
+	if u.Carrier.AnyTLS.PaddingMin == 0 {
+		u.Carrier.AnyTLS.PaddingMin = 100
+	}
+	if u.Carrier.AnyTLS.PaddingMax == 0 {
+		u.Carrier.AnyTLS.PaddingMax = 900
+	}
+	if u.Carrier.AnyTLS.IdleSessionTimeout == 0 {
+		u.Carrier.AnyTLS.IdleSessionTimeout = 300
+	}
+
+	// Reality defaults
+	if u.Behaviors.Reality.SpiderConcurrency == 0 {
+		u.Behaviors.Reality.SpiderConcurrency = 4
+	}
+	if u.Behaviors.Reality.SpiderTimeout == 0 {
+		u.Behaviors.Reality.SpiderTimeout = 10
+	}
+	if u.Behaviors.Reality.MaxDepth == 0 {
+		u.Behaviors.Reality.MaxDepth = 3
+	}
+	if u.Behaviors.Reality.MaxTotalFetches == 0 {
+		u.Behaviors.Reality.MaxTotalFetches = 20
+	}
+	if u.Behaviors.Reality.PerHostCap == 0 {
+		u.Behaviors.Reality.PerHostCap = 5
+	}
+	if len(u.Behaviors.Reality.SpiderY) == 0 {
+		u.Behaviors.Reality.SpiderY = []int{50, 100, 200, 300, 500, 800, 1000, 1500, 2000, 3000}
+	}
+
+	// Runtime defaults
+	if strings.TrimSpace(u.Runtime.Mode) == "" {
+		u.Runtime.Mode = "unified"
 	}
 }
 
@@ -230,6 +372,12 @@ func (c *Config) ValidateUQSP() error {
 	case "native", "capsule":
 	default:
 		return fmt.Errorf("transport.uqsp.datagrams.relay_mode must be one of: native, capsule")
+	}
+	if u.Datagrams.ReassemblyTimeout <= 0 {
+		return fmt.Errorf("transport.uqsp.datagrams.reassembly_timeout must be > 0")
+	}
+	if u.Datagrams.MaxReassemblyBytes < 64*1024 {
+		return fmt.Errorf("transport.uqsp.datagrams.max_reassembly_bytes must be >= 65536")
 	}
 
 	// Validate capsules
@@ -280,11 +428,62 @@ func (c *Config) ValidateUQSP() error {
 		return fmt.Errorf("transport.uqsp.security.tls_min_version must be one of: 1.2, 1.3")
 	}
 
+	// Validate runtime mode
+	switch strings.ToLower(strings.TrimSpace(u.Runtime.Mode)) {
+	case "", "unified", "legacy":
+	default:
+		return fmt.Errorf("transport.uqsp.runtime.mode must be one of: unified, legacy")
+	}
+
+	// Validate optional in-transport variant profile selector.
+	if strings.TrimSpace(u.VariantProfile) != "" {
+		if _, ok := parseVariantValue(u.VariantProfile); !ok {
+			return fmt.Errorf("transport.uqsp.variant_profile must be one of: 4a, 4b, 4c, 4d, 4e")
+		}
+	}
+
 	// Validate carrier type
-	switch strings.ToLower(strings.TrimSpace(u.Carrier.Type)) {
-	case "", "quic", "trusttunnel", "rawtcp", "icmptun", "webtunnel", "chisel", "xhttp":
+	carrierType := strings.ToLower(strings.TrimSpace(u.Carrier.Type))
+	switch carrierType {
+	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "icmptun", "webtunnel", "chisel", "xhttp", "anytls":
 	default:
 		return fmt.Errorf("transport.uqsp.carrier.type has unsupported value %q", u.Carrier.Type)
+	}
+	if carrierType == "rawtcp" {
+		u.Carrier.RawTCP.Raw.applyDefaults(c.Role)
+		if err := u.Carrier.RawTCP.Raw.validate(c.Role, c.Gateway.Listen); err != nil {
+			return fmt.Errorf("transport.uqsp.carrier.rawtcp.raw: %w", err)
+		}
+		if strings.TrimSpace(u.Carrier.RawTCP.KCP.Block) == "" {
+			return fmt.Errorf("transport.uqsp.carrier.rawtcp.kcp.block is required")
+		}
+	}
+	if carrierType == "faketcp" {
+		if u.Carrier.FakeTCP.MTU < 576 || u.Carrier.FakeTCP.MTU > 65535 {
+			return fmt.Errorf("transport.uqsp.carrier.faketcp.mtu must be between 576 and 65535")
+		}
+		if u.Carrier.FakeTCP.WindowSize < 1024 {
+			return fmt.Errorf("transport.uqsp.carrier.faketcp.window_size must be >= 1024")
+		}
+		if u.Carrier.FakeTCP.RTO <= 0 {
+			return fmt.Errorf("transport.uqsp.carrier.faketcp.rto must be > 0")
+		}
+		if u.Carrier.FakeTCP.Keepalive <= 0 {
+			return fmt.Errorf("transport.uqsp.carrier.faketcp.keepalive must be > 0")
+		}
+		if u.Carrier.FakeTCP.KeepaliveIdle <= 0 {
+			return fmt.Errorf("transport.uqsp.carrier.faketcp.keepalive_idle must be > 0")
+		}
+		switch strings.ToLower(strings.TrimSpace(u.Carrier.FakeTCP.AEADMode)) {
+		case "", "off", "chacha20poly1305", "aesgcm":
+		default:
+			return fmt.Errorf("transport.uqsp.carrier.faketcp.aead_mode must be one of: off, chacha20poly1305, aesgcm")
+		}
+		if strings.ToLower(strings.TrimSpace(u.Carrier.FakeTCP.AEADMode)) != "off" &&
+			strings.TrimSpace(u.Carrier.FakeTCP.AEADMode) != "" &&
+			strings.TrimSpace(u.Carrier.FakeTCP.CryptoKey) == "" {
+			return fmt.Errorf("transport.uqsp.carrier.faketcp.crypto_key is required when aead_mode is enabled")
+		}
 	}
 
 	// Validate carrier fingerprints and key options
@@ -297,6 +496,21 @@ func (c *Config) ValidateUQSP() error {
 	if strings.TrimSpace(u.Carrier.XHTTP.TLSFingerprint) == "" {
 		return fmt.Errorf("transport.uqsp.carrier.xhttp.tls_fingerprint is required")
 	}
+	for _, metaField := range []struct {
+		name      string
+		placement string
+	}{
+		{name: "session", placement: u.Carrier.XHTTP.Metadata.Session.Placement},
+		{name: "seq", placement: u.Carrier.XHTTP.Metadata.Seq.Placement},
+		{name: "mode", placement: u.Carrier.XHTTP.Metadata.Mode.Placement},
+	} {
+		p := strings.ToLower(strings.TrimSpace(metaField.placement))
+		switch p {
+		case "", "header", "path", "query", "cookie":
+		default:
+			return fmt.Errorf("transport.uqsp.carrier.xhttp.metadata.%s.placement must be one of: header, path, query, cookie", metaField.name)
+		}
+	}
 	if u.Carrier.TrustTunnel.PaddingMin < 0 || u.Carrier.TrustTunnel.PaddingMax < u.Carrier.TrustTunnel.PaddingMin {
 		return fmt.Errorf("transport.uqsp.carrier.trusttunnel padding range is invalid")
 	}
@@ -307,9 +521,9 @@ func (c *Config) ValidateUQSP() error {
 	// Validate reverse mode fields
 	if u.Reverse.Enabled {
 		switch strings.ToLower(strings.TrimSpace(u.Reverse.Role)) {
-		case "", "dialer", "listener":
+		case "", "client", "server", "rendezvous":
 		default:
-			return fmt.Errorf("transport.uqsp.reverse.role must be one of: dialer, listener")
+			return fmt.Errorf("transport.uqsp.reverse.role must be one of: client, server, rendezvous")
 		}
 		if strings.TrimSpace(u.Reverse.AuthToken) == "" {
 			return fmt.Errorf("transport.uqsp.reverse.auth_token is required when reverse mode is enabled")
@@ -320,8 +534,54 @@ func (c *Config) ValidateUQSP() error {
 		if u.Reverse.ReconnectDelay <= 0 {
 			return fmt.Errorf("transport.uqsp.reverse.reconnect_delay must be > 0")
 		}
+		if u.Reverse.ReconnectBackoff <= 0 {
+			return fmt.Errorf("transport.uqsp.reverse.reconnect_backoff must be > 0")
+		}
+		if u.Reverse.MaxReconnectDelay <= 0 {
+			return fmt.Errorf("transport.uqsp.reverse.max_reconnect_delay must be > 0")
+		}
+		if u.Reverse.MaxReconnectDelay < u.Reverse.ReconnectBackoff {
+			return fmt.Errorf("transport.uqsp.reverse.max_reconnect_delay must be >= reconnect_backoff")
+		}
 		if u.Reverse.MaxRetries < 1 {
 			return fmt.Errorf("transport.uqsp.reverse.max_retries must be >= 1")
+		}
+		if u.Reverse.KeepaliveInterval <= 0 {
+			return fmt.Errorf("transport.uqsp.reverse.keepalive_interval must be > 0")
+		}
+	}
+
+	if u.Behaviors.ViolatedTCP.FakeHTTPEnabled {
+		if strings.TrimSpace(u.Behaviors.ViolatedTCP.FakeHTTPHost) == "" {
+			return fmt.Errorf("transport.uqsp.behaviors.violated_tcp.fake_http_host is required when fake_http_enabled=true")
+		}
+		if strings.TrimSpace(u.Behaviors.ViolatedTCP.FakeHTTPUserAgent) == "" {
+			return fmt.Errorf("transport.uqsp.behaviors.violated_tcp.fake_http_user_agent is required when fake_http_enabled=true")
+		}
+	}
+	if carrierType == "anytls" {
+		pw := strings.TrimSpace(u.Carrier.AnyTLS.Password)
+		if pw == "" {
+			// Backward compat: allow placing password under behaviors.anytls.password.
+			pw = strings.TrimSpace(u.Behaviors.AnyTLS.Password)
+		}
+		if pw == "" {
+			return fmt.Errorf("transport.uqsp.carrier.anytls.password is required when carrier type is anytls (or set transport.uqsp.behaviors.anytls.password)")
+		}
+		if u.Carrier.AnyTLS.PaddingMin < 0 {
+			return fmt.Errorf("transport.uqsp.carrier.anytls.padding_min must be >= 0")
+		}
+		if u.Carrier.AnyTLS.PaddingMax < u.Carrier.AnyTLS.PaddingMin {
+			return fmt.Errorf("transport.uqsp.carrier.anytls.padding_max must be >= padding_min")
+		}
+		if u.Carrier.AnyTLS.IdleSessionTimeout < 0 {
+			return fmt.Errorf("transport.uqsp.carrier.anytls.idle_session_timeout must be >= 0")
+		}
+	}
+
+	if u.Behaviors.AnyTLS.Enabled {
+		if strings.TrimSpace(u.Behaviors.AnyTLS.Password) == "" {
+			return fmt.Errorf("transport.uqsp.behaviors.anytls.password is required when anytls behavior is enabled")
 		}
 	}
 
@@ -333,9 +593,18 @@ func (c *Config) UQSPEnabled() bool {
 	return strings.ToLower(strings.TrimSpace(c.Transport.Type)) == "uqsp"
 }
 
+// UQSPRuntimeMode returns the runtime mode for UQSP transport.
+func (c *Config) UQSPRuntimeMode() string {
+	mode := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Runtime.Mode))
+	if mode == "" {
+		return "unified"
+	}
+	return mode
+}
+
 // UQSPCarrierConfig selects and configures the underlying transport carrier.
 type UQSPCarrierConfig struct {
-	// Type selects the carrier: "quic", "trusttunnel", "rawtcp", "icmptun", "webtunnel", "chisel"
+	// Type selects the carrier: "quic", "trusttunnel", "rawtcp", "faketcp", "icmptun", "webtunnel", "chisel"
 	// Default is "quic" (native QUIC transport)
 	Type string `yaml:"type"`
 
@@ -345,10 +614,12 @@ type UQSPCarrierConfig struct {
 	// Type-specific configurations
 	TrustTunnel TrustTunnelCarrierConfig `yaml:"trusttunnel"`
 	RawTCP      RawTCPCarrierConfig      `yaml:"rawtcp"`
+	FakeTCP     FakeTCPCarrierConfig     `yaml:"faketcp"`
 	ICMPTun     ICMPTunCarrierConfig     `yaml:"icmptun"`
 	WebTunnel   WebTunnelCarrierConfig   `yaml:"webtunnel"`
 	Chisel      ChiselCarrierConfig      `yaml:"chisel"`
 	XHTTP       XHTTPCarrierConfig       `yaml:"xhttp"`
+	AnyTLS      AnyTLSCarrierConfig      `yaml:"anytls"`
 }
 
 // TrustTunnelCarrierConfig configures TrustTunnel as a carrier.
@@ -372,6 +643,36 @@ type TrustTunnelCarrierConfig struct {
 type RawTCPCarrierConfig struct {
 	Raw RawTCPConfig `yaml:"raw"`
 	KCP KCPConfig    `yaml:"kcp"`
+}
+
+// FakeTCPCarrierConfig configures FakeTCP as a carrier (tcpraw/udp2raw-style).
+type FakeTCPCarrierConfig struct {
+	MTU                int                   `yaml:"mtu"`
+	WindowSize         int                   `yaml:"window_size"`
+	RTO                time.Duration         `yaml:"rto"`
+	Keepalive          time.Duration         `yaml:"keepalive"`
+	KeepaliveIdle      time.Duration         `yaml:"keepalive_idle"`
+	FingerprintProfile string                `yaml:"fingerprint_profile"` // chrome_win10, safari_macos, linux_default, android, random
+	CryptoKey          string                `yaml:"crypto_key"`
+	AEADMode           string                `yaml:"aead_mode"` // off, chacha20poly1305, aesgcm
+	FakeHTTP           FakeTCPFakeHTTPConfig `yaml:"fake_http"`
+}
+
+// FakeTCPFakeHTTPConfig configures fake HTTP preface for DPI evasion.
+type FakeTCPFakeHTTPConfig struct {
+	Enabled   *bool  `yaml:"enabled"`
+	Host      string `yaml:"host"`
+	UserAgent string `yaml:"user_agent"`
+	Path      string `yaml:"path"`
+}
+
+// IsEnabled returns whether fake-HTTP preface should be applied.
+// Nil means enabled by default.
+func (c FakeTCPFakeHTTPConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 // ICMPTunCarrierConfig configures ICMPTun as a carrier.
@@ -412,20 +713,61 @@ type ChiselCarrierConfig struct {
 
 // XHTTPCarrierConfig configures XHTTP (SplitHTTP) as a carrier.
 type XHTTPCarrierConfig struct {
-	Server                string            `yaml:"server"`
-	Path                  string            `yaml:"path"`
-	Mode                  string            `yaml:"mode"` // stream-one, stream-up, stream-down, packet-up
-	Headers               map[string]string `yaml:"headers"`
-	MaxConns              int               `yaml:"max_connections"`
-	TLSInsecureSkipVerify bool              `yaml:"tls_insecure_skip_verify"`
-	TLSServerName         string            `yaml:"tls_server_name"`
-	TLSFingerprint        string            `yaml:"tls_fingerprint"`
+	Server                string              `yaml:"server"`
+	Path                  string              `yaml:"path"`
+	Mode                  string              `yaml:"mode"` // stream-one, stream-up, stream-down, packet-up
+	Headers               map[string]string   `yaml:"headers"`
+	MaxConns              int                 `yaml:"max_connections"`
+	TLSInsecureSkipVerify bool                `yaml:"tls_insecure_skip_verify"`
+	TLSServerName         string              `yaml:"tls_server_name"`
+	TLSFingerprint        string              `yaml:"tls_fingerprint"`
+	Metadata              XHTTPMetadataConfig `yaml:"metadata"`
+	XMux                  XHTTPXMuxConfig     `yaml:"xmux"`
+}
+
+// AnyTLSCarrierConfig configures AnyTLS as a carrier.
+type AnyTLSCarrierConfig struct {
+	Server             string   `yaml:"server"`
+	Password           string   `yaml:"password"`
+	PaddingScheme      string   `yaml:"padding_scheme"` // random | fixed | burst | adaptive or custom lines
+	PaddingMin         int      `yaml:"padding_min"`
+	PaddingMax         int      `yaml:"padding_max"`
+	PaddingLines       []string `yaml:"padding_lines"`
+	IdleSessionTimeout int      `yaml:"idle_session_timeout"` // seconds
+	TLSInsecureSkipVerify bool   `yaml:"tls_insecure_skip_verify"`
+	TLSServerName         string `yaml:"tls_server_name"`
+}
+
+// XHTTPMetadataConfig controls where session/sequence/mode metadata is encoded.
+type XHTTPMetadataConfig struct {
+	Session XHTTPMetadataFieldConfig `yaml:"session"`
+	Seq     XHTTPMetadataFieldConfig `yaml:"seq"`
+	Mode    XHTTPMetadataFieldConfig `yaml:"mode"`
+}
+
+// XHTTPMetadataFieldConfig describes placement+key for one metadata field.
+type XHTTPMetadataFieldConfig struct {
+	Placement string `yaml:"placement"` // header, path, query, cookie
+	Key       string `yaml:"key"`
+}
+
+// XHTTPXMuxConfig configures XMUX connection pooling for XHTTP.
+type XHTTPXMuxConfig struct {
+	Enabled          bool   `yaml:"enabled"`
+	MaxConnections   int    `yaml:"max_connections"`
+	MaxConcurrency   int    `yaml:"max_concurrency"`
+	MaxConnectionAge int64  `yaml:"max_connection_age"`
+	CMaxReuseTimes   int    `yaml:"c_max_reuse_times"`
+	HMaxRequestTimes int    `yaml:"h_max_request_times"`
+	HMaxReusableSecs int    `yaml:"h_max_reusable_secs"`
+	DrainTimeout     string `yaml:"drain_timeout"` // duration string
 }
 
 // UQSPBehaviorConfig configures protocol behavior overlays.
 type UQSPBehaviorConfig struct {
 	ShadowTLS   ShadowTLSBehaviorConfig   `yaml:"shadowtls"`
 	TLSMirror   TLSMirrorBehaviorConfig   `yaml:"tlsmirror"`
+	AnyTLS      AnyTLSBehaviorConfig      `yaml:"anytls"`
 	AWG         AWGBehaviorConfig         `yaml:"awg"`
 	Reality     RealityBehaviorConfig     `yaml:"reality"`
 	ECH         ECHBehaviorConfig         `yaml:"ech"`
@@ -434,6 +776,16 @@ type UQSPBehaviorConfig struct {
 	DomainFront DomainFrontBehaviorConfig `yaml:"domainfront"`
 	TLSFrag     TLSFragBehaviorConfig     `yaml:"tlsfrag"`
 	CSTP        CSTPBehaviorConfig        `yaml:"cstp"`
+	ViolatedTCP ViolatedTCPBehaviorConfig `yaml:"violated_tcp"`
+	QPP         QPPBehaviorConfig         `yaml:"qpp"`
+}
+
+// AnyTLSBehaviorConfig configures AnyTLS-style authenticated padded framing.
+type AnyTLSBehaviorConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	Password   string `yaml:"password"`
+	PaddingMin int    `yaml:"padding_min"`
+	PaddingMax int    `yaml:"padding_max"`
 }
 
 // ShadowTLSBehaviorConfig ports ShadowTLS v3 behaviors as an overlay.
@@ -458,6 +810,24 @@ type AWGBehaviorConfig struct {
 	JunkInterval time.Duration `yaml:"junk_interval"`
 	JunkMinSize  int           `yaml:"junk_min_size"`
 	JunkMaxSize  int           `yaml:"junk_max_size"`
+
+	JunkPacketCount           int             `yaml:"junk_packet_count"`
+	InitPacketJunkSize        int             `yaml:"init_packet_junk_size"`
+	ResponsePacketJunkSize    int             `yaml:"response_packet_junk_size"`
+	CookieReplyPacketJunkSize int             `yaml:"cookie_reply_packet_junk_size"`
+	TransportPacketJunkSize   int             `yaml:"transport_packet_junk_size"`
+	MagicHeaders              *AWGMagicConfig `yaml:"magic_headers"`
+	TimingObfuscation         bool            `yaml:"timing_obfuscation"`
+	JitterMin                 time.Duration   `yaml:"jitter_min"`
+	JitterMax                 time.Duration   `yaml:"jitter_max"`
+	SpecialJunkOptional       *bool           `yaml:"special_junk_optional"`
+}
+
+type AWGMagicConfig struct {
+	Init      string `yaml:"init"`
+	Response  string `yaml:"response"`
+	Underload string `yaml:"underload"`
+	Transport string `yaml:"transport"`
 }
 
 // RealityBehaviorConfig ports XTLS REALITY behaviors as an overlay.
@@ -465,11 +835,17 @@ type RealityBehaviorConfig struct {
 	Enabled         bool     `yaml:"enabled"`
 	Dest            string   `yaml:"dest"`
 	ServerNames     []string `yaml:"server_names"`
-	PrivateKey      string   `yaml:"private_key"`
+	PrivateKey        string   `yaml:"private_key"`
 	ServerPublicKey string   `yaml:"server_public_key"`
-	ShortIDs        []string `yaml:"short_ids"`
-	SpiderX         string   `yaml:"spider_x"`
-	Show            bool     `yaml:"show"`
+	ShortIDs          []string `yaml:"short_ids"`
+	SpiderX           string   `yaml:"spider_x"`
+	SpiderY           []int    `yaml:"spider_y"`
+	SpiderConcurrency int      `yaml:"spider_concurrency"`
+	SpiderTimeout     int      `yaml:"spider_timeout"`
+	MaxDepth          int      `yaml:"max_depth"`
+	MaxTotalFetches   int      `yaml:"max_total_fetches"`
+	PerHostCap        int      `yaml:"per_host_cap"`
+	Show              bool     `yaml:"show"`
 }
 
 // ECHBehaviorConfig ports Encrypted Client Hello behaviors as an overlay.
@@ -532,15 +908,66 @@ type CSTPBehaviorConfig struct {
 
 type UQSPReverseConfig struct {
 	Enabled           bool          `yaml:"enabled"`
-	Role              string        `yaml:"role"` // dialer, listener
+	Role              string        `yaml:"role"` // "client" | "server" | "rendezvous"
 	ClientAddress     string        `yaml:"client_address"`
 	ServerAddress     string        `yaml:"server_address"`
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
 	ReconnectDelay    time.Duration `yaml:"reconnect_delay"`
+	ReconnectBackoff  time.Duration `yaml:"reconnect_backoff"`   // Initial backoff delay (exponential)
+	MaxReconnectDelay time.Duration `yaml:"max_reconnect_delay"` // Maximum backoff delay (default: 60s)
 	MaxRetries        int           `yaml:"max_retries"`
 	AuthToken         string        `yaml:"auth_token"`
+	KeepaliveInterval time.Duration `yaml:"keepalive_interval"` // Keepalive interval for persistent connections
+}
+
+type ViolatedTCPBehaviorConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	Mode              string `yaml:"mode"` // malformed, no_handshake, random_flags, broken_seq
+	SeqRandomness     int    `yaml:"seq_randomness"`
+	FlagCycling       bool   `yaml:"flag_cycling"`
+	WindowJitter      int    `yaml:"window_jitter"`
+	OptionRandom      bool   `yaml:"option_random"`
+	FakeHTTPEnabled   bool   `yaml:"fake_http_enabled"`
+	FakeHTTPHost      string `yaml:"fake_http_host"`
+	FakeHTTPUserAgent string `yaml:"fake_http_user_agent"`
+}
+
+type QPPBehaviorConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Key      string `yaml:"key"`
+	NumSBox  int    `yaml:"num_sbox"`
+	AutoSync bool   `yaml:"auto_sync"`
 }
 
 func (c *UQSPConfig) GetReverse() UQSPReverseConfig {
 	return c.Reverse
+}
+
+// variantPolicyFor returns the per-variant policy for the given variant name,
+// or a zero-value policy if none is configured.
+func (c *UQSPConfig) variantPolicyFor(variant string) UQSPVariantPolicy {
+	if c.VariantPolicy == nil {
+		return UQSPVariantPolicy{}
+	}
+	return c.VariantPolicy[strings.ToLower(strings.TrimSpace(variant))]
+}
+
+// WARPEnabledForVariant returns whether WARP should be enabled for the given
+// variant.  The per-variant policy overrides the global config if set.
+func (c *UQSPConfig) WARPEnabledForVariant(variant string, globalWARP bool) bool {
+	p := c.variantPolicyFor(variant)
+	if p.WARPEnabled != nil {
+		return *p.WARPEnabled
+	}
+	return globalWARP
+}
+
+// ReverseEnabledForVariant returns whether reverse mode should be enabled for
+// the given variant.  The per-variant policy overrides the global config if set.
+func (c *UQSPConfig) ReverseEnabledForVariant(variant string) bool {
+	p := c.variantPolicyFor(variant)
+	if p.ReverseEnabled != nil {
+		return *p.ReverseEnabled
+	}
+	return c.Reverse.Enabled
 }

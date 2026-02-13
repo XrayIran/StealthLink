@@ -19,15 +19,17 @@ import (
 type RawTCPCarrier struct {
 	rawConfig config.RawTCPConfig
 	kcpConfig config.KCPConfig
+	authToken string
 	smux      *smux.Config
 	listener  *rawtcp.Listener
 }
 
 // NewRawTCPCarrier creates a new RawTCP carrier
-func NewRawTCPCarrier(rawCfg config.RawTCPConfig, kcpCfg config.KCPConfig, smuxCfg *smux.Config) Carrier {
+func NewRawTCPCarrier(rawCfg config.RawTCPConfig, kcpCfg config.KCPConfig, smuxCfg *smux.Config, authToken string) Carrier {
 	return &RawTCPCarrier{
 		rawConfig: rawCfg,
 		kcpConfig: kcpCfg,
+		authToken: authToken,
 		smux:      smuxCfg,
 	}
 }
@@ -39,7 +41,7 @@ func (c *RawTCPCarrier) Network() string {
 
 // Dial establishes a RawTCP connection via KCP and returns a net.Conn
 func (c *RawTCPCarrier) Dial(ctx context.Context, addr string) (net.Conn, error) {
-	dialer := rawtcp.NewDialer(c.rawConfig, c.kcpConfig, c.smux)
+	dialer := rawtcp.NewDialer(c.rawConfig, c.effectiveKCPConfig(), c.smux)
 	session, err := dialer.Dial(ctx, addr)
 	if err != nil {
 		return nil, fmt.Errorf("rawtcp dial: %w", err)
@@ -61,7 +63,7 @@ func (c *RawTCPCarrier) Dial(ctx context.Context, addr string) (net.Conn, error)
 
 // Listen creates a RawTCP listener
 func (c *RawTCPCarrier) Listen(addr string) (Listener, error) {
-	ln, err := rawtcp.Listen(c.rawConfig, c.kcpConfig, c.smux)
+	ln, err := rawtcp.Listen(c.rawConfig, c.effectiveKCPConfig(), c.smux)
 	if err != nil {
 		return nil, fmt.Errorf("rawtcp listen: %w", err)
 	}
@@ -82,6 +84,30 @@ func (c *RawTCPCarrier) IsAvailable() bool {
 	// RawTCP requires CAP_NET_RAW or root
 	// The actual check happens when trying to create the packet conn
 	return true
+}
+
+func (c *RawTCPCarrier) effectiveKCPConfig() config.KCPConfig {
+	kcpCfg := c.kcpConfig
+	if kcpCfg.Block == "" {
+		kcpCfg.Block = "aes"
+	}
+	if kcpCfg.Key == "" {
+		if c.authToken != "" {
+			kcpCfg.Key = c.authToken
+		} else {
+			kcpCfg.Key = "stealthlink-rawtcp-default"
+		}
+	}
+	if kcpCfg.PacketGuardMagic == "" {
+		kcpCfg.PacketGuardMagic = "PQT1"
+	}
+	if kcpCfg.PacketGuardWindow == 0 {
+		kcpCfg.PacketGuardWindow = 30
+	}
+	if kcpCfg.PacketGuardSkew == 0 {
+		kcpCfg.PacketGuardSkew = 1
+	}
+	return kcpCfg
 }
 
 // rawTCPListener wraps a RawTCP listener

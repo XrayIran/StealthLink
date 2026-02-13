@@ -3,6 +3,7 @@ package carrier
 import (
 	"bufio"
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -11,14 +12,180 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"stealthlink/internal/tlsutil"
+	"stealthlink/internal/transport/xhttpmeta"
 
+	quic "github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/xtaci/smux"
+	"golang.org/x/net/http2"
 )
+
+type xhttpMode string
+
+const (
+	xhttpModeStreamOne  xhttpMode = "stream-one"
+	xhttpModeStreamUp   xhttpMode = "stream-up"
+	xhttpModeStreamDown xhttpMode = "stream-down"
+	xhttpModePacketUp   xhttpMode = "packet-up"
+)
+
+type httpVersion string
+
+const (
+	httpVersion1_1 httpVersion = "1.1"
+	httpVersion2   httpVersion = "2"
+	httpVersion3   httpVersion = "3"
+)
+
+type scRange struct {
+	From int64 `yaml:"from"`
+	To   int64 `yaml:"to"`
+}
+
+func (r scRange) rand() int64 {
+	if r.To <= r.From {
+		return r.From
+	}
+	n := r.To - r.From
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return r.From + int64(binary.BigEndian.Uint64(b)%uint64(n))
+}
+
+type uploadPacket struct {
+	Reader  io.ReadCloser
+	Payload []byte
+	Seq     uint64
+}
+
+type uploadQueue struct {
+	pushedPackets   chan uploadPacket
+	heap            uploadHeap
+	nextSeq         uint64
+	closed          bool
+	maxPackets      int
+	reader          io.ReadCloser
+	nomore          bool
+	writeCloseMutex sync.Mutex
+}
+
+func newUploadQueue(maxPackets int) *uploadQueue {
+	return &uploadQueue{
+		pushedPackets: make(chan uploadPacket, maxPackets),
+		heap:          uploadHeap{},
+		nextSeq:       0,
+		closed:        false,
+		maxPackets:    maxPackets,
+	}
+}
+
+func (q *uploadQueue) Push(p uploadPacket) error {
+	q.writeCloseMutex.Lock()
+	defer q.writeCloseMutex.Unlock()
+	if q.closed {
+		return fmt.Errorf("packet queue closed")
+	}
+	if q.nomore {
+		return fmt.Errorf("reader already exists")
+	}
+	if p.Reader != nil {
+		q.nomore = true
+	}
+	q.pushedPackets <- p
+	return nil
+}
+
+func (q *uploadQueue) Close() error {
+	q.writeCloseMutex.Lock()
+	defer q.writeCloseMutex.Unlock()
+	if !q.closed {
+		q.closed = true
+		for {
+			select {
+			case p := <-q.pushedPackets:
+				if p.Reader != nil {
+					q.reader = p.Reader
+				}
+			default:
+				close(q.pushedPackets)
+				if q.reader != nil {
+					return q.reader.Close()
+				}
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (q *uploadQueue) Read(b []byte) (int, error) {
+	if q.reader != nil {
+		return q.reader.Read(b)
+	}
+	if q.closed {
+		return 0, io.EOF
+	}
+	if len(q.heap) == 0 {
+		packet, more := <-q.pushedPackets
+		if !more {
+			return 0, io.EOF
+		}
+		if packet.Reader != nil {
+			q.reader = packet.Reader
+			return q.reader.Read(b)
+		}
+		heap.Push(&q.heap, packet)
+	}
+	for len(q.heap) > 0 {
+		packet := heap.Pop(&q.heap).(uploadPacket)
+		if packet.Seq == q.nextSeq {
+			n := copy(b, packet.Payload)
+			if n < len(packet.Payload) {
+				packet.Payload = packet.Payload[n:]
+				heap.Push(&q.heap, packet)
+			} else {
+				q.nextSeq = packet.Seq + 1
+			}
+			return n, nil
+		}
+		if packet.Seq > q.nextSeq {
+			if len(q.heap) > q.maxPackets {
+				return 0, fmt.Errorf("packet queue too large")
+			}
+			heap.Push(&q.heap, packet)
+			packet2, more := <-q.pushedPackets
+			if !more {
+				return 0, io.EOF
+			}
+			heap.Push(&q.heap, packet2)
+		}
+	}
+	return 0, nil
+}
+
+type uploadHeap []uploadPacket
+
+func (h uploadHeap) Len() int           { return len(h) }
+func (h uploadHeap) Less(i, j int) bool { return h[i].Seq < h[j].Seq }
+func (h uploadHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *uploadHeap) Push(x interface{}) {
+	*h = append(*h, x.(uploadPacket))
+}
+func (h *uploadHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
 
 // XHTTPCarrier implements XHTTP (SplitHTTP) as a UQSP carrier.
 // XHTTP splits HTTP requests/responses across multiple connections.
@@ -30,6 +197,7 @@ type XHTTPCarrier struct {
 	streams   map[uint32]*xhttpStream
 	mu        sync.RWMutex
 	nextID    uint32
+	xmux      *xmuxManager
 }
 
 // XHTTPConfig configures the XHTTP carrier.
@@ -48,6 +216,58 @@ type XHTTPConfig struct {
 	HeaderRandomization bool `yaml:"header_randomization"`
 	RequestDelayMs      int  `yaml:"request_delay_ms"`
 	ResponseDelayMs     int  `yaml:"response_delay_ms"`
+
+	HTTPVersion string `yaml:"http_version"` // "1.1", "2", "3", or "auto"
+
+	ScMaxEachPostBytes   scRange             `yaml:"sc_max_each_post_bytes"`
+	ScMinPostsIntervalMs scRange             `yaml:"sc_min_posts_interval_ms"`
+	Extra                string              `yaml:"extra"`
+	DownloadSettings     string              `yaml:"download_settings"`
+	NoGRPCHeader         bool                `yaml:"no_grpc_header"`
+	KeepAlivePeriod      int                 `yaml:"keep_alive_period"`
+	Metadata             XHTTPMetadataConfig `yaml:"metadata"`
+
+	// XMux configuration
+	XMux XMuxConfig `yaml:"xmux"`
+}
+
+type XHTTPMetadataConfig struct {
+	Session XHTTPMetadataFieldConfig `yaml:"session"`
+	Seq     XHTTPMetadataFieldConfig `yaml:"seq"`
+	Mode    XHTTPMetadataFieldConfig `yaml:"mode"`
+}
+
+type XHTTPMetadataFieldConfig struct {
+	Placement string `yaml:"placement"` // header, path, query, cookie
+	Key       string `yaml:"key"`
+}
+
+type XMuxConfig struct {
+	Enabled          bool   `yaml:"enabled"`
+	MaxConnections   int    `yaml:"max_connections"`
+	MaxConcurrency   int    `yaml:"max_concurrency"`
+	MaxConnectionAge int64  `yaml:"max_connection_age"`
+	CMaxReuseTimes   int    `yaml:"c_max_reuse_times"`
+	HMaxRequestTimes int    `yaml:"h_max_request_times"`
+	HMaxReusableSecs int    `yaml:"h_max_reusable_secs"`
+	DrainTimeout     string `yaml:"drain_timeout"`
+}
+
+func (c XHTTPConfig) metadataConfig() xhttpmeta.MetadataConfig {
+	return xhttpmeta.MetadataConfig{
+		Session: xhttpmeta.FieldConfig{
+			Placement: xhttpmeta.Placement(strings.ToLower(strings.TrimSpace(c.Metadata.Session.Placement))),
+			Key:       c.Metadata.Session.Key,
+		},
+		Seq: xhttpmeta.FieldConfig{
+			Placement: xhttpmeta.Placement(strings.ToLower(strings.TrimSpace(c.Metadata.Seq.Placement))),
+			Key:       c.Metadata.Seq.Key,
+		},
+		Mode: xhttpmeta.FieldConfig{
+			Placement: xhttpmeta.Placement(strings.ToLower(strings.TrimSpace(c.Metadata.Mode.Placement))),
+			Key:       c.Metadata.Mode.Key,
+		},
+	}
 }
 
 // NewXHTTPCarrier creates a new XHTTP carrier.
@@ -83,7 +303,7 @@ func NewXHTTPCarrier(cfg XHTTPConfig, smuxCfg *smux.Config) *XHTTPCarrier {
 		return dialCarrierTLS(ctx, network, addr, tlsConfig, cfg.TLSFingerprint)
 	}
 
-	return &XHTTPCarrier{
+	carrier := &XHTTPCarrier{
 		config:    cfg,
 		smuxCfg:   smuxCfg,
 		tlsConfig: tlsConfig,
@@ -93,18 +313,24 @@ func NewXHTTPCarrier(cfg XHTTPConfig, smuxCfg *smux.Config) *XHTTPCarrier {
 			Transport: httpTransport,
 		},
 	}
+
+	// Initialize XMUX connection pool if enabled
+	if cfg.XMux.Enabled {
+		carrier.xmux = newXmuxManager(cfg.XMux, func() DialerClient {
+			httpVer := httpVersion(cfg.HTTPVersion)
+			if httpVer == "" || httpVer == "auto" {
+				httpVer = httpVersion2
+			}
+			return carrier.createHTTPClient(httpVer)
+		})
+	}
+
+	return carrier
 }
 
 // Dial connects to the XHTTP server.
 func (c *XHTTPCarrier) Dial(ctx context.Context, addr string) (net.Conn, error) {
-	switch c.config.Mode {
-	case "stream-one", "stream-up", "stream-down":
-		return c.dialStreamMode(ctx)
-	case "packet-up":
-		return c.dialPacketMode(ctx)
-	default:
-		return nil, fmt.Errorf("unsupported XHTTP mode: %s", c.config.Mode)
-	}
+	return c.dialEnhanced(ctx, addr)
 }
 
 // dialStreamMode dials in streaming mode.
@@ -590,4 +816,513 @@ func (c *xhttpServerConn) Read(b []byte) (int, error) {
 	}
 
 	return n, nil
+}
+
+type xmuxConn struct {
+	DialerClient
+	closed    int32
+	openUsage int32
+	createdAt time.Time
+	requests  int32
+}
+
+func (c *xmuxConn) isExpired(maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		return false
+	}
+	return time.Since(c.createdAt) > maxAge
+}
+
+func (c *xmuxConn) isExhausted(maxRequests int32) bool {
+	if maxRequests <= 0 {
+		return false
+	}
+	return atomic.LoadInt32(&c.requests) >= maxRequests
+}
+
+type xmuxManager struct {
+	config   XMuxConfig
+	createFn func() DialerClient
+	mu       sync.Mutex
+	conns    []*xmuxConn
+	nextIdx  int
+}
+
+func newXmuxManager(config XMuxConfig, createFn func() DialerClient) *xmuxManager {
+	maxConns := config.MaxConnections
+	if maxConns <= 0 {
+		maxConns = 8
+	}
+	return &xmuxManager{
+		config:   config,
+		createFn: createFn,
+		conns:    make([]*xmuxConn, 0, maxConns),
+	}
+}
+
+func (m *xmuxManager) getClient() DialerClient {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	maxAge := time.Duration(m.config.HMaxReusableSecs) * time.Second
+	if maxAge <= 0 {
+		maxAge = time.Duration(m.config.MaxConnectionAge) * time.Second
+	}
+	maxConns := m.config.MaxConnections
+	if maxConns <= 0 {
+		maxConns = 8
+	}
+
+	maxRequests := int32(m.config.HMaxRequestTimes)
+
+	// Evict expired or exhausted connections
+	alive := m.conns[:0]
+	for _, c := range m.conns {
+		if atomic.LoadInt32(&c.closed) == 0 && !c.isExpired(maxAge) && !c.isExhausted(maxRequests) {
+			alive = append(alive, c)
+		}
+	}
+	m.conns = alive
+
+	// Pick the least-loaded connection under max concurrency
+	var best *xmuxConn
+	for _, c := range m.conns {
+		usage := atomic.LoadInt32(&c.openUsage)
+		if m.config.MaxConcurrency > 0 && int(usage) >= m.config.MaxConcurrency {
+			continue
+		}
+		if best == nil || usage < atomic.LoadInt32(&best.openUsage) {
+			best = c
+		}
+	}
+
+	if best != nil {
+		atomic.AddInt32(&best.openUsage, 1)
+		atomic.AddInt32(&best.requests, 1)
+		return best.DialerClient
+	}
+
+	// All connections are full or none exist — create a new one if under limit
+	if len(m.conns) < maxConns {
+		client := m.createFn()
+		conn := &xmuxConn{
+			DialerClient: client,
+			createdAt:    time.Now(),
+		}
+		atomic.AddInt32(&conn.openUsage, 1)
+		atomic.AddInt32(&conn.requests, 1)
+		m.conns = append(m.conns, conn)
+		return client
+	}
+
+	// At capacity — round-robin
+	if m.nextIdx >= len(m.conns) {
+		m.nextIdx = 0
+	}
+	selected := m.conns[m.nextIdx]
+	m.nextIdx = (m.nextIdx + 1) % len(m.conns)
+	atomic.AddInt32(&selected.openUsage, 1)
+	atomic.AddInt32(&selected.requests, 1)
+	return selected.DialerClient
+}
+
+func (m *xmuxManager) release(client DialerClient) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.conns {
+		if c.DialerClient == client {
+			atomic.AddInt32(&c.openUsage, -1)
+			return
+		}
+	}
+}
+
+type DialerClient interface {
+	OpenStream(ctx context.Context, urlStr, sessionID string, body io.Reader, upload bool) (io.ReadCloser, net.Addr, net.Addr, error)
+	PostPacket(ctx context.Context, urlStr, sessionID string, seq uint64, body io.Reader, contentLen int64) error
+}
+
+type DefaultDialerClient struct {
+	config         *XHTTPConfig
+	client         *http.Client
+	httpVersion    httpVersion
+	uploadRawPool  *sync.Pool
+	dialUploadConn func(ctx context.Context) (net.Conn, error)
+}
+
+func (c *DefaultDialerClient) OpenStream(ctx context.Context, urlStr, sessionID string, body io.Reader, upload bool) (io.ReadCloser, net.Addr, net.Addr, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", urlStr, body)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Transfer-Encoding", "chunked")
+	if upload {
+		req.Header.Set("X-Stealthlink-Upload", "true")
+	}
+	for k, v := range c.config.Headers {
+		req.Header.Set(k, v)
+	}
+	if err := xhttpmeta.ApplyToRequest(req, c.config.metadataConfig(), xhttpmeta.MetadataValues{
+		SessionID: sessionID,
+		Mode:      c.config.Mode,
+	}); err != nil {
+		return nil, nil, nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, nil, nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	var localAddr, remoteAddr net.Addr
+	if resp.Request != nil && resp.Request.URL != nil {
+		remoteAddr, _ = net.ResolveTCPAddr("tcp", resp.Request.URL.Host)
+	}
+
+	return resp.Body, remoteAddr, localAddr, nil
+}
+
+func (c *DefaultDialerClient) PostPacket(ctx context.Context, urlStr, sessionID string, seq uint64, body io.Reader, contentLen int64) error {
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{})
+
+	req, err := http.NewRequestWithContext(ctx, "POST", urlStr, body)
+	if err != nil {
+		return err
+	}
+
+	req.ContentLength = contentLen
+	req.Header.Set("Content-Type", "application/octet-stream")
+	for k, v := range c.config.Headers {
+		req.Header.Set(k, v)
+	}
+	if err := xhttpmeta.ApplyToRequest(req, c.config.metadataConfig(), xhttpmeta.MetadataValues{
+		SessionID: sessionID,
+		Seq:       seq,
+		Mode:      c.config.Mode,
+	}); err != nil {
+		return err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+type splitHTTPConn struct {
+	writer     io.WriteCloser
+	reader     io.ReadCloser
+	remoteAddr net.Addr
+	localAddr  net.Addr
+	onClose    func()
+	closed     int32
+}
+
+func (c *splitHTTPConn) Write(b []byte) (int, error) {
+	return c.writer.Write(b)
+}
+
+func (c *splitHTTPConn) Read(b []byte) (int, error) {
+	return c.reader.Read(b)
+}
+
+func (c *splitHTTPConn) Close() error {
+	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
+		return nil
+	}
+	if c.onClose != nil {
+		c.onClose()
+	}
+	var err error
+	if c.writer != nil {
+		if e := c.writer.Close(); e != nil {
+			err = e
+		}
+	}
+	if c.reader != nil {
+		if e := c.reader.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
+func (c *splitHTTPConn) LocalAddr() net.Addr  { return c.localAddr }
+func (c *splitHTTPConn) RemoteAddr() net.Addr { return c.remoteAddr }
+func (c *splitHTTPConn) SetDeadline(t time.Time) error {
+	return c.SetReadDeadline(t)
+}
+func (c *splitHTTPConn) SetReadDeadline(t time.Time) error {
+	if rc, ok := c.reader.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return rc.SetReadDeadline(t)
+	}
+	return nil
+}
+func (c *splitHTTPConn) SetWriteDeadline(t time.Time) error {
+	if wc, ok := c.writer.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return wc.SetWriteDeadline(t)
+	}
+	return nil
+}
+
+type uploadWriter struct {
+	*io.PipeWriter
+	maxLen int32
+	wrote  int64
+}
+
+func (w *uploadWriter) Write(b []byte) (int, error) {
+	capacity := int(w.maxLen - int32(w.wrote))
+	if capacity > 0 && capacity < len(b) {
+		b = b[:capacity]
+	}
+	n, err := w.PipeWriter.Write(b)
+	w.wrote += int64(n)
+	return n, err
+}
+
+func (c *XHTTPCarrier) dialEnhanced(ctx context.Context, addr string) (net.Conn, error) {
+	cfg := c.config
+
+	httpVer := httpVersion(cfg.HTTPVersion)
+	if httpVer == "" || httpVer == "auto" {
+		if c.tlsConfig != nil {
+			if len(c.tlsConfig.NextProtos) == 0 {
+				httpVer = httpVersion2
+			} else {
+				switch c.tlsConfig.NextProtos[0] {
+				case "http/1.1":
+					httpVer = httpVersion1_1
+				case "h3":
+					httpVer = httpVersion3
+				default:
+					httpVer = httpVersion2
+				}
+			}
+		} else {
+			httpVer = httpVersion1_1
+		}
+	}
+
+	mode := cfg.Mode
+	if mode == "" || mode == "auto" {
+		mode = "stream-one"
+	}
+
+	sessionID := ""
+	if mode != "stream-one" {
+		sessionID = generateUUID()
+	}
+
+	requestURL := url.URL{
+		Scheme: "https",
+		Host:   cfg.Server,
+		Path:   cfg.Path,
+	}
+
+	if cfg.ScMaxEachPostBytes.From == 0 {
+		cfg.ScMaxEachPostBytes = scRange{From: 1000000, To: 1000000}
+	}
+	if cfg.ScMinPostsIntervalMs.From == 0 {
+		cfg.ScMinPostsIntervalMs = scRange{From: 10, To: 20}
+	}
+
+	// Use XMUX pool when enabled, otherwise create a fresh client
+	var client DialerClient
+	var releaseClient func()
+	if c.xmux != nil {
+		client = c.xmux.getClient()
+		releaseClient = func() { c.xmux.release(client) }
+	} else {
+		client = c.createHTTPClient(httpVer)
+		releaseClient = func() {}
+	}
+
+	if mode == "stream-one" {
+		conn, err := c.dialStreamOne(ctx, client, requestURL.String(), sessionID, httpVer)
+		if err != nil {
+			releaseClient()
+			return nil, err
+		}
+		if sc, ok := conn.(*splitHTTPConn); ok {
+			origClose := sc.onClose
+			sc.onClose = func() {
+				releaseClient()
+				if origClose != nil {
+					origClose()
+				}
+			}
+		}
+		return conn, nil
+	}
+
+	downloadURL := requestURL.String()
+	if cfg.DownloadSettings != "" {
+		downloadURL = cfg.DownloadSettings
+	}
+
+	conn, err := c.dialSplitMode(ctx, client, requestURL.String(), downloadURL, sessionID, mode, httpVer)
+	if err != nil {
+		releaseClient()
+		return nil, err
+	}
+	if sc, ok := conn.(*splitHTTPConn); ok {
+		origClose := sc.onClose
+		sc.onClose = func() {
+			releaseClient()
+			if origClose != nil {
+				origClose()
+			}
+		}
+	}
+	return conn, nil
+}
+
+func (c *XHTTPCarrier) createHTTPClient(httpVer httpVersion) DialerClient {
+	cfg := c.config
+
+	transport := c.createTransport(httpVer)
+
+	return &DefaultDialerClient{
+		config: &cfg,
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   0,
+		},
+		httpVersion:   httpVer,
+		uploadRawPool: &sync.Pool{},
+		dialUploadConn: func(ctx context.Context) (net.Conn, error) {
+			return dialCarrierTLS(ctx, "tcp", c.config.Server, c.tlsConfig, c.config.TLSFingerprint)
+		},
+	}
+}
+
+func (c *XHTTPCarrier) createTransport(httpVer httpVersion) http.RoundTripper {
+	cfg := c.config
+
+	switch httpVer {
+	case "2":
+		keepAlive := time.Duration(cfg.XMux.HMaxReusableSecs) * time.Second
+		if keepAlive == 0 {
+			keepAlive = time.Duration(cfg.XMux.MaxConnectionAge) * time.Second
+		}
+		if keepAlive == 0 {
+			keepAlive = 45 * time.Second
+		}
+		return &http2.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string, tlsCfg *tls.Config) (net.Conn, error) {
+				return dialCarrierTLS(ctx, network, addr, tlsCfg, c.config.TLSFingerprint)
+			},
+			ReadIdleTimeout: keepAlive,
+			IdleConnTimeout: 90 * time.Second,
+		}
+	case "3":
+		return &http3.Transport{
+			TLSClientConfig: c.tlsConfig,
+			QUICConfig: &quic.Config{
+				MaxIdleTimeout:  90 * time.Second,
+				KeepAlivePeriod: 30 * time.Second,
+			},
+		}
+	default:
+		return &http.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialCarrierTLS(ctx, network, addr, c.tlsConfig, c.config.TLSFingerprint)
+			},
+			IdleConnTimeout: 90 * time.Second,
+		}
+	}
+}
+
+func (c *XHTTPCarrier) dialStreamOne(ctx context.Context, client DialerClient, urlStr, sessionID string, httpVer httpVersion) (net.Conn, error) {
+	reader, writer := io.Pipe()
+
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", c.config.Server)
+
+	rc, _, _, err := client.OpenStream(ctx, urlStr, sessionID, reader, false)
+	if err != nil {
+		reader.Close()
+		writer.Close()
+		return nil, err
+	}
+
+	return &splitHTTPConn{
+		writer:     writer,
+		reader:     rc,
+		remoteAddr: remoteAddr,
+	}, nil
+}
+
+func (c *XHTTPCarrier) dialSplitMode(ctx context.Context, client DialerClient, uploadURL, downloadURL, sessionID, mode string, httpVer httpVersion) (net.Conn, error) {
+	maxUploadSize := c.config.ScMaxEachPostBytes.rand()
+	if maxUploadSize <= 0 {
+		maxUploadSize = 1000000
+	}
+
+	uploadReader, uploadWriter := io.Pipe()
+
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", c.config.Server)
+
+	downloadReader, _, _, err := client.OpenStream(ctx, downloadURL, sessionID, nil, false)
+	if err != nil {
+		uploadReader.Close()
+		uploadWriter.Close()
+		return nil, err
+	}
+
+	conn := &splitHTTPConn{
+		writer:     uploadWriter,
+		reader:     downloadReader,
+		remoteAddr: remoteAddr,
+	}
+
+	go c.uploadLoop(ctx, client, uploadURL, sessionID, uploadReader, maxUploadSize)
+
+	return conn, nil
+}
+
+func (c *XHTTPCarrier) uploadLoop(ctx context.Context, client DialerClient, baseURL, sessionID string, reader *io.PipeReader, maxUploadSize int64) {
+	buf := make([]byte, 32*1024)
+	seq := int64(0)
+
+	for {
+		interval := c.config.ScMinPostsIntervalMs.rand()
+		if interval > 0 {
+			time.Sleep(time.Duration(interval) * time.Millisecond)
+		}
+
+		n, err := reader.Read(buf)
+		if err != nil {
+			return
+		}
+
+		seqVal := uint64(seq)
+		seq++
+
+		urlStr := baseURL
+
+		go func(data []byte, s uint64) {
+			_ = client.PostPacket(ctx, urlStr, sessionID, s, bytes.NewReader(data), int64(len(data)))
+		}(buf[:n], seqVal)
+	}
+}
+
+func generateUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

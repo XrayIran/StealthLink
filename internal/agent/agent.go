@@ -23,6 +23,7 @@ import (
 	"stealthlink/internal/transport/tfo"
 	"stealthlink/internal/transport/uqsp"
 	"stealthlink/internal/tun"
+	"stealthlink/internal/vpn"
 
 	"github.com/xtaci/smux"
 )
@@ -68,7 +69,7 @@ func New(cfg *config.Config) *Agent {
 }
 
 func (a *Agent) Start(ctx context.Context) error {
-	metrics.Start(a.cfg.Metrics.Listen, a.cfg.Metrics.AuthToken)
+	metrics.Start(a.cfg.Metrics.Listen, a.cfg.Metrics.AuthToken, a.cfg.Metrics.Pprof)
 	a.startNoizeTelemetry(ctx)
 	groups := groupServices(a.cfg)
 	for key, grp := range groups {
@@ -218,11 +219,21 @@ func (a *Agent) buildUQSPDialer(target transportTarget) (transport.Dialer, strin
 		smuxCfg.KeepAliveTimeout = d
 	}
 
-	log.Printf("UQSP connecting with variant=%s: %s", a.cfg.VariantName(), a.cfg.VariantDescription())
+	if a.cfg.UQSPRuntimeMode() == "legacy" {
+		log.Printf("UQSP runtime mode=legacy; using historical dialer path")
+		d := uqsp.NewDialer(&a.cfg.Transport.UQSP, tlsCfg, smuxCfg, a.cfg.ActiveSharedKey())
+		return d, a.cfg.Agent.GatewayAddr, nil
+	}
 
-	dialer := uqsp.NewDialer(&a.cfg.Transport.UQSP, tlsCfg, smuxCfg, a.cfg.AgentToken(a.cfg.Agent.ID))
+	// Use the unified runtime dialer which routes through
+	// BuildVariantForRole -> UnifiedProtocol with full variant overlay
+	// chain, WARP egress, and reverse-initiation support.
+	rd, err := uqsp.NewRuntimeDialer(a.cfg, tlsCfg, smuxCfg, a.cfg.ActiveSharedKey())
+	if err != nil {
+		return nil, "", fmt.Errorf("UQSP runtime dialer: %w", err)
+	}
 
-	return dialer, a.cfg.Agent.GatewayAddr, nil
+	return rd, a.cfg.Agent.GatewayAddr, nil
 }
 
 func configLegacyTransportError(transportType string) error {
@@ -419,19 +430,73 @@ func (a *Agent) handleTun(ctx context.Context, strm net.Conn, svc *config.Servic
 	}
 	a.tunActive[svc.Name] = struct{}{}
 	a.tunMu.Unlock()
+	defer func() {
+		a.tunMu.Lock()
+		delete(a.tunActive, svc.Name)
+		a.tunMu.Unlock()
+	}()
 
-	iface, err := tun.Open(svc.Tun.Name, svc.Tun.MTU)
+	if a.cfg.VPN.Enabled {
+		vpnCfg := a.cfg.VPN
+		if vpnCfg.Name == "" {
+			vpnCfg.Name = svc.Tun.Name
+		}
+		if vpnCfg.MTU <= 0 && svc.Tun.MTU > 0 {
+			vpnCfg.MTU = svc.Tun.MTU
+		}
+		if vpnCfg.Mode == "" {
+			vpnCfg.Mode = svc.Tun.Mode
+		}
+		if vpnCfg.Mode == "" {
+			vpnCfg.Mode = "tun"
+		}
+
+		session, err := vpn.NewSession(vpnCfg, strm)
+		if err != nil {
+			log.Printf("vpn session init failed: %v", err)
+			metrics.IncErrors()
+			return
+		}
+
+		errCh := make(chan error, 1)
+		session.SetErrorHandler(func(err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		})
+
+		if err := session.Start(); err != nil {
+			log.Printf("vpn session start failed: %v", err)
+			metrics.IncErrors()
+			_ = session.Close()
+			return
+		}
+
+		log.Printf("tun service %s started on %s (vpn mode)", svc.Name, session.InterfaceName())
+		select {
+		case <-ctx.Done():
+		case err := <-errCh:
+			if err != nil {
+				log.Printf("tun service %s ended: %v", svc.Name, err)
+				metrics.IncErrors()
+			}
+		}
+		_ = session.Close()
+		return
+	}
+
+	iface, err := tun.OpenWithMode(tun.Config{
+		Name: svc.Tun.Name,
+		MTU:  svc.Tun.MTU,
+		Mode: svc.Tun.Mode,
+	})
 	if err != nil {
 		log.Printf("tun open failed: %v", err)
 		metrics.IncErrors()
 		return
 	}
-	defer func() {
-		_ = iface.Close()
-		a.tunMu.Lock()
-		delete(a.tunActive, svc.Name)
-		a.tunMu.Unlock()
-	}()
+	defer func() { _ = iface.Close() }()
 
 	log.Printf("tun service %s started on %s", svc.Name, iface.Name())
 	if err := tun.Bridge(ctx, iface, strm); err != nil {

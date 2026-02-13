@@ -11,14 +11,125 @@ type VariantConfig struct {
 	Variant string `yaml:"variant"`
 }
 
+func parseVariantValue(raw string) (int, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0":
+		return 0, true
+	case "4a", "xhttp-tls", "xhttp_tls":
+		return 0, true
+	case "1":
+		return 1, true
+	case "4b", "raw-tcp", "raw_tcp":
+		return 1, true
+	case "2":
+		return 2, true
+	case "4c", "tls-mirror", "tls_mirror":
+		return 2, true
+	case "3":
+		return 3, true
+	case "4d", "udp":
+		return 3, true
+	case "4":
+		return 4, true
+	case "4e", "trust":
+		return 4, true
+	default:
+		return 0, false
+	}
+}
+
+func (c *Config) selectedVariantRaw() string {
+	if v := strings.TrimSpace(c.Variant); v != "" {
+		return v
+	}
+	return strings.TrimSpace(c.Transport.UQSP.VariantProfile)
+}
+
+func (c *Config) applyVariantPreset() {
+	if !c.UQSPEnabled() {
+		return
+	}
+
+	variant, ok := parseVariantValue(c.selectedVariantRaw())
+	if !ok {
+		return
+	}
+
+	u := &c.Transport.UQSP
+	switch variant {
+	case 0: // 4a: XHTTP + gfw_resist_tls + domain fronting + vision + ECH
+		// ApplyUQSPDefaults sets carrier.type="quic" as a generic default. For non-4d variants,
+		// treat "quic" as "unset" so the variant preset can choose a more appropriate carrier.
+		if strings.TrimSpace(u.Carrier.Type) == "" || strings.EqualFold(strings.TrimSpace(u.Carrier.Type), "quic") {
+			u.Carrier.Type = "xhttp"
+		}
+		if strings.TrimSpace(u.Obfuscation.Profile) == "" || strings.EqualFold(strings.TrimSpace(u.Obfuscation.Profile), "none") {
+			u.Obfuscation.Profile = "adaptive"
+		}
+		u.Behaviors.Vision.Enabled = true
+		u.Behaviors.Vision.FlowAutoDetect = true
+		u.Behaviors.TLSFrag.Enabled = true
+		if u.Behaviors.TLSFrag.Strategy == "" {
+			u.Behaviors.TLSFrag.Strategy = "sni_split"
+		}
+	case 1: // 4b: Raw TCP + anti-DPI + obfuscation
+		if strings.TrimSpace(u.Carrier.Type) == "" || strings.EqualFold(strings.TrimSpace(u.Carrier.Type), "quic") {
+			u.Carrier.Type = "rawtcp"
+		}
+		if strings.TrimSpace(u.Obfuscation.Profile) == "" || strings.EqualFold(strings.TrimSpace(u.Obfuscation.Profile), "none") {
+			u.Obfuscation.Profile = "adaptive"
+		}
+		u.Obfuscation.MorphingEnabled = true
+		u.Behaviors.AWG.Enabled = true
+	case 2: // 4c: XHTTP + TLS look-alikes + Vision + ML-DSA-65
+		// Allow explicit carrier selection (e.g., AnyTLS) without being overridden by the preset.
+		if strings.TrimSpace(u.Carrier.Type) == "" || strings.EqualFold(strings.TrimSpace(u.Carrier.Type), "quic") {
+			u.Carrier.Type = "xhttp"
+		}
+		u.Behaviors.Vision.Enabled = true
+		u.Behaviors.Vision.FlowAutoDetect = true
+		if !u.Behaviors.Reality.Enabled && !u.Behaviors.ShadowTLS.Enabled && !u.Behaviors.TLSMirror.Enabled {
+			u.Behaviors.TLSMirror.Enabled = true
+		}
+		u.Security.PQKEM = true
+	case 3: // 4d: UDP/QUIC + brutal CC + AWG/obfuscation
+		if strings.TrimSpace(u.Carrier.Type) == "" {
+			u.Carrier.Type = "quic"
+		}
+		u.Congestion.Algorithm = "brutal"
+		if u.Congestion.BandwidthMbps == 0 {
+			u.Congestion.BandwidthMbps = 200
+		}
+		u.Capsules.ConnectUDP = true
+		if strings.TrimSpace(u.Obfuscation.Profile) == "" || strings.EqualFold(strings.TrimSpace(u.Obfuscation.Profile), "none") {
+			u.Obfuscation.Profile = "adaptive"
+		}
+		u.Obfuscation.MorphingEnabled = true
+		u.Behaviors.AWG.Enabled = true
+	case 4: // 4e: TLS-based tunnels + CSTP compatibility
+		if strings.TrimSpace(u.Carrier.Type) == "" || strings.TrimSpace(u.Carrier.Type) == "quic" {
+			u.Carrier.Type = "trusttunnel"
+		}
+		u.Behaviors.CSTP.Enabled = true
+		u.Behaviors.TLSFrag.Enabled = true
+		if u.Behaviors.TLSFrag.Strategy == "" {
+			u.Behaviors.TLSFrag.Strategy = "random"
+		}
+	}
+}
+
 func (c *Config) GetVariant() int {
+	if explicit, ok := parseVariantValue(c.selectedVariantRaw()); ok {
+		return explicit
+	}
+
 	behaviors := c.Transport.UQSP.Behaviors
 
 	if behaviors.ECH.Enabled || behaviors.DomainFront.Enabled {
 		return 0
 	}
 
-	if behaviors.Reality.Enabled || behaviors.ShadowTLS.Enabled || behaviors.TLSMirror.Enabled {
+	if behaviors.Reality.Enabled || behaviors.ShadowTLS.Enabled || behaviors.TLSMirror.Enabled || behaviors.AnyTLS.Enabled {
 		return 2
 	}
 
@@ -34,7 +145,7 @@ func (c *Config) GetVariant() int {
 	switch carrierType {
 	case "xhttp":
 		return 0
-	case "rawtcp", "icmptun":
+	case "rawtcp", "faketcp", "icmptun":
 		return 1
 	case "webtunnel", "chisel", "trusttunnel":
 		return 4
@@ -46,10 +157,25 @@ func (c *Config) GetVariant() int {
 }
 
 func (c *Config) ValidateVariant() error {
-	variant := c.GetVariant()
-
 	if !c.UQSPEnabled() {
 		return nil
+	}
+
+	if strings.TrimSpace(c.Variant) != "" && strings.TrimSpace(c.Transport.UQSP.VariantProfile) != "" {
+		v1, ok1 := parseVariantValue(c.Variant)
+		v2, ok2 := parseVariantValue(c.Transport.UQSP.VariantProfile)
+		if ok1 && ok2 && v1 != v2 {
+			return fmt.Errorf("variant and transport.uqsp.variant_profile conflict: %q vs %q", c.Variant, c.Transport.UQSP.VariantProfile)
+		}
+	}
+
+	raw := c.selectedVariantRaw()
+	variant, ok := parseVariantValue(raw)
+	if raw != "" && !ok {
+		return fmt.Errorf("variant must be one of: 4a, 4b, 4c, 4d, 4e")
+	}
+	if !ok {
+		variant = c.GetVariant()
 	}
 
 	switch variant {
@@ -93,17 +219,18 @@ func (c *Config) validateVariantRawTCP() error {
 	behaviors := c.Transport.UQSP.Behaviors
 
 	if behaviors.Obfs4.Enabled {
-		if behaviors.Obfs4.NodeID == "" {
-			return fmt.Errorf("obfs4.node_id is required when obfs4 is enabled")
+		seedProvided := strings.TrimSpace(behaviors.Obfs4.Seed) != ""
+		if !seedProvided && strings.TrimSpace(behaviors.Obfs4.NodeID) == "" {
+			return fmt.Errorf("obfs4.node_id is required when obfs4 is enabled (or set obfs4.seed)")
 		}
-		if behaviors.Obfs4.PublicKey == "" {
-			return fmt.Errorf("obfs4.public_key is required when obfs4 is enabled")
+		if !seedProvided && strings.TrimSpace(behaviors.Obfs4.PublicKey) == "" {
+			return fmt.Errorf("obfs4.public_key is required when obfs4 is enabled (or set obfs4.seed)")
 		}
 	}
 
 	carrierType := c.Transport.UQSP.Carrier.Type
-	if carrierType != "rawtcp" && carrierType != "icmptun" && carrierType != "" {
-		return fmt.Errorf("raw-tcp variant requires carrier.type to be rawtcp or icmptun, got: %s", carrierType)
+	if carrierType != "rawtcp" && carrierType != "faketcp" && carrierType != "icmptun" && carrierType != "" {
+		return fmt.Errorf("raw-tcp variant requires carrier.type to be rawtcp, faketcp, or icmptun, got: %s", carrierType)
 	}
 
 	return nil
@@ -140,14 +267,15 @@ func (c *Config) validateVariantTLSMirror() error {
 	if behaviors.TLSMirror.Enabled {
 		tlsModes++
 	}
-
-	if tlsModes == 0 {
-		return fmt.Errorf("tls-mirror variant requires at least one TLS behavior (reality, shadowtls, or tlsmirror)")
+	if behaviors.AnyTLS.Enabled {
+		tlsModes++
+		if strings.TrimSpace(behaviors.AnyTLS.Password) == "" {
+			return fmt.Errorf("anytls.password is required when AnyTLS is enabled")
+		}
 	}
 
-	if c.Transport.UQSP.Security.PQKEM {
-		if c.Role == "gateway" {
-		}
+	if tlsModes == 0 {
+		return fmt.Errorf("tls-mirror variant requires at least one TLS behavior (reality, shadowtls, tlsmirror, or anytls)")
 	}
 
 	return nil
@@ -204,7 +332,7 @@ func (c *Config) VariantDescription() string {
 	variant := c.GetVariant()
 	descs := []string{
 		"XHTTP + TLS + Domain Fronting + XTLS Vision + ECH - Maximum stealth with CDN cover",
-		"Raw TCP + KCP + smux + obfs4 - Low latency, high throughput",
+		"RawTCP/FakeTCP + KCP/smux + obfs4 + anti-DPI - Low latency, high throughput",
 		"REALITY/ShadowTLS + XTLS Vision + PQ signatures - TLS fingerprint resistance",
 		"QUIC/UDP + Hysteria2 CC + AmneziaWG - UDP-based with anti-DPI",
 		"TrustTunnel + HTTP/2 + HTTP/3 - HTTP-constrained environments",

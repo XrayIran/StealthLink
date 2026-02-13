@@ -8,21 +8,186 @@ import (
 func PromHandler(w http.ResponseWriter, r *http.Request) {
 	st := SnapshotData()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	fmt.Fprintf(w, "# HELP stealthlink_sessions_total Total number of sessions created\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_sessions_total counter\n")
 	fmt.Fprintf(w, "stealthlink_sessions_total %d\n", st.SessionsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_sessions_active Currently active sessions\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_sessions_active gauge\n")
 	fmt.Fprintf(w, "stealthlink_sessions_active %d\n", st.SessionsActive)
+
+	fmt.Fprintf(w, "# HELP stealthlink_streams_total Total number of streams created\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_streams_total counter\n")
 	fmt.Fprintf(w, "stealthlink_streams_total %d\n", st.StreamsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_streams_active Currently active streams\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_streams_active gauge\n")
 	fmt.Fprintf(w, "stealthlink_streams_active %d\n", st.StreamsActive)
+
+	fmt.Fprintf(w, "# HELP stealthlink_udp_sessions Current number of UDP sessions\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_udp_sessions gauge\n")
 	fmt.Fprintf(w, "stealthlink_udp_sessions %d\n", st.UDPSessions)
+
+	fmt.Fprintf(w, "# HELP stealthlink_errors_total Total number of errors\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_errors_total counter\n")
 	fmt.Fprintf(w, "stealthlink_errors_total %d\n", st.Errors)
+
+	fmt.Fprintf(w, "# HELP stealthlink_last_ping_rtt_ms Last ping RTT in milliseconds\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_last_ping_rtt_ms gauge\n")
 	fmt.Fprintf(w, "stealthlink_last_ping_rtt_ms %d\n", st.LastPingRTTMs)
+
+	fmt.Fprintf(w, "# HELP stealthlink_traffic_bytes_total Total traffic in bytes\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_traffic_bytes_total counter\n")
 	fmt.Fprintf(w, "stealthlink_traffic_bytes_total %d\n", st.TrafficBytesTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_traffic_bytes_inbound Total inbound traffic in bytes\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_traffic_bytes_inbound counter\n")
 	fmt.Fprintf(w, "stealthlink_traffic_bytes_inbound %d\n", st.TrafficBytesInbound)
+
+	fmt.Fprintf(w, "# HELP stealthlink_traffic_bytes_outbound Total outbound traffic in bytes\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_traffic_bytes_outbound counter\n")
 	fmt.Fprintf(w, "stealthlink_traffic_bytes_outbound %d\n", st.TrafficBytesOutbound)
+
+	fmt.Fprintf(w, "# HELP stealthlink_sockets_open Currently open sockets\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_sockets_open gauge\n")
 	fmt.Fprintf(w, "stealthlink_sockets_open %d\n", st.SocketsOpen)
+
+	fmt.Fprintf(w, "# HELP stealthlink_obfs_junk_packets_total Total obfuscation junk packets sent\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_obfs_junk_packets_total counter\n")
 	fmt.Fprintf(w, "stealthlink_obfs_junk_packets_total %d\n", st.ObfsJunkPacketsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_obfs_signature_packets_total Total obfuscation signature packets sent\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_obfs_signature_packets_total counter\n")
 	fmt.Fprintf(w, "stealthlink_obfs_signature_packets_total %d\n", st.ObfsSignaturePacketsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_raw_enobufs_total Total ENOBUFS errors on raw sockets\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_raw_enobufs_total counter\n")
+	fmt.Fprintf(w, "stealthlink_raw_enobufs_total %d\n", st.RawENOBUFSTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_raw_write_retries_total Total write retries on raw sockets\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_raw_write_retries_total counter\n")
+	fmt.Fprintf(w, "stealthlink_raw_write_retries_total %d\n", st.RawWriteRetriesTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_raw_drops_total Total packet drops on raw sockets\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_raw_drops_total counter\n")
+	fmt.Fprintf(w, "stealthlink_raw_drops_total %d\n", st.RawDropsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_uqsp_reassembly_evictions_total Total UQSP datagram reassembly evictions\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_uqsp_reassembly_evictions_total counter\n")
+	fmt.Fprintf(w, "stealthlink_uqsp_reassembly_evictions_total %d\n", st.UQSPReassemblyEvicts)
+
 	for name, n := range st.TransportSessions {
 		fmt.Fprintf(w, "stealthlink_transport_sessions_active{transport=%q} %d\n", name, n)
+	}
+
+	// Xmux metrics
+	fmt.Fprintf(w, "# HELP stealthlink_xmux_connection_reuses_total Total number of Xmux connection reuses\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_xmux_connection_reuses_total counter\n")
+	fmt.Fprintf(w, "stealthlink_xmux_connection_reuses_total %d\n", st.XmuxConnectionReusesTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_xmux_connection_rotations_total Total number of Xmux connection rotations by reason\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_xmux_connection_rotations_total counter\n")
+	for reason, n := range st.XmuxConnectionRotationsTotal {
+		fmt.Fprintf(w, "stealthlink_xmux_connection_rotations_total{reason=%q} %d\n", reason, n)
+	}
+
+	fmt.Fprintf(w, "# HELP stealthlink_xmux_active_connections Current number of active Xmux connections\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_xmux_active_connections gauge\n")
+	fmt.Fprintf(w, "stealthlink_xmux_active_connections %d\n", st.XmuxActiveConnections)
+
+	// FakeTCP metrics
+	fmt.Fprintf(w, "# HELP stealthlink_faketcp_aead_auth_failures_total Total number of FakeTCP AEAD authentication failures\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_faketcp_aead_auth_failures_total counter\n")
+	fmt.Fprintf(w, "stealthlink_faketcp_aead_auth_failures_total %d\n", st.FakeTCPAEADAuthFailuresTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_faketcp_key_derivations_total Total number of FakeTCP key derivations\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_faketcp_key_derivations_total counter\n")
+	fmt.Fprintf(w, "stealthlink_faketcp_key_derivations_total %d\n", st.FakeTCPKeyDerivationsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_faketcp_encrypted_bytes_total Total number of FakeTCP encrypted bytes by direction\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_faketcp_encrypted_bytes_total counter\n")
+	for dir, n := range st.FakeTCPEncryptedBytesTotal {
+		fmt.Fprintf(w, "stealthlink_faketcp_encrypted_bytes_total{direction=%q} %d\n", dir, n)
+	}
+
+	// REALITY spider metrics
+	fmt.Fprintf(w, "# HELP stealthlink_reality_spider_fetches_total Total number of REALITY spider fetches\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_reality_spider_fetches_total counter\n")
+	fmt.Fprintf(w, "stealthlink_reality_spider_fetches_total %d\n", st.RealitySpiderFetchesTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_reality_spider_duration_seconds Total REALITY spider crawl duration in seconds\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_reality_spider_duration_seconds counter\n")
+	fmt.Fprintf(w, "stealthlink_reality_spider_duration_seconds %.3f\n", st.RealitySpiderDurationSeconds)
+
+	fmt.Fprintf(w, "# HELP stealthlink_reality_spider_urls_crawled Current number of URLs in REALITY spider crawl queue\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_reality_spider_urls_crawled gauge\n")
+	fmt.Fprintf(w, "stealthlink_reality_spider_urls_crawled %d\n", st.RealitySpiderURLsCrawled)
+
+	// Entropy metrics
+	fmt.Fprintf(w, "# HELP stealthlink_entropy_bytes_generated_total Total random bytes generated\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_entropy_bytes_generated_total counter\n")
+	for class, n := range st.EntropyBytesGeneratedTotal {
+		fmt.Fprintf(w, "stealthlink_entropy_bytes_generated_total{class=%q} %d\n", class, n)
+	}
+
+	fmt.Fprintf(w, "# HELP stealthlink_entropy_reseeds_total Total entropy source reseeds\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_entropy_reseeds_total counter\n")
+	fmt.Fprintf(w, "stealthlink_entropy_reseeds_total %d\n", st.EntropyReseedsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_entropy_method Active entropy method (1=active)\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_entropy_method gauge\n")
+	for method, n := range st.EntropyMethod {
+		fmt.Fprintf(w, "stealthlink_entropy_method{method=%q} %d\n", method, n)
+	}
+
+	// KCP FEC metrics
+	fmt.Fprintf(w, "# HELP stealthlink_kcp_fec_parity_skipped_total Total number of KCP FEC parity packets skipped\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_kcp_fec_parity_skipped_total counter\n")
+	fmt.Fprintf(w, "stealthlink_kcp_fec_parity_skipped_total %d\n", st.KCPFECParitySkippedTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_kcp_fec_auto_tune_adjustments_total Total number of KCP FEC auto-tune parameter changes\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_kcp_fec_auto_tune_adjustments_total counter\n")
+	fmt.Fprintf(w, "stealthlink_kcp_fec_auto_tune_adjustments_total %d\n", st.KCPFECAutoTuneAdjustmentsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_kcp_fec_data_shards Current number of KCP FEC data shards\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_kcp_fec_data_shards gauge\n")
+	fmt.Fprintf(w, "stealthlink_kcp_fec_data_shards %d\n", st.KCPFECDataShards)
+
+	fmt.Fprintf(w, "# HELP stealthlink_kcp_fec_parity_shards Current number of KCP FEC parity shards\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_kcp_fec_parity_shards gauge\n")
+	fmt.Fprintf(w, "stealthlink_kcp_fec_parity_shards %d\n", st.KCPFECParityShards)
+
+	// Smux shaper metrics
+	fmt.Fprintf(w, "# HELP stealthlink_smux_shaper_control_frames_total Total number of smux control frames transmitted\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_smux_shaper_control_frames_total counter\n")
+	fmt.Fprintf(w, "stealthlink_smux_shaper_control_frames_total %d\n", st.SmuxShaperControlFramesTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_smux_shaper_data_frames_total Total number of smux data frames transmitted\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_smux_shaper_data_frames_total counter\n")
+	fmt.Fprintf(w, "stealthlink_smux_shaper_data_frames_total %d\n", st.SmuxShaperDataFramesTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_smux_shaper_queue_size Current smux shaper queue size\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_smux_shaper_queue_size gauge\n")
+	fmt.Fprintf(w, "stealthlink_smux_shaper_queue_size %d\n", st.SmuxShaperQueueSize)
+
+	fmt.Fprintf(w, "# HELP stealthlink_smux_shaper_starvation_preventions_total Total smux data starvation preventions\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_smux_shaper_starvation_preventions_total counter\n")
+	fmt.Fprintf(w, "stealthlink_smux_shaper_starvation_preventions_total %d\n", st.SmuxShaperStarvationPreventionsTotal)
+
+	// Connection pool metrics
+	fmt.Fprintf(w, "# HELP stealthlink_pool_size Current connection pool size\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_pool_size gauge\n")
+	fmt.Fprintf(w, "stealthlink_pool_size %d\n", st.PoolSize)
+
+	fmt.Fprintf(w, "# HELP stealthlink_pool_utilization Connection pool utilization ratio\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_pool_utilization gauge\n")
+	fmt.Fprintf(w, "stealthlink_pool_utilization %.3f\n", st.PoolUtilization)
+
+	fmt.Fprintf(w, "# HELP stealthlink_pool_adjustments_total Total connection pool adjustments by direction\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_pool_adjustments_total counter\n")
+	for dir, n := range st.PoolAdjustmentsTotal {
+		fmt.Fprintf(w, "stealthlink_pool_adjustments_total{direction=%q} %d\n", dir, n)
 	}
 
 	// TCP telemetry metrics

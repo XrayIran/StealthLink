@@ -1,4 +1,5 @@
 role: gateway
+variant: "4e"
 
 gateway:
   listen: "0.0.0.0:8443"
@@ -7,6 +8,15 @@ transport:
   type: uqsp
   uqsp:
     carrier:
+      # type: anytls # Unlocked: Replace trusttunnel with anytls for TLS fingerprint resistance
+      # anytls:
+      #   server: "gateway.example.com:443"
+      #   password: "replace-with-anytls-password"
+      #   padding_scheme: burst
+      #   padding_min: 100
+      #   padding_max: 900
+      #   tls_insecure_skip_verify: true
+      #   tls_server_name: "gateway.example.com"
       type: trusttunnel
       trusttunnel:
         server: "https://gateway.example.com:443"

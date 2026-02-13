@@ -28,14 +28,21 @@ type TrustTunnelCarrier struct {
 // NewTrustTunnelCarrier creates a new TrustTunnel carrier
 func NewTrustTunnelCarrier(cfg config.TrustTunnelCarrierConfig, smuxCfg *smux.Config) Carrier {
 	ttConfig := &trusttunnel.Config{
-		Server:         cfg.Server,
-		Version:        trusttunnel.ProtocolVersion(cfg.Version),
-		MaxConcurrent:  cfg.MaxConcurrent,
-		StreamTimeout:  cfg.StreamTimeout,
-		PaddingMin:     cfg.PaddingMin,
-		PaddingMax:     cfg.PaddingMax,
-		DomainFronting: cfg.DomainFronting,
-		Headers:        map[string]string{},
+		Server:          cfg.Server,
+		Version:         trusttunnel.ProtocolVersion(cfg.Version),
+		MaxConcurrent:   cfg.MaxConcurrent,
+		StreamTimeout:   cfg.StreamTimeout,
+		RequestInterval: 30 * time.Second,
+		PaddingMin:      cfg.PaddingMin,
+		PaddingMax:      cfg.PaddingMax,
+		DomainFronting:  cfg.DomainFronting,
+		Headers:         map[string]string{},
+	}
+	if ttConfig.MaxConcurrent <= 0 {
+		ttConfig.MaxConcurrent = 8
+	}
+	if ttConfig.StreamTimeout <= 0 {
+		ttConfig.StreamTimeout = 60 * time.Second
 	}
 
 	// Only set Token if not empty
@@ -169,7 +176,7 @@ func (c *TrustTunnelCarrier) IsAvailable() bool {
 type trustTunnelConn struct {
 	tunnel  *trusttunnel.TrustTunnel
 	session *smux.Session
-	stream  net.Conn
+	stream  *smux.Stream
 	mu      sync.Mutex
 }
 
@@ -178,101 +185,133 @@ func (c *trustTunnelConn) dpdLoop(interval time.Duration) {
 	defer t.Stop()
 	for range t.C {
 		c.mu.Lock()
-		s := c.stream
+		sess := c.session
 		c.mu.Unlock()
-		if s == nil {
-			continue
-		}
-		_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if _, err := s.Write([]byte{}); err != nil {
+		if sess == nil || sess.IsClosed() {
 			return
 		}
-		_ = s.SetWriteDeadline(time.Time{})
+		// Open a short-lived probe stream. If the session is dead the
+		// smux layer will surface the error, which tears down the tunnel.
+		probe, err := sess.OpenStream()
+		if err != nil {
+			return
+		}
+		if probe == nil {
+			return
+		}
+		_ = probe.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		probe.Write([]byte{0x02}) // DPD ping byte
+		probe.Close()
 	}
 }
 
 func (c *trustTunnelConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
-	if c.stream == nil {
-		var err error
-		c.stream, err = c.session.OpenStream()
-		if err != nil {
-			c.mu.Unlock()
-			return 0, err
-		}
-	}
+	stream, err := c.ensureStreamLocked()
 	c.mu.Unlock()
-	return c.stream.Read(p)
+	if err != nil {
+		return 0, err
+	}
+	return stream.Read(p)
 }
 
 func (c *trustTunnelConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
-	if c.stream == nil {
-		var err error
-		c.stream, err = c.session.OpenStream()
-		if err != nil {
-			c.mu.Unlock()
-			return 0, err
-		}
-	}
+	stream, err := c.ensureStreamLocked()
 	c.mu.Unlock()
-	return c.stream.Write(p)
+	if err != nil {
+		return 0, err
+	}
+	return stream.Write(p)
 }
 
 func (c *trustTunnelConn) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.stream != nil {
-		_ = c.stream.Close()
+	stream := c.stream
+	sess := c.session
+	tun := c.tunnel
+	c.stream = nil
+	c.session = nil
+	c.tunnel = nil
+	c.mu.Unlock()
+	if stream != nil {
+		_ = stream.Close()
 	}
-	if c.session != nil {
-		_ = c.session.Close()
+	if sess != nil {
+		_ = sess.Close()
 	}
-	if c.tunnel != nil {
-		return c.tunnel.Close()
+	if tun != nil {
+		return tun.Close()
 	}
 	return nil
 }
 
 func (c *trustTunnelConn) LocalAddr() net.Addr {
-	if c.stream != nil {
-		return c.stream.LocalAddr()
+	c.mu.Lock()
+	stream := c.stream
+	c.mu.Unlock()
+	if stream != nil {
+		return stream.LocalAddr()
 	}
 	return nil
 }
 
 func (c *trustTunnelConn) RemoteAddr() net.Addr {
-	if c.stream != nil {
-		return c.stream.RemoteAddr()
+	c.mu.Lock()
+	stream := c.stream
+	c.mu.Unlock()
+	if stream != nil {
+		return stream.RemoteAddr()
 	}
 	return nil
 }
 
 func (c *trustTunnelConn) SetDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.stream != nil {
-		return c.stream.SetDeadline(t)
+	stream := c.stream
+	c.mu.Unlock()
+	if stream != nil {
+		return stream.SetDeadline(t)
 	}
 	return nil
 }
 
 func (c *trustTunnelConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.stream != nil {
-		return c.stream.SetReadDeadline(t)
+	stream := c.stream
+	c.mu.Unlock()
+	if stream != nil {
+		return stream.SetReadDeadline(t)
 	}
 	return nil
 }
 
 func (c *trustTunnelConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.stream != nil {
-		return c.stream.SetWriteDeadline(t)
+	stream := c.stream
+	c.mu.Unlock()
+	if stream != nil {
+		return stream.SetWriteDeadline(t)
 	}
 	return nil
+}
+
+func (c *trustTunnelConn) ensureStreamLocked() (*smux.Stream, error) {
+	if c.session == nil {
+		return nil, fmt.Errorf("trusttunnel: session closed")
+	}
+	if c.stream != nil {
+		return c.stream, nil
+	}
+	stream, err := c.session.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	if stream == nil {
+		return nil, fmt.Errorf("trusttunnel: OpenStream returned nil stream")
+	}
+	c.stream = stream
+	return stream, nil
 }
 
 // Ensure we implement net.Conn

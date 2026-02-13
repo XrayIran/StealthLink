@@ -61,14 +61,20 @@ func buildUQSPAgentDialer(cfg *config.Config, target Target, smuxCfg *smux.Confi
 		authToken = cfg.AgentToken(cfg.Agent.ID)
 	}
 
-	// Create UQSP dialer
-	d := uqsp.NewDialer(
-		&cfg.Transport.UQSP,
-		tlsCfg,
-		smuxCfg,
-		authToken,
-	)
+	if cfg.UQSPRuntimeMode() == "legacy" {
+		d := uqsp.NewDialer(
+			&cfg.Transport.UQSP,
+			tlsCfg,
+			smuxCfg,
+			authToken,
+		)
+		return d, target.Addr, "uqsp", nil
+	}
 
+	d, err := uqsp.NewRuntimeDialer(cfg, tlsCfg, smuxCfg, authToken)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("uqsp runtime dialer: %w", err)
+	}
 	return d, target.Addr, "uqsp", nil
 }
 
@@ -106,18 +112,24 @@ func buildUQSPGatewayListener(cfg *config.Config, smuxCfg *smux.Config) (transpo
 	// Get auth token
 	authToken := cfg.ActiveSharedKey()
 
-	// Create UQSP listener
-	l, err := uqsp.Listen(
-		cfg.Gateway.Listen,
-		&cfg.Transport.UQSP,
-		tlsCfg,
-		smuxCfg,
-		authToken,
-	)
+	if cfg.UQSPRuntimeMode() == "legacy" {
+		l, err := uqsp.Listen(
+			cfg.Gateway.Listen,
+			&cfg.Transport.UQSP,
+			tlsCfg,
+			smuxCfg,
+			authToken,
+		)
+		if err != nil {
+			return nil, "", err
+		}
+		return l, "uqsp", nil
+	}
+
+	l, err := uqsp.NewRuntimeListener(cfg.Gateway.Listen, cfg, tlsCfg, smuxCfg, authToken)
 	if err != nil {
 		return nil, "", err
 	}
-
 	return l, "uqsp", nil
 }
 

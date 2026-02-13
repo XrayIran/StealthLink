@@ -11,6 +11,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Set via -ldflags at build time.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 // Version represents the configuration schema version
 type Version string
 
@@ -394,8 +401,9 @@ func detectCarrierType(transport map[string]interface{}) string {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: migrate <command> [options]")
+		fmt.Println("Usage: stealthlink <command> [options]")
 		fmt.Println("Commands:")
+		fmt.Println("  version                   - Print version and exit")
 		fmt.Println("  migrate <input> [output]  - Migrate config to v2")
 		fmt.Println("  validate <config>         - Validate v2 config")
 		fmt.Println("  detect <config>           - Detect config version")
@@ -405,6 +413,10 @@ func main() {
 	command := os.Args[1]
 
 	switch command {
+	case "version":
+		fmt.Printf("stealthlink %s (commit=%s built=%s)\n", version, commit, buildTime)
+		return
+
 	case "migrate":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: migrate migrate <input> [output]")

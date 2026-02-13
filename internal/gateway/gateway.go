@@ -25,6 +25,7 @@ import (
 	stealthtx "stealthlink/internal/transport/stealth"
 	"stealthlink/internal/transport/uqsp"
 	"stealthlink/internal/tun"
+	"stealthlink/internal/vpn"
 	"stealthlink/internal/warp"
 
 	"github.com/xtaci/smux"
@@ -104,7 +105,7 @@ func New(cfg *config.Config) *Gateway {
 }
 
 func (g *Gateway) Start(ctx context.Context) error {
-	metrics.Start(g.cfg.Metrics.Listen, g.cfg.Metrics.AuthToken)
+	metrics.Start(g.cfg.Metrics.Listen, g.cfg.Metrics.AuthToken, g.cfg.Metrics.Pprof)
 
 	if g.cfg.WARP.Enabled {
 		if err := g.startWARP(ctx); err != nil {
@@ -264,13 +265,26 @@ func (g *Gateway) buildUQSPListener() (transport.Listener, error) {
 		smuxCfg.KeepAliveTimeout = d
 	}
 
-	listener, err := uqsp.NewListener(
-		g.cfg.Gateway.Listen, &g.cfg.Transport.UQSP, tlsCfg, smuxCfg, "")
-	if err != nil {
-		return nil, fmt.Errorf("create UQSP listener: %w", err)
+	if g.cfg.UQSPRuntimeMode() == "legacy" {
+		log.Printf("UQSP runtime mode=legacy; using historical listener path")
+		listener, err := uqsp.NewListener(
+			g.cfg.Gateway.Listen, &g.cfg.Transport.UQSP, tlsCfg, smuxCfg, g.cfg.ActiveSharedKey())
+		if err != nil {
+			return nil, fmt.Errorf("create legacy UQSP listener: %w", err)
+		}
+		return listener, nil
 	}
 
-	return listener, nil
+	// Use the unified runtime listener which routes through
+	// BuildVariantForRole -> UnifiedProtocol with full variant overlay
+	// chain, WARP egress, and reverse-initiation support.
+	rl, err := uqsp.NewRuntimeListener(
+		g.cfg.Gateway.Listen, g.cfg, tlsCfg, smuxCfg, g.cfg.ActiveSharedKey())
+	if err != nil {
+		return nil, fmt.Errorf("UQSP runtime listener: %w", err)
+	}
+
+	return rl, nil
 }
 
 func (g *Gateway) handleSession(ctx context.Context, sess transport.Session) {
@@ -652,6 +666,11 @@ func (g *Gateway) startTun(ctx context.Context, entry *agentEntry, name string) 
 	}
 	entry.tunActive[name] = struct{}{}
 	entry.mu.Unlock()
+	defer func() {
+		entry.mu.Lock()
+		delete(entry.tunActive, name)
+		entry.mu.Unlock()
+	}()
 
 	strm, err := entry.sess.OpenStream()
 	if err != nil {
@@ -669,7 +688,63 @@ func (g *Gateway) startTun(ctx context.Context, entry *agentEntry, name string) 
 		log.Printf("tun write open failed: %v", err)
 		return
 	}
-	iface, err := tun.Open(svc.Tun.Name, svc.Tun.MTU)
+	if g.cfg.VPN.Enabled {
+		vpnCfg := g.cfg.VPN
+		if vpnCfg.Name == "" {
+			vpnCfg.Name = svc.Tun.Name
+		}
+		if vpnCfg.MTU <= 0 && svc.Tun.MTU > 0 {
+			vpnCfg.MTU = svc.Tun.MTU
+		}
+		if vpnCfg.Mode == "" {
+			vpnCfg.Mode = svc.Tun.Mode
+		}
+		if vpnCfg.Mode == "" {
+			vpnCfg.Mode = "tun"
+		}
+
+		session, err := vpn.NewSession(vpnCfg, strm)
+		if err != nil {
+			_ = strm.Close()
+			metrics.DecStreams()
+			log.Printf("vpn session init failed: %v", err)
+			return
+		}
+		errCh := make(chan error, 1)
+		session.SetErrorHandler(func(err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		})
+		if err := session.Start(); err != nil {
+			_ = strm.Close()
+			metrics.DecStreams()
+			log.Printf("vpn session start failed: %v", err)
+			_ = session.Close()
+			return
+		}
+
+		log.Printf("tun service %s started on %s (vpn mode)", name, session.InterfaceName())
+		select {
+		case <-ctx.Done():
+		case err := <-errCh:
+			if err != nil {
+				log.Printf("tun service %s ended: %v", name, err)
+			}
+		}
+		_ = session.Close()
+		metrics.DecStreams()
+		metrics.DecService(name)
+		releaseSvc()
+		return
+	}
+
+	iface, err := tun.OpenWithMode(tun.Config{
+		Name: svc.Tun.Name,
+		MTU:  svc.Tun.MTU,
+		Mode: svc.Tun.Mode,
+	})
 	if err != nil {
 		_ = strm.Close()
 		metrics.DecStreams()
@@ -682,9 +757,7 @@ func (g *Gateway) startTun(ctx context.Context, entry *agentEntry, name string) 
 	}
 	metrics.DecStreams()
 	metrics.DecService(name)
-	if releaseSvc != nil {
-		releaseSvc()
-	}
+	releaseSvc()
 }
 
 func (r *registry) register(name string, entry *agentEntry) {

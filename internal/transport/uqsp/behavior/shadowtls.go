@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -24,6 +25,14 @@ type ShadowTLSOverlay struct {
 	HandshakeDest string
 	ServerNames   []string
 }
+
+const (
+	tlsRecordTypeHandshake  = 0x16
+	tlsVersion10            = 0x0301
+	tlsVersion12            = 0x0303
+	tlsHandshakeClientHello = 0x01
+	tlsHandshakeServerHello = 0x02
+)
 
 // NewShadowTLSOverlay creates a new ShadowTLS overlay from config
 func NewShadowTLSOverlay(cfg config.ShadowTLSBehaviorConfig) *ShadowTLSOverlay {
@@ -149,39 +158,32 @@ func (c *shadowTLSConn) buildClientHello() ([]byte, error) {
 
 // readServerHello reads the ServerHello from the connection
 func (c *shadowTLSConn) readServerHello() ([]byte, error) {
-	// Read TLS record header
-	header := make([]byte, 5)
-	if _, err := c.Conn.Read(header); err != nil {
-		return nil, err
-	}
-
-	// Get record length
-	length := binary.BigEndian.Uint16(header[3:5])
-
-	// Read record body
-	body := make([]byte, length)
-	if _, err := c.Conn.Read(body); err != nil {
-		return nil, err
-	}
-
-	return append(header, body...), nil
+	return readTLSHandshakeMessage(c.Conn, tlsHandshakeServerHello, 16)
 }
 
 // verifyServerHello verifies the ServerHello response
 func (c *shadowTLSConn) verifyServerHello(serverHello []byte) error {
-	if len(serverHello) < 5 {
+	if len(serverHello) < 4 {
 		return fmt.Errorf("server hello too short")
 	}
 
-	// Check content type (0x16 = handshake)
-	if serverHello[0] != 0x16 {
-		return fmt.Errorf("expected handshake record, got 0x%02x", serverHello[0])
+	if serverHello[0] != tlsHandshakeServerHello {
+		return fmt.Errorf("expected ServerHello handshake message, got type 0x%02x", serverHello[0])
 	}
 
-	// Verify TLS version (should be 0x0303 for TLS 1.2 in record layer)
-	version := binary.BigEndian.Uint16(serverHello[1:3])
-	if version != 0x0303 && version != 0x0301 {
-		return fmt.Errorf("unexpected TLS version: 0x%04x", version)
+	msgLen := int(serverHello[1])<<16 | int(serverHello[2])<<8 | int(serverHello[3])
+	if msgLen <= 0 || msgLen > len(serverHello)-4 {
+		return fmt.Errorf("invalid ServerHello length: %d", msgLen)
+	}
+	body := serverHello[4 : 4+msgLen]
+	if len(body) < 38 {
+		return fmt.Errorf("ServerHello body too short: %d", len(body))
+	}
+
+	// TLS 1.2 and 1.3 both typically use legacy_version 0x0303.
+	version := binary.BigEndian.Uint16(body[0:2])
+	if version != tlsVersion12 && version != tlsVersion10 {
+		return fmt.Errorf("unexpected ServerHello legacy version: 0x%04x", version)
 	}
 
 	// ServerHello is valid
@@ -196,7 +198,7 @@ func (c *shadowTLSConn) deriveSessionKey(clientHello, serverHello []byte) []byte
 	return h.Sum(nil)
 }
 
-// Read reads data from the connection
+// Read reads data from the connection with TLS record deframing.
 func (c *shadowTLSConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	if !c.handshakeDone {
@@ -204,21 +206,34 @@ func (c *shadowTLSConn) Read(p []byte) (int, error) {
 		if err := c.handshake(); err != nil {
 			return 0, err
 		}
-	} else {
-		c.mu.Unlock()
+		c.mu.Lock()
 	}
 
 	// Read from buffer first
 	if len(c.readBuf) > 0 {
 		n := copy(p, c.readBuf)
 		c.readBuf = c.readBuf[n:]
+		c.mu.Unlock()
 		return n, nil
 	}
+	c.mu.Unlock()
 
-	return c.Conn.Read(p)
+	// Read a TLS ApplicationData record from the underlying connection
+	_, _, payload, err := readTLSRecord(c.Conn)
+	if err != nil {
+		return 0, err
+	}
+
+	n := copy(p, payload)
+	if n < len(payload) {
+		c.mu.Lock()
+		c.readBuf = append(c.readBuf[:0], payload[n:]...)
+		c.mu.Unlock()
+	}
+	return n, nil
 }
 
-// Write writes data to the connection
+// Write writes data to the connection wrapped in TLS ApplicationData records.
 func (c *shadowTLSConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	if !c.handshakeDone {
@@ -230,7 +245,26 @@ func (c *shadowTLSConn) Write(p []byte) (int, error) {
 		c.mu.Unlock()
 	}
 
-	return c.Conn.Write(p)
+	// Wrap in TLS ApplicationData record (type 0x17, TLS 1.2)
+	written := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > 16384 {
+			chunk = chunk[:16384]
+		}
+		record := make([]byte, 5+len(chunk))
+		record[0] = 0x17 // ApplicationData
+		record[1] = 0x03 // TLS 1.2
+		record[2] = 0x03
+		binary.BigEndian.PutUint16(record[3:5], uint16(len(chunk)))
+		copy(record[5:], chunk)
+		if _, err := c.Conn.Write(record); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		p = p[len(chunk):]
+	}
+	return written, nil
 }
 
 // Ensure shadowTLSConn implements net.Conn
@@ -238,9 +272,9 @@ var _ net.Conn = (*shadowTLSConn)(nil)
 
 // ShadowTLSAcceptor handles server-side ShadowTLS acceptance
 type ShadowTLSAcceptor struct {
-	Password      string
-	ServerNames   []string
-	AllowAnySNI   bool
+	Password    string
+	ServerNames []string
+	AllowAnySNI bool
 }
 
 // Accept handles an incoming ShadowTLS connection
@@ -315,27 +349,24 @@ func (c *shadowTLSServerConn) acceptHandshake() error {
 
 // readClientHello reads the ClientHello from the connection
 func (c *shadowTLSServerConn) readClientHello() ([]byte, error) {
-	// Read TLS record header
-	header := make([]byte, 5)
-	if _, err := c.Conn.Read(header); err != nil {
-		return nil, err
-	}
-
-	// Get record length
-	length := binary.BigEndian.Uint16(header[3:5])
-
-	// Read record body
-	body := make([]byte, length)
-	if _, err := c.Conn.Read(body); err != nil {
-		return nil, err
-	}
-
-	return append(header, body...), nil
+	return readTLSHandshakeMessage(c.Conn, tlsHandshakeClientHello, 16)
 }
 
 // parseSNI extracts the SNI from a ClientHello
 func (c *shadowTLSServerConn) parseSNI(clientHello []byte) (string, error) {
-	return tlsutil.ParseSNI(clientHello)
+	if len(clientHello) < 4 || clientHello[0] != tlsHandshakeClientHello {
+		return "", fmt.Errorf("invalid ClientHello handshake message")
+	}
+	if len(clientHello) > 65535 {
+		return "", fmt.Errorf("ClientHello too large: %d", len(clientHello))
+	}
+	record := make([]byte, 5+len(clientHello))
+	record[0] = tlsRecordTypeHandshake
+	record[1] = 0x03
+	record[2] = 0x03
+	binary.BigEndian.PutUint16(record[3:5], uint16(len(clientHello)))
+	copy(record[5:], clientHello)
+	return tlsutil.ParseSNI(record)
 }
 
 // buildServerHello builds a TLS 1.3 ServerHello
@@ -343,7 +374,7 @@ func (c *shadowTLSServerConn) buildServerHello() []byte {
 	return tlsutil.BuildServerHello()
 }
 
-// Read reads data from the connection
+// Read reads data from the connection with TLS record deframing.
 func (c *shadowTLSServerConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	if !c.handshakeDone {
@@ -354,10 +385,17 @@ func (c *shadowTLSServerConn) Read(p []byte) (int, error) {
 	} else {
 		c.mu.Unlock()
 	}
-	return c.Conn.Read(p)
+
+	// Read a TLS ApplicationData record from the underlying connection
+	_, _, payload, err := readTLSRecord(c.Conn)
+	if err != nil {
+		return 0, err
+	}
+	n := copy(p, payload)
+	return n, nil
 }
 
-// Write writes data to the connection
+// Write writes data to the connection wrapped in TLS ApplicationData records.
 func (c *shadowTLSServerConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	if !c.handshakeDone {
@@ -368,7 +406,26 @@ func (c *shadowTLSServerConn) Write(p []byte) (int, error) {
 	} else {
 		c.mu.Unlock()
 	}
-	return c.Conn.Write(p)
+
+	written := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > 16384 {
+			chunk = chunk[:16384]
+		}
+		record := make([]byte, 5+len(chunk))
+		record[0] = 0x17 // ApplicationData
+		record[1] = 0x03 // TLS 1.2
+		record[2] = 0x03
+		binary.BigEndian.PutUint16(record[3:5], uint16(len(chunk)))
+		copy(record[5:], chunk)
+		if _, err := c.Conn.Write(record); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		p = p[len(chunk):]
+	}
+	return written, nil
 }
 
 // Ensure shadowTLSServerConn implements net.Conn
@@ -444,4 +501,64 @@ func generateRandom(n int) []byte {
 	b := make([]byte, n)
 	rand.Read(b)
 	return b
+}
+
+func readTLSHandshakeMessage(conn net.Conn, wantType byte, maxRecords int) ([]byte, error) {
+	var handshakeBuf []byte
+
+	for i := 0; i < maxRecords; i++ {
+		recordType, version, payload, err := readTLSRecord(conn)
+		if err != nil {
+			return nil, err
+		}
+
+		// Ignore non-handshake records while waiting for expected message.
+		if recordType != tlsRecordTypeHandshake {
+			continue
+		}
+		if version != tlsVersion12 && version != tlsVersion10 {
+			continue
+		}
+
+		handshakeBuf = append(handshakeBuf, payload...)
+
+		for len(handshakeBuf) >= 4 {
+			msgType := handshakeBuf[0]
+			msgLen := int(handshakeBuf[1])<<16 | int(handshakeBuf[2])<<8 | int(handshakeBuf[3])
+			if msgLen < 0 || msgLen > 1<<20 {
+				return nil, fmt.Errorf("invalid TLS handshake message length: %d", msgLen)
+			}
+			if len(handshakeBuf) < 4+msgLen {
+				break
+			}
+
+			msg := make([]byte, 4+msgLen)
+			copy(msg, handshakeBuf[:4+msgLen])
+			handshakeBuf = handshakeBuf[4+msgLen:]
+			if msgType == wantType {
+				return msg, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("expected TLS handshake type 0x%02x not received", wantType)
+}
+
+func readTLSRecord(conn net.Conn) (recordType byte, version uint16, payload []byte, err error) {
+	header := make([]byte, 5)
+	if _, err = io.ReadFull(conn, header); err != nil {
+		return 0, 0, nil, err
+	}
+
+	recordType = header[0]
+	version = binary.BigEndian.Uint16(header[1:3])
+	length := int(binary.BigEndian.Uint16(header[3:5]))
+	if length < 0 || length > 64*1024 {
+		return 0, 0, nil, fmt.Errorf("invalid TLS record length %d", length)
+	}
+	payload = make([]byte, length)
+	if _, err = io.ReadFull(conn, payload); err != nil {
+		return 0, 0, nil, err
+	}
+	return recordType, version, payload, nil
 }

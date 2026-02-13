@@ -10,22 +10,27 @@ import (
 	"time"
 
 	"stealthlink/internal/config"
+	"stealthlink/internal/metrics"
+	"stealthlink/internal/transport/transportutil"
 )
 
 type packetConfig struct {
-	iface      *net.Interface
-	guid       string
-	ipv4Addr   *net.UDPAddr
-	ipv4Router net.HardwareAddr
-	ipv6Addr   *net.UDPAddr
-	ipv6Router net.HardwareAddr
-	port       int
-	sockbuf    int
-	snaplen    int
-	promisc    bool
-	immediate  bool
-	timeoutMs  int
-	tcpLocal   []config.TCPFlags
+	iface              *net.Interface
+	guid               string
+	ipv4Addr           *net.UDPAddr
+	ipv4Router         net.HardwareAddr
+	ipv6Addr           *net.UDPAddr
+	ipv6Router         net.HardwareAddr
+	port               int
+	sockbuf            int
+	snaplen            int
+	promisc            bool
+	immediate          bool
+	timeoutMs          int
+	tcpLocal           []config.TCPFlags
+	dscp               int
+	fingerprintProfile string // TCP option mimicry profile
+	bpfProfile         string // BPF filter profile: basic, strict, stealth
 }
 
 type PacketConn struct {
@@ -114,7 +119,31 @@ func (c *PacketConn) WriteTo(data []byte, addr net.Addr) (n int, err error) {
 		return 0, net.InvalidAddrError("invalid address")
 	}
 
-	if err := c.sendHandle.Write(data, daddr); err != nil {
+	cfg := transportutil.DefaultTransientBufferConfig()
+	err = transportutil.RetryWithBackoff(
+		cfg,
+		transportutil.IsTransientBufferError,
+		func(attempt int) {
+			metrics.IncRawWriteRetry()
+			// Check for cancellation between retries
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-deadline:
+				return
+			default:
+			}
+		},
+		func() { metrics.IncRawDrop() },
+		func() error {
+			werr := c.sendHandle.Write(data, daddr)
+			if werr != nil && transportutil.IsTransientBufferError(werr) {
+				metrics.IncRawENOBUFS()
+			}
+			return werr
+		},
+	)
+	if err != nil {
 		return 0, err
 	}
 	return len(data), nil
@@ -131,7 +160,21 @@ func (c *PacketConn) Close() error {
 	return nil
 }
 
-func (c *PacketConn) LocalAddr() net.Addr { return nil }
+func (c *PacketConn) LocalAddr() net.Addr {
+	if c.cfg != nil && c.cfg.ipv4Addr != nil {
+		return &net.TCPAddr{
+			IP:   c.cfg.ipv4Addr.IP,
+			Port: c.cfg.port,
+		}
+	}
+	if c.cfg != nil && c.cfg.ipv6Addr != nil {
+		return &net.TCPAddr{
+			IP:   c.cfg.ipv6Addr.IP,
+			Port: c.cfg.port,
+		}
+	}
+	return &net.TCPAddr{Port: c.cfg.port}
+}
 
 func (c *PacketConn) SetDeadline(t time.Time) error {
 	c.readDeadline.Store(t)
@@ -149,7 +192,15 @@ func (c *PacketConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *PacketConn) SetDSCP(dscp int) error { return nil }
+func (c *PacketConn) SetDSCP(dscp int) error {
+	// DSCP is set at the IP layer via raw socket.
+	// For pcap-based raw TCP, DSCP is embedded in the crafted IP header
+	// by the send handle. Store the value for use in packet construction.
+	if c.cfg != nil {
+		c.cfg.dscp = dscp
+	}
+	return nil
+}
 
 func (c *PacketConn) SetClientTCPF(addr net.Addr, f []config.TCPFlags) {
 	c.sendHandle.setClientTCPF(addr, f)
@@ -160,17 +211,19 @@ func buildPacketConfig(raw config.RawTCPConfig) (*packetConfig, error) {
 		return nil, fmt.Errorf("rawtcp interface not resolved")
 	}
 	cfg := &packetConfig{
-		iface:     raw.InterfaceObj(),
-		guid:      raw.GUID,
-		ipv4Addr:  raw.IPv4.UDPAddr(),
-		ipv6Addr:  raw.IPv6.UDPAddr(),
-		port:      raw.Port(),
-		sockbuf:   raw.PCAP.Sockbuf,
-		snaplen:   raw.PCAP.Snaplen,
-		promisc:   raw.PCAP.Promisc,
-		immediate: raw.PCAP.Immediate,
-		timeoutMs: raw.PCAP.TimeoutMs,
-		tcpLocal:  raw.TCP.LocalParsed(),
+		iface:              raw.InterfaceObj(),
+		guid:               raw.GUID,
+		ipv4Addr:           raw.IPv4.UDPAddr(),
+		ipv6Addr:           raw.IPv6.UDPAddr(),
+		port:               raw.Port(),
+		sockbuf:            raw.PCAP.Sockbuf,
+		snaplen:            raw.PCAP.Snaplen,
+		promisc:            raw.PCAP.Promisc,
+		immediate:          raw.PCAP.Immediate,
+		timeoutMs:          raw.PCAP.TimeoutMs,
+		tcpLocal:           raw.TCP.LocalParsed(),
+		fingerprintProfile: raw.FingerprintProfile,
+		bpfProfile:         raw.BPFProfile,
 	}
 	if raw.IPv4.UDPAddr() != nil {
 		cfg.ipv4Router = raw.IPv4.Router()

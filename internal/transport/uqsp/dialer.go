@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"time"
 
@@ -15,7 +16,10 @@ import (
 	"github.com/xtaci/smux"
 )
 
-// Dialer implements transport.Dialer for UQSP
+// Deprecated: Dialer is the legacy UQSP dialer. Use RuntimeDialer instead,
+// which routes traffic through the unified variant runtime (BuildVariantForRole).
+// Set runtime.mode=unified (the default) in your config to use RuntimeDialer.
+// This type will be removed in a future release.
 type Dialer struct {
 	Config       *config.UQSPConfig
 	TLSConfig    *tls.Config
@@ -25,8 +29,9 @@ type Dialer struct {
 	carrier      carrier.Carrier
 }
 
-// NewDialer creates a new UQSP dialer
+// Deprecated: NewDialer creates a legacy UQSP dialer. Use NewRuntimeDialer instead.
 func NewDialer(cfg *config.UQSPConfig, tlsCfg *tls.Config, smuxCfg *smux.Config, authToken string) *Dialer {
+	log.Println("WARNING: using deprecated legacy UQSP Dialer; migrate to runtime.mode=unified (RuntimeDialer) — legacy mode will be removed in a future release")
 	if cfg == nil {
 		cfg = &config.UQSPConfig{}
 	}
@@ -95,10 +100,17 @@ func (d *Dialer) selectCarrier() (carrier.Carrier, error) {
 		return nil, nil // Use native QUIC
 
 	case "trusttunnel":
-		return nil, fmt.Errorf("trusttunnel carrier is not available in this build")
+		c := carrier.NewTrustTunnelCarrier(cfg.TrustTunnel, d.SmuxConfig)
+		d.carrier = c
+		return c, nil
 
 	case "rawtcp":
-		c := carrier.NewRawTCPCarrier(cfg.RawTCP.Raw, cfg.RawTCP.KCP, d.SmuxConfig)
+		c := carrier.NewRawTCPCarrier(cfg.RawTCP.Raw, cfg.RawTCP.KCP, d.SmuxConfig, d.AuthToken)
+		d.carrier = c
+		return c, nil
+
+	case "faketcp":
+		c := carrier.NewFakeTCPCarrier(cfg.FakeTCP, d.SmuxConfig, d.AuthToken)
 		d.carrier = c
 		return c, nil
 
@@ -148,6 +160,20 @@ func (d *Dialer) selectCarrier() (carrier.Carrier, error) {
 			TLSInsecureSkipVerify: cfg.XHTTP.TLSInsecureSkipVerify,
 			TLSServerName:         cfg.XHTTP.TLSServerName,
 			TLSFingerprint:        cfg.XHTTP.TLSFingerprint,
+			Metadata: carrier.XHTTPMetadataConfig{
+				Session: carrier.XHTTPMetadataFieldConfig{
+					Placement: cfg.XHTTP.Metadata.Session.Placement,
+					Key:       cfg.XHTTP.Metadata.Session.Key,
+				},
+				Seq: carrier.XHTTPMetadataFieldConfig{
+					Placement: cfg.XHTTP.Metadata.Seq.Placement,
+					Key:       cfg.XHTTP.Metadata.Seq.Key,
+				},
+				Mode: carrier.XHTTPMetadataFieldConfig{
+					Placement: cfg.XHTTP.Metadata.Mode.Placement,
+					Key:       cfg.XHTTP.Metadata.Mode.Key,
+				},
+			},
 		}
 		c := carrier.NewXHTTPCarrier(xhCfg, d.SmuxConfig)
 		d.carrier = c
@@ -181,6 +207,12 @@ func (d *Dialer) dialOverCarrier(ctx context.Context, c carrier.Carrier, addr st
 		return nil, fmt.Errorf("UQSP guard send: %w", err)
 	}
 	_ = conn.SetDeadline(time.Time{})
+
+	conn, err = d.applyCarrierOverlays(conn, false)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("apply carrier overlays: %w", err)
+	}
 
 	// Create smux session over the carrier connection
 	smuxSess, err := smux.Client(conn, d.SmuxConfig)

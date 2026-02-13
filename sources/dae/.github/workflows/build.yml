@@ -1,0 +1,52 @@
+#      _
+#   __| | __ _  ___
+#  / _` |/ _` |/ _ \
+# | (_| | (_| |  __/
+#  \__,_|\__,_|\___|
+#
+# Copyright (C) 2023 @daeuniverse <https://github.com/daeuniverse>
+#
+# This is a open-source software, liscensed under the AGPL-3.0 License.
+# See /License for more information.
+
+name: Build (Main)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.go"
+      - "**/*.c"
+      - "**/*.h"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/seed-build.yml"
+      - "Makefile"
+
+jobs:
+  pre-actions:
+    uses: daeuniverse/ci-seed-jobs/.github/workflows/pre-actions.yml@master
+    with:
+      repository: ${{ github.repository }}
+      ref: ${{ github.sha }}
+      fetch-depth: 0
+      check-runs: '["build", "main-build-passed"]'
+    secrets: inherit
+
+  build:
+    uses: daeuniverse/dae/.github/workflows/seed-build.yml@main
+    with:
+      ref: ${{ github.sha }}
+      build-type: main-build
+    secrets: inherit
+
+  post-actions:
+    if: always()
+    needs: [build]
+    uses: daeuniverse/ci-seed-jobs/.github/workflows/dae-post-actions.yml@master
+    with:
+      check-run-id: "dae-bot[bot]/main-build-passed"
+      check-run-conclusion: ${{ needs.build.result }}
+    secrets: inherit

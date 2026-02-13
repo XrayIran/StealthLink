@@ -1,4 +1,5 @@
 role: agent
+variant: "4c"
 
 agent:
   id: "agent-4c"
@@ -8,18 +9,29 @@ transport:
   type: uqsp
   uqsp:
     carrier:
-      type: xhttp
-      xhttp:
-        server: "cdn.example.com:443"
-        mode: stream-one
-        tls_fingerprint: "chrome_auto"
+      type: anytls
+      anytls:
+        server: "gateway.example.com:8443"
+        password: "replace-with-anytls-password"
+        padding_scheme: random # random | fixed | burst | adaptive
+        padding_min: 100
+        padding_max: 900
+        idle_session_timeout: 300
+        tls_insecure_skip_verify: true
+        tls_server_name: "gateway.example.com"
+        
+        # Alternative: REALITY with Spider (Phase 6)
+        # type: reality
+        # reality:
+        #   server_name: "www.microsoft.com"
+        #   handshake:
+        #     server: "www.microsoft.com"
+        #     u_tls: true
+        #   spider_x: "/"           # Entry path
+        #   spider_y: [1000, 2000]  # Timing distribution (ms)
+        #   spider_concurrency: 4   # Max concurrent fetches
+        #   spider_depth: 3         # Max crawl depth
     behaviors:
-      reality:
-        enabled: true
-        dest: "www.microsoft.com:443"
-        server_names:
-          - "www.microsoft.com"
-        private_key: "replace-base64-x25519-private-key"
       vision:
         enabled: true
         flow_auto_detect: true

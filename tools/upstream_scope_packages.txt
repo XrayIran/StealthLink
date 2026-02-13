@@ -1,0 +1,5 @@
+# Quality-enforced packages for current closure gate.
+# Threshold applies only to packages listed here when touched.
+./internal/transport/anytls
+./internal/transport/carrier
+./internal/transport/xhttpmeta

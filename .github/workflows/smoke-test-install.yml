@@ -1,0 +1,345 @@
+name: Smoke Test - Install from ZIP
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  smoke-test-install:
+    name: Install from ZIP on Fresh VPS
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libpcap-dev \
+            build-essential \
+            zip \
+            unzip \
+            curl \
+            jq
+
+      - name: Start installation timer
+        run: echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
+
+      - name: Display system info
+        run: |
+          echo "=== System Information ==="
+          echo "OS: $(lsb_release -d | cut -f2)"
+          echo "Kernel: $(uname -r)"
+          echo "Architecture: $(uname -m)"
+          echo "Go version: $(go version)"
+          echo ""
+          echo "=== Network Configuration ==="
+          ip addr show
+          echo ""
+          echo "=== Available disk space ==="
+          df -h
+
+      - name: Build release ZIP
+        run: |
+          echo "Building release ZIP package..."
+          make package VERSION=ci-test
+          
+          echo ""
+          echo "=== Verifying ZIP was created ==="
+          ls -lh dist/*.zip
+          
+          echo ""
+          echo "=== ZIP contents ==="
+          unzip -l dist/stealthlink-linux-amd64-vci-test.zip | head -30
+
+      - name: Extract ZIP to temporary location
+        run: |
+          echo "Extracting ZIP to /tmp/stealthlink-install-test..."
+          mkdir -p /tmp/stealthlink-install-test
+          unzip -q dist/stealthlink-linux-amd64-vci-test.zip -d /tmp/stealthlink-install-test
+          
+          echo ""
+          echo "=== Extracted contents ==="
+          ls -lR /tmp/stealthlink-install-test | head -50
+
+      - name: Run stealthlink-ctl install (local mode)
+        run: |
+          echo "Running stealthlink-ctl install..."
+          cd /tmp/stealthlink-install-test/stealthlink-linux-amd64-vci-test
+          
+          # Install using local bundle with offline mode to skip package manager steps
+          sudo ./stealthlink-ctl install --local --role=gateway --offline
+          
+          echo ""
+          echo "=== Verifying installation ==="
+          ls -lh /opt/stealthlink/
+          ls -lh /usr/local/bin/stealthlink-* || true
+
+      - name: Configure mode 4a (XHTTP)
+        run: |
+          echo "Updating configuration for mode 4a..."
+          
+          # The install command creates a default config, let's update it for mode 4a
+          sudo tee /opt/stealthlink/config.yaml > /dev/null <<'EOF'
+role: gateway
+
+gateway:
+  listen: "0.0.0.0:8443"
+
+transport:
+  mode: "4a"
+  type: uqsp
+  uqsp:
+    carrier:
+      type: xhttp
+      xhttp:
+        session_placement: header
+        session_key: X-Session-ID
+        sequence_placement: header
+        sequence_key: X-Sequence
+    mux:
+      enabled: true
+      type: smux
+
+security:
+  shared_key: "test-key-for-ci-only-not-secure"
+
+auth:
+  strict: false
+
+metrics:
+  enabled: true
+  listen: "127.0.0.1:9090"
+
+logging:
+  level: info
+  format: json
+EOF
+          
+          echo ""
+          echo "=== Configuration file ==="
+          cat /opt/stealthlink/config.yaml
+
+      - name: Validate configuration
+        run: |
+          echo "Validating configuration..."
+          /opt/stealthlink/stealthlink-gateway -config /opt/stealthlink/config.yaml -validate || {
+            echo "Configuration validation failed"
+            exit 1
+          }
+          echo "Configuration is valid"
+
+      - name: Reload systemd and start service
+        run: |
+          echo "Reloading systemd daemon..."
+          sudo systemctl daemon-reload
+          
+          echo ""
+          echo "Starting StealthLink service..."
+          sudo systemctl start stealthlink
+          
+          echo ""
+          echo "Waiting for service to start..."
+          sleep 5
+          
+          echo ""
+          echo "=== Service status ==="
+          sudo systemctl status stealthlink --no-pager || true
+
+      - name: Verify service is active
+        run: |
+          echo "Checking if service is active..."
+          if sudo systemctl is-active --quiet stealthlink; then
+            echo "✓ Service is active"
+          else
+            echo "✗ Service is not active"
+            echo ""
+            echo "=== Service logs ==="
+            sudo journalctl -u stealthlink -n 50 --no-pager
+            exit 1
+          fi
+
+      - name: Verify metrics endpoint responds
+        run: |
+          echo "Checking metrics endpoint..."
+          
+          # Wait a bit more for metrics to be ready
+          sleep 3
+          
+          if curl -s --max-time 5 http://127.0.0.1:9090/metrics > /tmp/metrics.txt; then
+            echo "✓ Metrics endpoint is responding"
+            echo ""
+            echo "=== Sample metrics (first 20 lines) ==="
+            head -20 /tmp/metrics.txt
+          else
+            echo "✗ Metrics endpoint is not responding"
+            echo ""
+            echo "=== Service logs ==="
+            sudo journalctl -u stealthlink -n 50 --no-pager
+            exit 1
+          fi
+
+      - name: Verify systemctl status shows active and logs show no errors
+        run: |
+          echo "=== Verifying service status and logs ==="
+          echo ""
+          
+          # Check systemctl status
+          echo "Checking systemctl status..."
+          if sudo systemctl is-active --quiet stealthlink; then
+            echo "✓ systemctl status shows service is active"
+          else
+            echo "✗ systemctl status shows service is NOT active"
+            sudo systemctl status stealthlink --no-pager
+            exit 1
+          fi
+          
+          echo ""
+          echo "Checking logs for errors..."
+          
+          # Get last 100 lines of logs
+          sudo journalctl -u stealthlink -n 100 --no-pager > /tmp/service-logs-check.txt
+          
+          # Check for error patterns (excluding metric names)
+          if grep -iE "error|fatal|panic" /tmp/service-logs-check.txt | grep -vE "error_count|errors_total|error_rate"; then
+            echo "✗ Errors found in logs:"
+            echo ""
+            cat /tmp/service-logs-check.txt
+            exit 1
+          else
+            echo "✓ No errors found in logs"
+          fi
+          
+          echo ""
+          echo "=== Service Status Summary ==="
+          sudo systemctl status stealthlink --no-pager --lines=10
+
+      - name: Run systemd security audit
+        run: |
+          echo "Running systemd security analysis..."
+          echo ""
+          
+          # Run security analysis
+          sudo systemd-analyze security stealthlink-gateway > /tmp/security-audit.txt 2>&1 || true
+          
+          echo "=== Security Audit Results ==="
+          cat /tmp/security-audit.txt
+          echo ""
+          
+          # Check for UNSAFE ratings (informational only, don't fail)
+          if grep -i "UNSAFE" /tmp/security-audit.txt; then
+            echo "⚠️  Note: Some UNSAFE settings detected (may be necessary for functionality)"
+          else
+            echo "✓ No UNSAFE security settings detected"
+          fi
+          
+          # Check overall exposure level
+          if grep -i "Overall exposure level" /tmp/security-audit.txt; then
+            echo ""
+            echo "Security audit completed successfully"
+          fi
+
+      - name: Check installation timing
+        run: |
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          MINUTES=$((DURATION / 60))
+          SECONDS=$((DURATION % 60))
+          
+          echo "=== Installation Timing ==="
+          echo "Total duration: ${MINUTES}m ${SECONDS}s (${DURATION} seconds)"
+          echo ""
+          
+          if [ $DURATION -gt 300 ]; then
+            echo "⚠️  Installation took longer than 5 minutes"
+            echo "Target: 300 seconds (5 minutes)"
+            echo "Actual: ${DURATION} seconds"
+            exit 1
+          else
+            echo "✓ Installation completed within 5 minute target"
+            echo "Target: 300 seconds (5 minutes)"
+            echo "Actual: ${DURATION} seconds"
+          fi
+
+      - name: Check for errors in logs
+        run: |
+          echo "Checking logs for errors..."
+          
+          # Get last 100 lines of logs
+          sudo journalctl -u stealthlink -n 100 --no-pager > /tmp/service-logs.txt
+          
+          # Check for common error patterns
+          if grep -i "error\|fatal\|panic" /tmp/service-logs.txt | grep -v "error_count\|errors_total"; then
+            echo "✗ Errors found in logs"
+            echo ""
+            echo "=== Full logs ==="
+            cat /tmp/service-logs.txt
+            exit 1
+          else
+            echo "✓ No errors found in logs"
+          fi
+
+      - name: Verify binary versions
+        run: |
+          echo "=== Binary versions ==="
+          /opt/stealthlink/stealthlink-gateway version || echo "version command not available"
+          /opt/stealthlink/stealthlink-agent version || echo "version command not available"
+          /opt/stealthlink/stealthlink-tools version || echo "version command not available"
+
+      - name: Test stealthlink-ctl commands
+        run: |
+          echo "Testing stealthlink-ctl commands..."
+          
+          echo ""
+          echo "=== stealthlink-ctl status ==="
+          sudo /usr/local/bin/stealthlink-ctl status || true
+          
+          echo ""
+          echo "=== stealthlink-ctl health ==="
+          sudo /usr/local/bin/stealthlink-ctl health || true
+
+      - name: Cleanup and stop service
+        if: always()
+        run: |
+          echo "Stopping service..."
+          sudo systemctl stop stealthlink || true
+          
+          echo ""
+          echo "=== Final service status ==="
+          sudo systemctl status stealthlink --no-pager || true
+          
+          echo ""
+          echo "=== Final logs ==="
+          sudo journalctl -u stealthlink -n 100 --no-pager || true
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-logs
+          path: |
+            /tmp/service-logs.txt
+            /tmp/metrics.txt
+          retention-days: 7
+
+  smoke-test-summary:
+    name: Smoke Test Summary
+    runs-on: ubuntu-latest
+    needs: smoke-test-install
+    if: always()
+    
+    steps:
+      - name: Check smoke test result
+        run: |
+          echo "Smoke test completed"
+          echo "Check job results above for details"

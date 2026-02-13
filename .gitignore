@@ -39,3 +39,6 @@ target/
 .claude/
 .zencoder/
 .zenflow/
+
+# Stakpak session files
+.stakpak/session*

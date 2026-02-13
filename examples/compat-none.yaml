@@ -1,0 +1,43 @@
+# Example configuration with NO compatibility adapter (recommended)
+# This is the default mode and provides the best performance
+
+role: gateway
+
+gateway:
+  listen: ":8443"
+
+transport:
+  type: uqsp
+  
+  # No compatibility adapter (default)
+  # compat_mode: none  # This is the default, can be omitted
+  
+  # UQSP configuration for Mode 4a (XHTTP + Domain Fronting)
+  # Using StealthLink's native wire format
+  uqsp:
+    carrier:
+      type: xhttp
+    
+    # XHTTP configuration
+    xhttp:
+      mode: stream-up
+      path: /api/v1/data
+      max_connections: 8
+
+# Mux configuration
+mux:
+  max_streams_per_session: 100
+
+# Logging
+logging:
+  level: info
+  format: json
+
+# Security
+security:
+  replay_capacity: 1000000
+
+# Metrics
+metrics:
+  enabled: true
+  listen: ":9090"

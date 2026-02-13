@@ -3,6 +3,7 @@ package behavior
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/hex"
 	"testing"
 
@@ -59,5 +60,45 @@ func TestDeriveServerPublicKeyMissing(t *testing.T) {
 	conn := &realityConn{}
 	if got := conn.deriveServerPublicKey(); got != nil {
 		t.Fatalf("expected nil public key, got len=%d", len(got))
+	}
+}
+
+func TestRealityEd25519DerivationDependsOnKey(t *testing.T) {
+	keyA := make([]byte, 32)
+	keyB := make([]byte, 32)
+	for i := range keyA {
+		keyA[i] = byte(i + 1)
+		keyB[i] = byte(i + 2)
+	}
+
+	privA, err := deriveRealityEd25519PrivateKey(keyA)
+	if err != nil {
+		t.Fatalf("derive key A: %v", err)
+	}
+	privB, err := deriveRealityEd25519PrivateKey(keyB)
+	if err != nil {
+		t.Fatalf("derive key B: %v", err)
+	}
+
+	if bytes.Equal(privA.Seed(), privB.Seed()) {
+		t.Fatalf("derived ed25519 seeds are identical for distinct x25519 keys")
+	}
+	if bytes.Equal(privA.Public().(ed25519.PublicKey), privB.Public().(ed25519.PublicKey)) {
+		t.Fatalf("derived ed25519 public keys are identical for distinct x25519 keys")
+	}
+}
+
+func TestParseRealityKeyAcceptsRawURLBase64(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(3*i + 7)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(key)
+	got, err := parseRealityKey(encoded)
+	if err != nil {
+		t.Fatalf("parseRealityKey(rawurl) error: %v", err)
+	}
+	if !bytes.Equal(got, key) {
+		t.Fatalf("parsed key mismatch")
 	}
 }

@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"stealthlink/internal/metrics"
+	"stealthlink/internal/tlsutil"
+	"stealthlink/internal/transport/underlay"
 	"stealthlink/internal/transport/uqsp/behavior"
 	"stealthlink/internal/transport/uqsp/carrier"
 	"stealthlink/internal/warp"
@@ -32,7 +34,7 @@ const (
 	VariantXHTTP_TLS ProtocolVariant = iota
 
 	// VariantRawTCP represents category 4b:
-	// Raw TCP + KCP + smux + obfs4/TUIC-style obfuscation
+	// RawTCP/FakeTCP + KCP/smux + obfs4/TUIC-style obfuscation
 	// Best for: Low-latency, high-throughput scenarios
 	VariantRawTCP
 
@@ -54,14 +56,15 @@ const (
 
 // VariantConfig configures a specific protocol variant.
 type VariantConfig struct {
-	Variant       ProtocolVariant
-	Carrier       carrier.Carrier
-	Behaviors     []behavior.Overlay
-	TLSConfig     *tls.Config
-	EnableWARP    bool         // Hide server IP behind WARP
-	WARPConfig    *warp.Config // WARP runtime config when enabled
-	EnableReverse bool         // Server initiates connection
-	ReverseMode   *ReverseMode // Reverse mode tuning and addressing
+	Variant        ProtocolVariant
+	Carrier        carrier.Carrier
+	Behaviors      []behavior.Overlay
+	TLSConfig      *tls.Config
+	EnableWARP     bool         // Hide server IP behind WARP
+	WARPConfig     *warp.Config // WARP runtime config when enabled
+	UnderlayDialer underlay.Dialer
+	EnableReverse  bool         // Server initiates connection
+	ReverseMode    *ReverseMode // Reverse mode tuning and addressing
 }
 
 // UnifiedProtocol implements the unified protocol with all variants.
@@ -74,11 +77,23 @@ type UnifiedProtocol struct {
 	warpOn  bool
 }
 
-// uqspSession represents a unified protocol session (placeholder)
+// Overlays returns the configured behavior overlays for this protocol instance.
+func (u *UnifiedProtocol) Overlays() []behavior.Overlay {
+	return u.variant.Behaviors
+}
+
+// UnderlayDialer returns the configured underlay dialer (direct/warp/socks).
+// This is primarily exposed for observability and integration tests.
+func (u *UnifiedProtocol) UnderlayDialer() underlay.Dialer {
+	return u.variant.UnderlayDialer
+}
+
+// uqspSession represents a unified protocol session with optional SessionManager.
 type uqspSession struct {
-	variant   ProtocolVariant
-	conn      net.Conn
-	behaviors []behavior.Overlay
+	variant    ProtocolVariant
+	conn       net.Conn
+	behaviors  []behavior.Overlay
+	sessionMgr *SessionManager // nil when carrier doesn't support QUIC multiplexing
 }
 
 // NewUnifiedProtocol creates a new unified protocol instance.
@@ -114,6 +129,12 @@ func (u *UnifiedProtocol) Dial(ctx context.Context, addr string) (conn net.Conn,
 		}
 	}
 
+	if u.variant.UnderlayDialer != nil {
+		ctx = tlsutil.WithBaseDialFunc(ctx, func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return u.variant.UnderlayDialer.Dial(ctx, network, addr)
+		})
+	}
+
 	// Get base connection from carrier
 	conn, err = u.variant.Carrier.Dial(ctx, addr)
 	if err != nil {
@@ -133,8 +154,41 @@ func (u *UnifiedProtocol) Dial(ctx context.Context, addr string) (conn net.Conn,
 	}
 	conn = u.wrapWARPConn(conn)
 
+	// Track the session; if the carrier supports QUIC muxing, a SessionManager
+	// will be attached later via AttachSessionManager.
+	u.session = &uqspSession{
+		variant:   u.variant.Variant,
+		conn:      conn,
+		behaviors: u.variant.Behaviors,
+	}
+
 	recordConnectionEstablished(carrierName)
 	return wrapMetricsConn(conn, carrierName), nil
+}
+
+// Close releases resources owned by this protocol instance (carriers, underlay dialers, WARP).
+func (u *UnifiedProtocol) Close() error {
+	var firstErr error
+	if u.variant.Carrier != nil {
+		if err := u.variant.Carrier.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if u.variant.UnderlayDialer != nil {
+		if err := u.variant.UnderlayDialer.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	u.warpMu.Lock()
+	w := u.warp
+	u.warp = nil
+	u.warpMu.Unlock()
+	if w != nil {
+		if err := w.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Listen creates a listener using the configured variant.
@@ -181,7 +235,11 @@ func (u *UnifiedProtocol) listenReverse(addr string) (net.Listener, error) {
 
 	// In reverse mode, we create a listener that waits for incoming
 	// connections from the peer (who acts as the "server")
-	reverse := NewReverseDialer(mode, u.variant.TLSConfig)
+	var dialFn func(ctx context.Context, network, addr string) (net.Conn, error)
+	if u.variant.UnderlayDialer != nil {
+		dialFn = u.variant.UnderlayDialer.Dial
+	}
+	reverse := NewReverseDialerWithDialFunc(mode, u.variant.TLSConfig, dialFn)
 
 	ctx := context.Background()
 	if err := reverse.Start(ctx); err != nil {
@@ -218,11 +276,17 @@ func (u *UnifiedProtocol) ensureWARP(ctx context.Context) error {
 	if err != nil {
 		u.warpErr = err
 		u.warpOn = true
+		if cfg.Required {
+			return fmt.Errorf("warp required but failed to initialize: %w", err)
+		}
 		return err
 	}
 	if err := w.Start(ctx); err != nil {
 		u.warpErr = err
 		u.warpOn = true
+		if cfg.Required {
+			return fmt.Errorf("warp required but failed to start: %w", err)
+		}
 		return err
 	}
 	if cfg.RoutingMode == "vpn_only" && cfg.VPNSubnet != "" && w.IsEnabled() {
@@ -389,14 +453,33 @@ func carrierMetricName(c carrier.Carrier) string {
 	return "uqsp"
 }
 
+// AttachSessionManager attaches a SessionManager to the protocol for
+// QUIC-backed carriers that support multiplexed streams and UDP relay.
+func (u *UnifiedProtocol) AttachSessionManager(mgr *SessionManager) {
+	if u.session == nil {
+		u.session = &uqspSession{variant: u.variant.Variant}
+	}
+	u.session.sessionMgr = mgr
+}
+
+// SessionManager returns the attached SessionManager, or nil if the carrier
+// does not support QUIC multiplexing.
+func (u *UnifiedProtocol) SessionManager() *SessionManager {
+	if u.session == nil {
+		return nil
+	}
+	return u.session.sessionMgr
+}
+
 // ProtocolBuilder helps build protocol variants with the recommended settings.
 type ProtocolBuilder struct {
-	variant     ProtocolVariant
-	carrierType string
-	behaviors   []behavior.Overlay
-	tlsConfig   *tls.Config
-	warpEnabled bool
-	reverseMode bool
+	variant         ProtocolVariant
+	carrierType     string
+	carrierInstance carrier.Carrier
+	behaviors       []behavior.Overlay
+	tlsConfig       *tls.Config
+	warpEnabled     bool
+	reverseMode     bool
 }
 
 // NewProtocolBuilder creates a new protocol builder.
@@ -407,9 +490,16 @@ func NewProtocolBuilder(variant ProtocolVariant) *ProtocolBuilder {
 	}
 }
 
-// WithCarrier sets the carrier type.
+// WithCarrier sets the carrier type string. The carrier will be resolved
+// from the DefaultRegistry when Build() is called.
 func (b *ProtocolBuilder) WithCarrier(carrierType string) *ProtocolBuilder {
 	b.carrierType = carrierType
+	return b
+}
+
+// WithCarrierInstance sets the carrier directly, bypassing the registry.
+func (b *ProtocolBuilder) WithCarrierInstance(c carrier.Carrier) *ProtocolBuilder {
+	b.carrierInstance = c
 	return b
 }
 
@@ -447,9 +537,22 @@ func (b *ProtocolBuilder) Build() (VariantConfig, error) {
 		Behaviors:     b.behaviors,
 	}
 
-	// Validate
-	if config.Carrier == nil {
-		return VariantConfig{}, fmt.Errorf("carrier not configured")
+	// Resolve carrier: prefer explicit instance, then lookup by type string.
+	switch {
+	case b.carrierInstance != nil:
+		config.Carrier = b.carrierInstance
+	case b.carrierType != "":
+		c, ok := carrier.DefaultRegistry.Get(b.carrierType)
+		if ok && c != nil {
+			config.Carrier = c
+		} else if b.carrierType == "quic" {
+			// QUIC is built-in and doesn't need registry lookup
+			config.Carrier = buildVariantQUICCarrier(b.tlsConfig)
+		} else {
+			return VariantConfig{}, fmt.Errorf("carrier type %q not found in registry", b.carrierType)
+		}
+	default:
+		return VariantConfig{}, fmt.Errorf("carrier not configured: use WithCarrier or WithCarrierInstance")
 	}
 
 	return config, nil
@@ -479,7 +582,7 @@ func VariantDescription(v ProtocolVariant) string {
 	case VariantXHTTP_TLS:
 		return "XHTTP + TLS + Domain Fronting + XTLS Vision + ECH - Maximum stealth with CDN cover"
 	case VariantRawTCP:
-		return "Raw TCP + KCP + smux + obfs4 - Low latency, high throughput"
+		return "RawTCP/FakeTCP + KCP/smux + obfs4 - Low latency, high throughput"
 	case VariantTLSMirror:
 		return "REALITY/ShadowTLS + XTLS Vision + PQ signatures - TLS fingerprint resistance"
 	case VariantUDP:

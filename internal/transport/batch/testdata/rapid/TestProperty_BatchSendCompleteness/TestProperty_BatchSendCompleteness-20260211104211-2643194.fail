@@ -1,0 +1,304 @@
+# 2026/02/11 10:42:11.724069 [TestProperty_BatchSendCompleteness] [rapid] draw numMsgs: 33
+# 2026/02/11 10:42:11.724073 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724077 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724078 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724079 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724080 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724081 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724082 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724083 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724083 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724084 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724085 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724086 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724087 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724087 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724088 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724089 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724090 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724091 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724091 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724092 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724093 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724094 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724094 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724095 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724096 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724097 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724097 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724098 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724099 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724099 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724100 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724101 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724101 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724104 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724105 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724106 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724106 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724107 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724108 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724108 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724109 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724110 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724110 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724111 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724112 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724113 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724113 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724114 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724115 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724116 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724116 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724118 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724118 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724119 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724120 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724120 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724121 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724122 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724122 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724123 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724124 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724125 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724125 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724135 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724136 [TestProperty_BatchSendCompleteness] [rapid] draw msgSize: 1
+# 2026/02/11 10:42:11.724138 [TestProperty_BatchSendCompleteness] [rapid] draw msg: []byte{0x0}
+# 2026/02/11 10:42:11.724366 [TestProperty_BatchSendCompleteness] Expected 33 messages sent, got 32 (property violated: Batch Send Completeness)
+# 
+v0.4.8#1522166606095539024
+0x0
+0xe3e05a098777c
+0x20
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/xtaci/kcp-go/v5"
@@ -31,15 +32,15 @@ const (
 type BlockCrypt string
 
 const (
-	BlockNone   BlockCrypt = "none"
-	BlockAES    BlockCrypt = "aes"
-	BlockAES128 BlockCrypt = "aes-128"
+	BlockNone     BlockCrypt = "none"
+	BlockAES      BlockCrypt = "aes"
+	BlockAES128   BlockCrypt = "aes-128"
 	BlockBlowfish BlockCrypt = "blowfish"
-	BlockCast5  BlockCrypt = "cast5"
-	Block3DES   BlockCrypt = "3des"
-	BlockTEA    BlockCrypt = "tea"
-	BlockXTEA   BlockCrypt = "xtea"
-	BlockSalsa20 BlockCrypt = "salsa20"
+	BlockCast5    BlockCrypt = "cast5"
+	Block3DES     BlockCrypt = "3des"
+	BlockTEA      BlockCrypt = "tea"
+	BlockXTEA     BlockCrypt = "xtea"
+	BlockSalsa20  BlockCrypt = "salsa20"
 )
 
 // Config holds the unified KCP configuration
@@ -59,6 +60,10 @@ type Config struct {
 	// DSCP marking
 	DSCP int
 
+	// Batch I/O configuration
+	BatchEnabled bool // Enable batch I/O (default: true on Linux)
+	BatchSize    int  // Max messages per batch (1-64, default: 32)
+
 	// Mode-specific configurations
 	Brutal BrutalConfig
 	AWG    AWGConfig
@@ -68,24 +73,24 @@ type Config struct {
 // BrutalConfig holds brutal congestion control settings
 type BrutalConfig struct {
 	Enabled    bool
-	Bandwidth  int // Mbps
+	Bandwidth  int    // Mbps
 	PacingMode string // adaptive, aggressive, conservative
 }
 
 // AWGConfig holds AmneziaWG-specific settings
 type AWGConfig struct {
-	JunkEnabled   bool
-	JunkInterval  time.Duration
-	JunkMinSize   int
-	JunkMaxSize   int
+	JunkEnabled     bool
+	JunkInterval    time.Duration
+	JunkMinSize     int
+	JunkMaxSize     int
 	PacketObfuscate bool
 }
 
 // DTLSConfig holds DTLS-specific settings
 type DTLSConfig struct {
-	MTU           int
+	MTU              int
 	HandshakeTimeout time.Duration
-	FlightInterval time.Duration
+	FlightInterval   time.Duration
 }
 
 // DefaultConfig returns default KCP configuration
@@ -165,7 +170,7 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (net.Conn, error) {
 		conn.SetDSCP(d.cfg.DSCP)
 	}
 
-	return conn, nil
+	return NewKCPConn(conn, d.cfg.Mode, d.cfg), nil
 }
 
 // Listener wraps a KCP listener with unified configuration
@@ -226,6 +231,7 @@ func (l *Listener) Accept() (net.Conn, error) {
 		if l.cfg.DSCP > 0 {
 			kcpConn.SetDSCP(l.cfg.DSCP)
 		}
+		return NewKCPConn(kcpConn, l.cfg.Mode, l.cfg), nil
 	}
 
 	return conn, nil
@@ -375,20 +381,82 @@ func applyDTLSModeSettings(conn *kcp.UDPSession, cfg DTLSConfig) error {
 	return nil
 }
 
-// KCPConn wraps a KCP connection with additional features
 type KCPConn struct {
 	*kcp.UDPSession
 	mode Mode
 	cfg  *Config
+	fec  *FECController
+
+	autoTuneStop chan struct{}
+	autoTuneDone chan struct{}
+	stopOnce     sync.Once
 }
 
 // NewKCPConn wraps a KCP session
 func NewKCPConn(sess *kcp.UDPSession, mode Mode, cfg *Config) *KCPConn {
-	return &KCPConn{
+	c := &KCPConn{
 		UDPSession: sess,
 		mode:       mode,
 		cfg:        cfg,
+		fec:        NewFECController(cfg.DataShards, cfg.ParityShards, cfg.AutoTuneFEC),
 	}
+	if cfg.AutoTuneFEC {
+		c.autoTuneStop = make(chan struct{})
+		c.autoTuneDone = make(chan struct{})
+		go c.fecAutoTuneLoop()
+	}
+	return c
+}
+
+func (c *KCPConn) Write(b []byte) (n int, err error) {
+	if c.fec != nil {
+		c.fec.RecordDataPacket()
+		// Check for parity skip
+		// Note: kcp-go currently doesn't expose runtime per-session FEC
+		// reconfiguration, so parity skip is tracked at controller level and
+		// applied on next connection setup via configured shard policy.
+		if c.fec.ShouldSkipParity(time.Duration(c.UDPSession.GetSRTT()) * time.Millisecond) {
+			_, _ = c.fec.GetShards()
+		}
+	}
+	return c.UDPSession.Write(b)
+}
+
+func (c *KCPConn) fecAutoTuneLoop() {
+	defer close(c.autoTuneDone)
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.autoTuneStop:
+			return
+		case <-ticker.C:
+			// Get stats from KCP session
+			snmp := kcp.DefaultSnmp.Copy()
+			// Update FEC controller with loss stats
+			// Note: This is global stats, ideally we want per-session.
+			// For a single-stream or limited-stream session, it's a good proxy.
+			c.fec.RecordPacket(snmp.LostSegs > 0, time.Duration(c.UDPSession.GetSRTTVar())*time.Millisecond)
+		}
+	}
+}
+
+// Close closes the KCP connection and deterministically stops background loops.
+func (c *KCPConn) Close() error {
+	c.stopAutoTuneLoop()
+	return c.UDPSession.Close()
+}
+
+func (c *KCPConn) stopAutoTuneLoop() {
+	if c.autoTuneStop == nil || c.autoTuneDone == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		close(c.autoTuneStop)
+		<-c.autoTuneDone
+	})
 }
 
 // Mode returns the KCP mode

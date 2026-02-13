@@ -1,10 +1,10 @@
 package obfs
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"net"
+	"stealthlink/internal/transport/kcpbase"
 	"sync"
 )
 
@@ -87,7 +87,7 @@ func (p *PaddingObfuscator) GenerateJunk() []byte {
 		return nil
 	}
 	junk := make([]byte, size)
-	rand.Read(junk)
+	kcpbase.FastRandom.Read(junk)
 	return junk
 }
 
@@ -109,7 +109,7 @@ func (p *PaddingObfuscator) calculatePaddingSize(dataLen int) int {
 		if p.maxPadding <= p.minPadding {
 			return p.minPadding
 		}
-		return p.minPadding + randInt(p.maxPadding-p.minPadding)
+		return p.minPadding + int(kcpbase.FastRandom.Int64n(int64(p.maxPadding-p.minPadding+1)))
 
 	case StrategyPower2:
 		// Pad to next power of 2
@@ -193,7 +193,7 @@ func (c *paddingConn) Write(p []byte) (int, error) {
 	binary.BigEndian.PutUint32(packet, uint32(len(p)))
 	copy(packet[4:], p)
 	if paddingSize > 0 {
-		rand.Read(packet[4+len(p):])
+		kcpbase.FastRandom.Read(packet[4+len(p):])
 	}
 
 	_, err := c.Conn.Write(packet)
@@ -212,7 +212,7 @@ func (c *paddingConn) calculatePaddingSize(dataLen int) int {
 		if c.maxPadding <= c.minPadding {
 			return c.minPadding
 		}
-		return c.minPadding + randInt(c.maxPadding-c.minPadding)
+		return c.minPadding + int(kcpbase.FastRandom.Int64n(int64(c.maxPadding-c.minPadding+1)))
 	case StrategyPower2:
 		target := 1
 		for target < dataLen+c.minPadding {
@@ -267,7 +267,7 @@ func (c *paddingPacketConn) calculatePaddingSize(dataLen int) int {
 		if c.maxPadding <= c.minPadding {
 			return c.minPadding
 		}
-		return c.minPadding + randInt(c.maxPadding-c.minPadding)
+		return c.minPadding + int(kcpbase.FastRandom.Int64n(int64(c.maxPadding-c.minPadding+1)))
 	case StrategyPower2:
 		target := 1
 		for target < dataLen+c.minPadding {
@@ -293,7 +293,7 @@ func (c *paddingPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) 
 	binary.BigEndian.PutUint32(packet, uint32(len(p)))
 	copy(packet[4:], p)
 	if paddingSize > 0 {
-		rand.Read(packet[4+len(p):])
+		kcpbase.FastRandom.Read(packet[4+len(p):])
 	}
 
 	_, err = c.PacketConn.WriteTo(packet, addr)
@@ -362,11 +362,11 @@ func (a *AWGObfuscator) WrapPacketConn(conn net.PacketConn) (net.PacketConn, err
 func (a *AWGObfuscator) GenerateJunk() []byte {
 	size := a.jmin
 	if a.jmax > a.jmin {
-		size += randInt(a.jmax - a.jmin)
+		size += int(kcpbase.FastRandom.Int64n(int64(a.jmax - a.jmin + 1)))
 	}
 
 	junk := make([]byte, size)
-	rand.Read(junk)
+	kcpbase.FastRandom.Read(junk)
 
 	// Mark as junk packet
 	junk[0] = 0xFF

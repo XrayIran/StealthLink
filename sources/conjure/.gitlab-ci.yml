@@ -1,0 +1,47 @@
+variables:
+  DEBIAN_STABLE: bookworm
+  DEBIAN_FRONTEND: noninteractive
+  REPRODUCIBLE_FLAGS: -trimpath -ldflags=-buildid=
+  DOCKER_REGISTRY_URL: docker.io
+
+.test-template: &test-template
+  artifacts:
+    name: "${CI_PROJECT_PATH}_${CI_JOB_STAGE}_${CI_JOB_ID}_${CI_COMMIT_REF_NAME}_${CI_COMMIT_SHA}"
+    paths:
+      - client/client
+    expire_in: 1 week
+    when: on_success
+
+# use Go installed as part of the official, Debian-based Docker images
+.golang-docker-debian-template: &golang-docker-debian-template
+  before_script:
+    - apt-get update
+    - apt-get -qy install --no-install-recommends
+        ca-certificates
+        git
+        lbzip2
+        libczmq-dev
+
+.go-test: &go-test
+  - gofmt -d .
+  - test -z "$(go fmt ./...)"
+  - go vet ./...
+  - go test -v -race ./...
+
+  - cd $CI_PROJECT_DIR/client/
+  - go get
+  - go build $REPRODUCIBLE_FLAGS
+
+go-1.22:
+  image: ${DOCKER_REGISTRY_URL}/golang:1.22-$DEBIAN_STABLE
+  <<: *golang-docker-debian-template
+  <<: *test-template
+  script:
+    - *go-test
+
+go-1.23:
+  image: ${DOCKER_REGISTRY_URL}/golang:1.23-$DEBIAN_STABLE
+  <<: *golang-docker-debian-template
+  <<: *test-template
+  script:
+    - *go-test

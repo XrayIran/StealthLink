@@ -78,6 +78,7 @@ func (c *TLSConnWrapper) Close() error {
 type OverlayConfig struct {
 	ShadowTLS   ShadowTLSOverlay
 	TLSMirror   TLSMirrorOverlay
+	AnyTLS      AnyTLSOverlay
 	AWG         AWGOverlay
 	Reality     RealityOverlay
 	ECH         ECHOverlay
@@ -86,9 +87,10 @@ type OverlayConfig struct {
 	DomainFront DomainFrontOverlay
 	TLSFrag     TLSFragOverlay
 	CSTP        CSTPOverlay
+	ViolatedTCP ViolatedTCPOverlay
+	QPP         QPPOverlay
 }
 
-// NewManagerFromConfig creates a behavior manager from configuration
 func NewManagerFromConfig(cfg *OverlayConfig) *Manager {
 	m := NewManager()
 	if cfg == nil {
@@ -100,6 +102,9 @@ func NewManagerFromConfig(cfg *OverlayConfig) *Manager {
 	}
 	if cfg.TLSMirror.Enabled() {
 		m.AddOverlay(&cfg.TLSMirror)
+	}
+	if cfg.AnyTLS.Enabled() {
+		m.AddOverlay(&cfg.AnyTLS)
 	}
 	if cfg.AWG.Enabled() {
 		m.AddOverlay(&cfg.AWG)
@@ -125,6 +130,48 @@ func NewManagerFromConfig(cfg *OverlayConfig) *Manager {
 	if cfg.CSTP.Enabled() {
 		m.AddOverlay(&cfg.CSTP)
 	}
+	if cfg.ViolatedTCP.Enabled() {
+		m.AddOverlay(&cfg.ViolatedTCP)
+	}
+	if cfg.QPP.Enabled() {
+		m.AddOverlay(&cfg.QPP)
+	}
 
 	return m
+}
+
+func SortBehaviors(overlays []Overlay) []Overlay {
+	if len(overlays) <= 1 {
+		return overlays
+	}
+	sorted := make([]Overlay, 0, len(overlays))
+	var phase2, phase3 []Overlay
+
+	for _, o := range overlays {
+		switch overlayPriority(o.Name()) {
+		case 1:
+			sorted = append(sorted, o)
+		case 2:
+			phase2 = append(phase2, o)
+		default:
+			phase3 = append(phase3, o)
+		}
+	}
+	sorted = append(sorted, phase2...)
+	sorted = append(sorted, phase3...)
+	return sorted
+}
+
+// overlayPriority returns execution phase for known overlay names.
+func overlayPriority(name string) int {
+	switch name {
+	case "ech", "domainfront":
+		return 1
+	case "reality", "shadowtls", "tlsmirror", "anytls", "obfs4", "gfwresist_tls", "gfwresist_tcp", "violated_tcp":
+		return 2
+	case "qpp":
+		return 0
+	default:
+		return 3
+	}
 }

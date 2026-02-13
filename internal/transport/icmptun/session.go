@@ -98,6 +98,23 @@ func (c *LRUSessionMap) evictOldest() {
 	}
 }
 
+// Range iterates over all entries, calling fn for each. If fn returns false, iteration stops.
+func (c *LRUSessionMap) Range(fn func(key string, value interface{}) bool) {
+	c.mu.RLock()
+	// Collect entries under read lock to avoid holding lock during callback
+	entries := make([]lruEntry, 0, len(c.items))
+	for e := c.order.Front(); e != nil; e = e.Next() {
+		entries = append(entries, *e.Value.(*lruEntry))
+	}
+	c.mu.RUnlock()
+
+	for _, entry := range entries {
+		if !fn(entry.key, entry.value) {
+			return
+		}
+	}
+}
+
 // Len returns the number of items
 func (c *LRUSessionMap) Len() int {
 	c.mu.RLock()

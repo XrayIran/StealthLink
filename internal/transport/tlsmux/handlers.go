@@ -74,8 +74,11 @@ func (h *RealityHandler) WrapClient(ctx context.Context, conn net.Conn, tlsConfi
 		ServerNames: h.Config.ServerNames,
 		PrivateKey:  h.Config.PrivateKey,
 		ShortIds:    h.Config.ShortIDs,
-		SpiderX:     h.Config.SpiderX,
-		Show:        h.Config.Show,
+		Spider: reality.SpiderConfig{
+			Enabled: h.Config.SpiderX != "",
+			SpiderX: h.Config.SpiderX,
+		},
+		Show: h.Config.Show,
 	}
 
 	// Create a reality dialer for the handshake logic
@@ -92,8 +95,11 @@ func (h *RealityHandler) WrapServer(conn net.Conn, tlsConfig *tls.Config) (net.C
 		ServerNames: h.Config.ServerNames,
 		PrivateKey:  h.Config.PrivateKey,
 		ShortIds:    h.Config.ShortIDs,
-		SpiderX:     h.Config.SpiderX,
-		Show:        h.Config.Show,
+		Spider: reality.SpiderConfig{
+			Enabled: h.Config.SpiderX != "",
+			SpiderX: h.Config.SpiderX,
+		},
+		Show: h.Config.Show,
 	}
 
 	// Create listener-like wrapper for the connection

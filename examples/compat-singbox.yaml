@@ -1,0 +1,46 @@
+# Example configuration for sing-box compatibility mode
+# Use this ONLY when you need interoperability with sing-box clients
+
+role: gateway
+
+gateway:
+  listen: ":8443"
+
+transport:
+  type: uqsp
+  
+  # Enable sing-box compatibility adapter
+  compat_mode: singbox
+  
+  # sing-box adapter configuration
+  singbox:
+    enabled: true
+    mode: anytls  # AnyTLS protocol
+  
+  # UQSP configuration for Mode 4c (TLS-Like + AnyTLS)
+  uqsp:
+    carrier:
+      type: anytls
+    
+    # TLS configuration
+    tls:
+      cert_file: /path/to/cert.pem
+      key_file: /path/to/key.pem
+
+# Mux configuration
+mux:
+  max_streams_per_session: 100
+
+# Logging
+logging:
+  level: info
+  format: json
+
+# Security
+security:
+  replay_capacity: 1000000
+
+# Metrics
+metrics:
+  enabled: true
+  listen: ":9090"

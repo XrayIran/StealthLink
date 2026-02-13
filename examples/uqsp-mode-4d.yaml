@@ -1,4 +1,5 @@
 role: agent
+variant: "4d"
 
 agent:
   id: "agent-4d"
@@ -9,6 +10,20 @@ transport:
   uqsp:
     carrier:
       type: quic
+      # Alternative configuration for KCP with new features:
+      # type: kcp
+      # kcp:
+      #   fec:
+      #     auto_tune: true      # Enable adaptive FEC
+      #     parity_skip: true    # Skip parity on gaps > RTO
+      #   entropy:
+      #     accelerated: true    # Use hardware AES-NI/ChaCha8
+      
+      # System Optimization (Applies to both QUIC and KCP)
+      sys:
+        udp_batch_enabled: true
+        udp_batch_size: 16
+
     congestion:
       algorithm: brutal
       bandwidth_mbps: 200

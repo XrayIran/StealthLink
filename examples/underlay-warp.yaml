@@ -1,0 +1,43 @@
+# Example: WARP underlay dialer
+# Routes StealthLink traffic through Cloudflare WARP
+# Server egress appears as Cloudflare IP
+
+role: agent
+
+agent:
+  id: agent-002
+  gateway_addr: gateway.example.com:443
+
+transport:
+  type: stealth
+  mode: "4a"  # XHTTP + Domain Fronting
+  
+  # Underlay dialer configuration
+  dialer: warp  # Route through Cloudflare WARP
+  
+  # WARP dialer configuration
+  warp_dialer:
+    mode: consumer  # "consumer" | "zero-trust" | "connector"
+    device_id: ""   # Optional: pre-registered device ID
+  
+  stealth:
+    carrier:
+      kind: tcp
+    camouflage:
+      mode: tls
+      tls:
+        server_name: gateway.example.com
+
+# WARP configuration (global)
+warp:
+  enabled: true
+  mode: builtin  # "builtin" (wireguard-go) or "wgquick" (system)
+  endpoint: "engage.cloudflareclient.com:2408"
+  routing_mode: vpn_only  # Route only StealthLink traffic through WARP
+  vpn_subnet: "10.8.0.0/24"
+  keepalive: 25s
+
+services:
+  - name: web
+    listen: 127.0.0.1:8080
+    target: 10.0.0.1:80

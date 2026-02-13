@@ -54,10 +54,13 @@ func (o *Obfs4Overlay) Validate() error {
 	if o.NodeID != "" {
 		id, err := base64.StdEncoding.DecodeString(o.NodeID)
 		if err != nil {
-			id = make([]byte, 32)
-			copy(id, []byte(o.NodeID))
+			id = []byte(o.NodeID)
 		}
-		o.nodeIDBytes = id
+		if len(id) != 32 {
+			h := sha256.Sum256(id)
+			id = h[:]
+		}
+		o.nodeIDBytes = append([]byte(nil), id...)
 	}
 
 	if o.PublicKey != "" {
@@ -68,7 +71,7 @@ func (o *Obfs4Overlay) Validate() error {
 		if len(pk) != 32 {
 			return fmt.Errorf("public key must be 32 bytes, got %d", len(pk))
 		}
-		o.publicKeyBytes = pk
+		o.publicKeyBytes = append([]byte(nil), pk...)
 	}
 
 	if o.PrivateKey != "" {
@@ -79,7 +82,8 @@ func (o *Obfs4Overlay) Validate() error {
 		if len(sk) != 32 {
 			return fmt.Errorf("private key must be 32 bytes, got %d", len(sk))
 		}
-		o.privateKeyBytes = sk
+		clampCurve25519Private(sk)
+		o.privateKeyBytes = append([]byte(nil), sk...)
 	}
 
 	if o.Seed != "" {
@@ -87,7 +91,51 @@ func (o *Obfs4Overlay) Validate() error {
 		if err != nil {
 			return fmt.Errorf("invalid seed: %w", err)
 		}
-		o.seedBytes = seed
+		o.seedBytes = append([]byte(nil), seed...)
+	}
+
+	if len(o.publicKeyBytes) == 0 && len(o.privateKeyBytes) == 0 && len(o.seedBytes) > 0 {
+		pub, priv, err := deriveKeypairFromSeed(o.seedBytes)
+		if err != nil {
+			return fmt.Errorf("derive keypair from seed: %w", err)
+		}
+		o.publicKeyBytes = pub
+		o.privateKeyBytes = priv
+	}
+
+	if len(o.privateKeyBytes) > 0 && len(o.publicKeyBytes) == 0 {
+		pub, err := curve25519.X25519(o.privateKeyBytes, curve25519.Basepoint)
+		if err != nil {
+			return fmt.Errorf("derive public key from private key: %w", err)
+		}
+		o.publicKeyBytes = pub
+	}
+
+	if len(o.publicKeyBytes) == 0 {
+		return fmt.Errorf("public key is required (or provide seed/private_key)")
+	}
+	if o.ServerMode && len(o.privateKeyBytes) == 0 {
+		return fmt.Errorf("private key is required in server mode (or provide seed)")
+	}
+
+	if len(o.nodeIDBytes) == 0 {
+		src := o.seedBytes
+		if len(src) == 0 {
+			src = o.publicKeyBytes
+		}
+		h := sha256.New()
+		h.Write([]byte("obfs4-node-id-v1"))
+		h.Write(src)
+		o.nodeIDBytes = h.Sum(nil)
+		if len(o.nodeIDBytes) > 32 {
+			o.nodeIDBytes = o.nodeIDBytes[:32]
+		}
+	}
+	if len(o.seedBytes) == 0 {
+		h := sha256.New()
+		h.Write([]byte("obfs4-seed-v1"))
+		h.Write(o.publicKeyBytes)
+		o.seedBytes = h.Sum(nil)
 	}
 
 	if o.IATMode < 0 || o.IATMode > 2 {
@@ -101,6 +149,9 @@ func (o *Obfs4Overlay) Validate() error {
 func (o *Obfs4Overlay) Apply(conn net.Conn) (net.Conn, error) {
 	if !o.EnabledField {
 		return conn, nil
+	}
+	if err := o.Validate(); err != nil {
+		return nil, err
 	}
 
 	return NewObfs4Conn(conn, o)
@@ -239,31 +290,6 @@ func (c *Obfs4Conn) serverHandshake() error {
 	copy(c.recvKey[:], keys[0:32])
 	copy(c.sendKey[:], keys[32:64])
 
-	responsePub, responsePriv, err := generateKeypair()
-	if err != nil {
-		return err
-	}
-
-	response := make([]byte, 0, 128)
-	response = append(response, responsePub...)
-
-	paddingLen := c.paddingDist.randomLength(8192)
-	if paddingLen > 0 {
-		padding := make([]byte, paddingLen)
-		if _, err := rand.Read(padding); err != nil {
-			return err
-		}
-		key := deriveKey(responsePub, nil)
-		encrypted := encryptPadding(padding, key)
-		response = append(response, encrypted...)
-	}
-
-	if _, err := c.Conn.Write(response); err != nil {
-		return err
-	}
-
-	_ = responsePriv
-
 	c.state = obfs4StateEstablished
 	return nil
 }
@@ -385,9 +411,7 @@ func generateKeypair() (publicKey, privateKey []byte, err error) {
 		return nil, nil, err
 	}
 
-	privateKey[0] &= 248
-	privateKey[31] &= 127
-	privateKey[31] |= 64
+	clampCurve25519Private(privateKey)
 
 	publicKey, err = curve25519.X25519(privateKey, curve25519.Basepoint)
 	if err != nil {
@@ -410,7 +434,22 @@ func deriveKeys(sharedSecret, clientPub, serverPub []byte) []byte {
 	h.Write(clientPub)
 	h.Write(serverPub)
 	h.Write([]byte("obfs4-key-v1"))
-	return h.Sum(nil)
+	root := h.Sum(nil)
+
+	hc2s := sha256.New()
+	hc2s.Write(root)
+	hc2s.Write([]byte("client->server"))
+	c2s := hc2s.Sum(nil)
+
+	hs2c := sha256.New()
+	hs2c.Write(root)
+	hs2c.Write([]byte("server->client"))
+	s2c := hs2c.Sum(nil)
+
+	keys := make([]byte, 64)
+	copy(keys[:32], c2s)
+	copy(keys[32:], s2c)
+	return keys
 }
 
 func encryptPadding(padding, key []byte) []byte {
@@ -431,6 +470,30 @@ func newProbabilityDist(seed []byte) *probabilityDist {
 		rand.Read(seed)
 	}
 	return &probabilityDist{seed: seed}
+}
+
+func clampCurve25519Private(privateKey []byte) {
+	if len(privateKey) < 32 {
+		return
+	}
+	privateKey[0] &= 248
+	privateKey[31] &= 127
+	privateKey[31] |= 64
+}
+
+func deriveKeypairFromSeed(seed []byte) (publicKey, privateKey []byte, err error) {
+	h := sha256.New()
+	h.Write([]byte("obfs4-seed-keypair-v1"))
+	h.Write(seed)
+	sum := h.Sum(nil)
+	privateKey = make([]byte, 32)
+	copy(privateKey, sum[:32])
+	clampCurve25519Private(privateKey)
+	publicKey, err = curve25519.X25519(privateKey, curve25519.Basepoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return publicKey, privateKey, nil
 }
 
 func (d *probabilityDist) randomLength(max int) int {

@@ -6,9 +6,13 @@ package xhttp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
+	"math/big"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +20,7 @@ import (
 	"stealthlink/internal/transport"
 	"stealthlink/internal/transport/h2mux"
 	"stealthlink/internal/transport/padding"
+	"stealthlink/internal/transport/xhttpmeta"
 
 	"github.com/xtaci/smux"
 )
@@ -30,16 +35,32 @@ const (
 	ModePacketUp   Mode = "packet-up"
 )
 
+// MetadataPlacement controls where XHTTP session metadata is placed.
+type MetadataPlacement string
+
+const (
+	PlacementHeader MetadataPlacement = "header"
+	PlacementPath   MetadataPlacement = "path"
+	PlacementQuery  MetadataPlacement = "query"
+	PlacementCookie MetadataPlacement = "cookie"
+)
+
 // Config configures XHTTP transport.
 type Config struct {
-	Mode           Mode                   `yaml:"mode"`
-	Path           string                 `yaml:"path"`
-	Headers        map[string]string      `yaml:"headers"`
-	XPadding       padding.XPaddingConfig `yaml:"xpadding"`
-	MaxConnections int                    `yaml:"max_connections"`
-	PacketSize     int                    `yaml:"packet_size"`
-	KeepAlive      time.Duration          `yaml:"keep_alive"`
-	XMux           XMuxConfig             `yaml:"xmux"`
+	Mode              Mode                   `yaml:"mode"`
+	Path              string                 `yaml:"path"`
+	Headers           map[string]string      `yaml:"headers"`
+	XPadding          padding.XPaddingConfig `yaml:"xpadding"`
+	MaxConnections    int                    `yaml:"max_connections"`
+	PacketSize        int                    `yaml:"packet_size"`
+	KeepAlive         time.Duration          `yaml:"keep_alive"`
+	XMux              XMuxConfig             `yaml:"xmux"`
+	
+	SessionPlacement  MetadataPlacement      `yaml:"session_placement"`
+	SessionKey        string                 `yaml:"session_key"`
+	SequencePlacement MetadataPlacement      `yaml:"sequence_placement"`
+	SequenceKey       string                 `yaml:"sequence_key"`
+	MetadataPlacement MetadataPlacement      `yaml:"metadata_placement"` // Backward compatibility
 }
 
 // ApplyDefaults sets default values.
@@ -62,6 +83,33 @@ func (c *Config) ApplyDefaults() {
 	if c.KeepAlive <= 0 {
 		c.KeepAlive = 30 * time.Second
 	}
+	if c.MetadataPlacement == "" && c.SessionPlacement == "" && c.SequencePlacement == "" {
+		c.MetadataPlacement = PlacementHeader
+	}
+	
+	// Default placements to MetadataPlacement if not specified
+	if c.SessionPlacement == "" {
+		if c.MetadataPlacement != "" {
+			c.SessionPlacement = c.MetadataPlacement
+		} else {
+			c.SessionPlacement = PlacementHeader
+		}
+	}
+	if c.SequencePlacement == "" {
+		if c.MetadataPlacement != "" {
+			c.SequencePlacement = c.MetadataPlacement
+		} else {
+			c.SequencePlacement = PlacementHeader
+		}
+	}
+	
+	if c.SessionKey == "" {
+		c.SessionKey = "X-Session-ID"
+	}
+	if c.SequenceKey == "" {
+		c.SequenceKey = "X-Seq"
+	}
+	
 	c.XPadding.ApplyDefaults()
 }
 
@@ -118,11 +166,42 @@ type baseDialer struct {
 
 func (d *baseDialer) Dial(ctx context.Context, addr string) (transport.Session, error) {
 	cfg := d.config
-	url := buildURL(addr, cfg.Path)
-	base := h2mux.NewDialer(url, d.tlsConfig, d.smuxConfig, d.fingerprint, firstNonEmpty(d.connectAddr, addr), d.guard)
-	base.Headers = buildHeaders(cfg)
+	
+	// Generate a session ID for the connection
+	sessionID := generateSessionID()
+	
+	metaCfg := xhttpmeta.MetadataConfig{
+		Session: xhttpmeta.FieldConfig{Placement: xhttpmeta.Placement(cfg.SessionPlacement), Key: cfg.SessionKey},
+		Seq:     xhttpmeta.FieldConfig{Placement: xhttpmeta.Placement(cfg.SequencePlacement), Key: cfg.SequenceKey},
+		Mode:    xhttpmeta.FieldConfig{Placement: xhttpmeta.Placement(cfg.MetadataPlacement), Key: "X-Stealthlink-Mode"},
+	}
+	metaValues := xhttpmeta.MetadataValues{
+		SessionID: sessionID,
+		Seq:       1, // First request
+		Mode:      string(cfg.Mode),
+	}
+
+	rawURL := "https://" + addr + cfg.Path
+	u, err := xhttpmeta.BuildURL(rawURL, metaCfg, metaValues)
+	if err != nil {
+		u = rawURL
+	}
+
+	base := h2mux.NewDialer(u, d.tlsConfig, d.smuxConfig, d.fingerprint, firstNonEmpty(d.connectAddr, addr), d.guard)
+	base.Headers = buildHeaders(cfg, metaCfg, metaValues)
+	base.Cookies = buildCookies(cfg, metaCfg, metaValues)
 	base.ProxyDial = d.proxyDial
-	return base.Dial(ctx, addr)
+	
+	// We use a context that won't be cancelled when the dial timeout expires
+	// for the persistent HTTP/2 session.
+	sessionCtx := context.WithoutCancel(ctx)
+	return base.Dial(sessionCtx, addr)
+}
+
+func generateSessionID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // SetProxyDial sets a custom TCP dial function (for upstream proxy/fronting shaping).
@@ -137,14 +216,16 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (transport.Session, erro
 		return d.xmuxDialer.Dial(ctx, addr)
 	}
 
-	cfg := d.config
-	cfg.ApplyDefaults()
-
-	url := buildURL(addr, cfg.Path)
-	base := h2mux.NewDialer(url, d.tlsConfig, d.smuxConfig, d.fingerprint, firstNonEmpty(d.connectAddr, addr), d.guard)
-	base.Headers = buildHeaders(cfg)
-	base.ProxyDial = d.proxyDial
-	return base.Dial(ctx, addr)
+	bd := &baseDialer{
+		tlsConfig:   d.tlsConfig,
+		smuxConfig:  d.smuxConfig,
+		fingerprint: d.fingerprint,
+		connectAddr: d.connectAddr,
+		guard:       d.guard,
+		config:      d.config,
+		proxyDial:   d.proxyDial,
+	}
+	return bd.Dial(ctx, addr)
 }
 
 // Stats returns XMux statistics if XMux is enabled.
@@ -167,10 +248,16 @@ func Listen(addr string, config Config, tlsConfig *tls.Config, smuxCfg *smux.Con
 		padMin, padMax = config.XPadding.Min, config.XPadding.Max
 	}
 
-	return h2mux.Listen(addr, config.Path, tlsConfig, smuxCfg, guard, padMin, padMax)
+	metaCfg := xhttpmeta.MetadataConfig{
+		Session: xhttpmeta.FieldConfig{Placement: xhttpmeta.Placement(config.SessionPlacement), Key: config.SessionKey},
+		Seq:     xhttpmeta.FieldConfig{Placement: xhttpmeta.Placement(config.SequencePlacement), Key: config.SequenceKey},
+		Mode:    xhttpmeta.FieldConfig{Placement: xhttpmeta.Placement(config.MetadataPlacement), Key: "X-Stealthlink-Mode"},
+	}
+
+	return h2mux.Listen(addr, config.Path, tlsConfig, smuxCfg, guard, padMin, padMax, metaCfg)
 }
 
-// GenerateRandomPath generates a random path token.
+// GenerateRandomPath generates a random path token using crypto/rand.
 func GenerateRandomPath(prefix string, length int) string {
 	if length <= 0 {
 		length = 8
@@ -180,40 +267,63 @@ func GenerateRandomPath(prefix string, length int) string {
 	}
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
-	seed := time.Now().UnixNano()
+	max := big.NewInt(int64(len(chars)))
 	for i := range b {
-		seed = seed*1664525 + 1013904223
-		if seed < 0 {
-			seed = -seed
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			n = big.NewInt(0)
 		}
-		b[i] = chars[seed%int64(len(chars))]
+		b[i] = chars[n.Int64()]
 	}
 	return strings.TrimSuffix(prefix, "/") + "/" + string(b)
 }
 
-func buildHeaders(cfg Config) map[string]string {
-	headers := make(map[string]string, len(cfg.Headers)+5)
+func buildHeaders(cfg Config, metaCfg xhttpmeta.MetadataConfig, values xhttpmeta.MetadataValues) map[string]string {
+	h := make(http.Header)
 	for k, v := range cfg.Headers {
-		headers[k] = v
+		h.Set(k, v)
 	}
-	headers["X-XHTTP-Mode"] = string(cfg.Mode)
-	headers["X-XHTTP-Packet-Size"] = strconv.Itoa(cfg.PacketSize)
-	headers["X-XHTTP-KeepAlive"] = cfg.KeepAlive.String()
+	
+	// Apply metadata using xhttpmeta
+	req, _ := http.NewRequest(http.MethodPost, "http://dummy", nil)
+	_ = xhttpmeta.ApplyToRequest(req, metaCfg, values)
+	for k, v := range req.Header {
+		h[k] = v
+	}
+
+	// Internal metadata
+	h.Set("X-XHTTP-Packet-Size", strconv.Itoa(cfg.PacketSize) )
+	h.Set("X-XHTTP-KeepAlive", cfg.KeepAlive.String())
+	
 	if cfg.XPadding.Enabled {
-		headers[cfg.XPadding.GetHeaderName()] = cfg.XPadding.GetHeaderValue()
+		h.Set(cfg.XPadding.GetHeaderName(), cfg.XPadding.GetHeaderValue())
 	}
-	return headers
+
+	// Copy back to map
+	out := make(map[string]string)
+	for k, v := range h {
+		out[k] = v[0]
+	}
+	return out
 }
 
-func buildURL(addr, path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		path = "/_sl"
+func buildCookies(cfg Config, metaCfg xhttpmeta.MetadataConfig, values xhttpmeta.MetadataValues) []*http.Cookie {
+	req, _ := http.NewRequest(http.MethodPost, "http://dummy", nil)
+	_ = xhttpmeta.ApplyToRequest(req, metaCfg, values)
+	
+	cookies := req.Cookies()
+	
+	// If path or query contains pkt/ka, they are already in the URL
+	// If they should be in cookies, we'd need more logic in xhttpmeta
+	// For now, let's keep it simple as before for pkt/ka if placement is cookie
+	if cfg.MetadataPlacement == PlacementCookie {
+		cookies = append(cookies,
+			&http.Cookie{Name: "x-pkt", Value: strconv.Itoa(cfg.PacketSize)},
+			&http.Cookie{Name: "x-ka", Value: cfg.KeepAlive.String()},
+		)
 	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-	return "https://" + addr + path
+	
+	return cookies
 }
 
 func firstNonEmpty(values ...string) string {
@@ -232,5 +342,15 @@ func ValidateMode(mode string) error {
 		return nil
 	default:
 		return fmt.Errorf("unsupported xhttp mode: %s", mode)
+	}
+}
+
+// ValidatePlacement validates metadata placement values.
+func ValidatePlacement(placement string) error {
+	switch MetadataPlacement(strings.ToLower(strings.TrimSpace(placement))) {
+	case PlacementHeader, PlacementPath, PlacementQuery, PlacementCookie, "":
+		return nil
+	default:
+		return fmt.Errorf("unsupported metadata placement: %s", placement)
 	}
 }

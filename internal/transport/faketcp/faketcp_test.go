@@ -2,10 +2,15 @@ package faketcp
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
+	"syscall"
 	"testing"
 	"time"
+
+	"stealthlink/internal/transport/batch"
+	"stealthlink/internal/transport/transportutil"
 
 	"github.com/xtaci/smux"
 )
@@ -95,6 +100,29 @@ func TestFakeTCPDialListenDataFlow(t *testing.T) {
 	}
 }
 
+func TestIsTransientUDPBufferError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "enobufs", err: syscall.ENOBUFS, want: true},
+		{name: "enomem", err: syscall.ENOMEM, want: true},
+		{name: "string", err: errors.New("send failed: ENOBUFS"), want: true},
+		{name: "other", err: errors.New("permission denied"), want: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := transportutil.IsTransientBufferError(tc.err); got != tc.want {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFakeTCPHandleRSTClosesSession(t *testing.T) {
 	s := &fakeSession{
 		state:   StateEstablished,
@@ -113,6 +141,67 @@ func TestFakeTCPHandleRSTClosesSession(t *testing.T) {
 	buf := make([]byte, 16)
 	if _, err := s.Read(buf); err != io.EOF {
 		t.Fatalf("read error=%v want=%v", err, io.EOF)
+	}
+}
+
+func TestFakeTCPReorderBufferDrainsContiguous(t *testing.T) {
+	s := &fakeSession{
+		state:      StateEstablished,
+		readCh:     make(chan *packet, 256),
+		writeCh:    make(chan []byte, 256),
+		closeCh:    make(chan struct{}),
+		readyCh:    make(chan struct{}, 1),
+		reorderBuf: make(map[uint32]*packet),
+		config:     DefaultConfig(),
+		batchMgr:   batch.NewBatchIOManager(batch.BatchConfig{Enabled: false}),
+	}
+
+	// Simulate out-of-order: deliver seq 10 first, then seq 0
+	s.rcvNxt = 0
+	ooo := &packet{Type: PacketTypeData, Seq: 5, Payload: []byte("BBB")}
+	s.handleData(ooo) // Out of order — should be buffered
+
+	if len(s.reorderBuf) != 1 {
+		t.Fatalf("expected 1 buffered packet, got %d", len(s.reorderBuf))
+	}
+
+	// Now deliver the expected seq=0.
+	// sendPacket ACK errors are ignored by handleData, so no socket is required.
+	first := &packet{Type: PacketTypeData, Seq: 0, Payload: []byte("AAAAA")}
+	s.handleData(first)
+
+	// rcvNxt should advance past both packets: 0+5=5, then 5+3=8
+	if s.rcvNxt != 8 {
+		t.Fatalf("rcvNxt=%d want=8", s.rcvNxt)
+	}
+	if len(s.reorderBuf) != 0 {
+		t.Fatalf("reorderBuf should be empty, got %d entries", len(s.reorderBuf))
+	}
+}
+
+func TestEncodePacketContainsTCPOptions(t *testing.T) {
+	pkt := &packet{
+		Type:    PacketTypeData,
+		Seq:     100,
+		Ack:     50,
+		Payload: []byte("hello"),
+	}
+	data := encodePacket(pkt, FPProfileLinuxDefault)
+	if len(data) != HeaderSize+5 {
+		t.Fatalf("encoded length %d want %d", len(data), HeaderSize+5)
+	}
+	// Check MSS at offset 12-13
+	mss := uint16(data[12])<<8 | uint16(data[13])
+	if mss != 1460 {
+		t.Fatalf("MSS=%d want=1460", mss)
+	}
+	// Check window scale at offset 14
+	if data[14] != 7 {
+		t.Fatalf("window_scale=%d want=7", data[14])
+	}
+	// Check SACK permitted at offset 15
+	if data[15] != 1 {
+		t.Fatalf("sack_permitted=%d want=1", data[15])
 	}
 }
 
@@ -136,5 +225,39 @@ func TestFakeTCPDialTimeoutWithoutServer(t *testing.T) {
 	defer cancel()
 	if _, err := dialer.Dial(ctx, addr); err == nil {
 		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestBuildSessionCryptoDirectionalKeys(t *testing.T) {
+	cfg := &Config{
+		CryptoKey: "unit-test-secret",
+		AEADMode:  "chacha20poly1305",
+	}
+	clientCrypto, err := buildSessionCrypto(cfg, true)
+	if err != nil {
+		t.Fatalf("client crypto: %v", err)
+	}
+	serverCrypto, err := buildSessionCrypto(cfg, false)
+	if err != nil {
+		t.Fatalf("server crypto: %v", err)
+	}
+	if clientCrypto == nil || serverCrypto == nil {
+		t.Fatal("expected crypto contexts")
+	}
+
+	pkt := &packet{
+		Type:   PacketTypeData,
+		Seq:    123,
+		Ack:    99,
+		Window: 2048,
+	}
+	plain := []byte("payload")
+	cipherText := clientCrypto.send.Seal(plain, pkt)
+	got, err := serverCrypto.recv.Open(cipherText, pkt)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if string(got) != string(plain) {
+		t.Fatalf("got=%q want=%q", got, plain)
 	}
 }

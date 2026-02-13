@@ -1,0 +1,463 @@
+variables:
+  DOCKER_REGISTRY_URL: docker.io
+
+stages:
+  - test
+  - deploy
+  - container-build
+  - container-mirror
+  - binary_build
+  - release
+  - release_upload_binary
+
+variables:
+  DEBIAN_FRONTEND: noninteractive
+  DEBIAN_OLD_STABLE: bullseye
+  DEBIAN_STABLE: bookworm
+  REPRODUCIBLE_FLAGS: -trimpath -ldflags=-buildid=
+  # Don't fail pulling images if dependency_proxy.yml is not included
+  DOCKER_REGISTRY_URL: "docker.io"
+
+
+# set up apt for automated use
+.apt-template: &apt-template
+- export LC_ALL=C.UTF-8
+- export DEBIAN_FRONTEND=noninteractive
+- ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime
+- echo 'quiet "1";'
+       'APT::Install-Recommends "0";'
+       'APT::Install-Suggests "0";'
+       'APT::Acquire::Retries "20";'
+       'APT::Get::Assume-Yes "true";'
+       'Dpkg::Use-Pty "0";'
+      > /etc/apt/apt.conf.d/99gitlab
+- apt-get update
+- apt-get dist-upgrade
+
+
+# Set things up to use the OS-native packages for Go.  Anything that
+# is downloaded by go during the `go fmt` stage is not coming from the
+# Debian/Ubuntu repo. So those would need to be packaged for this to
+# make it into Debian and/or Ubuntu.
+.debian-native-template: &debian-native-template
+  variables:
+    GOPATH: /usr/share/gocode
+  before_script:
+    - apt-get update
+    - apt-get -qy install --no-install-recommends
+        build-essential
+        ca-certificates
+        git
+        golang
+        golang-github-cheekybits-genny-dev
+        golang-github-jtolds-gls-dev
+        golang-github-klauspost-reedsolomon-dev
+        golang-github-lucas-clemente-quic-go-dev
+        golang-github-smartystreets-assertions-dev
+        golang-github-smartystreets-goconvey-dev
+        golang-github-tjfoc-gmsm-dev
+        golang-github-xtaci-kcp-dev
+        golang-github-xtaci-smux-dev
+        golang-golang-x-crypto-dev
+        golang-golang-x-net-dev
+        golang-goptlib-dev
+        golang-golang-x-sys-dev
+        golang-golang-x-text-dev
+        golang-golang-x-xerrors-dev
+
+# use Go installed as part of the official, Debian-based Docker images
+.golang-docker-debian-template: &golang-docker-debian-template
+  before_script:
+    - apt-get update
+    - apt-get -qy install --no-install-recommends
+        ca-certificates
+        git
+
+.go-test: &go-test
+  - gofmt -d .
+  - test -z "$(go fmt ./...)"
+  - go vet ./...
+  - go test -v -race ./...
+
+  - cd $CI_PROJECT_DIR/client/
+  - go get
+  - go build $REPRODUCIBLE_FLAGS
+
+.test-template: &test-template
+  artifacts:
+    name: "${CI_PROJECT_PATH}_${CI_JOB_STAGE}_${CI_JOB_ID}_${CI_COMMIT_REF_NAME}_${CI_COMMIT_SHA}"
+    paths:
+      - client/*.aar
+      - client/*.jar
+      - client/client
+    expire_in: 1 week
+    when: on_success
+  after_script:
+    - echo "Download debug artifacts from https://gitlab.com/${CI_PROJECT_PATH}/-/jobs"
+    # this file changes every time but should not be cached
+    - rm -f $GRADLE_USER_HOME/caches/modules-2/modules-2.lock
+    - rm -rf $GRADLE_USER_HOME/caches/*/plugin-resolution/
+
+# -- jobs ------------------------------------------------------------
+
+android:
+  image: ${DOCKER_REGISTRY_URL}/golang:1.24-$DEBIAN_OLD_STABLE
+  variables:
+    ANDROID_HOME: /usr/lib/android-sdk
+    LANG: C.UTF-8
+  cache:
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+  <<: *test-template
+  before_script:
+    - *apt-template
+    - apt-get install
+        android-sdk-platform-23
+        android-sdk-platform-tools
+        build-essential
+        curl
+        default-jdk-headless
+        git
+        gnupg
+        unzip
+        wget
+        ca-certificates
+
+    - ndk=android-ndk-r21e-linux-x86_64.zip
+    - wget --continue --no-verbose https://dl.google.com/android/repository/$ndk
+    - echo "ad7ce5467e18d40050dc51b8e7affc3e635c85bd8c59be62de32352328ed467e  $ndk" > $ndk.sha256
+    - sha256sum -c $ndk.sha256
+    - unzip -q $ndk
+    - rm ${ndk}*
+    - mv android-ndk-* $ANDROID_HOME/ndk-bundle/
+
+    - chmod -R a+rX $ANDROID_HOME
+  script:
+    - *go-test
+    - export GRADLE_USER_HOME=$CI_PROJECT_DIR/.gradle
+    - go version
+    - go env
+
+    - go get golang.org/x/mobile/cmd/gomobile
+    - go get golang.org/x/mobile/cmd/gobind
+    - go install golang.org/x/mobile/cmd/gobind
+    - go install golang.org/x/mobile/cmd/gomobile
+    - gomobile init
+
+    - cd $CI_PROJECT_DIR/client
+    # gomobile builds a shared library not a CLI executable
+    - sed -i 's,^package main$,package snowflakeclient,' *.go
+    - go get golang.org/x/mobile/bind
+    - gomobile bind -v -target=android $REPRODUCIBLE_FLAGS .
+
+go-1.23:
+  image: ${DOCKER_REGISTRY_URL}/golang:1.23-$DEBIAN_STABLE
+  <<: *golang-docker-debian-template
+  <<: *test-template
+  script:
+    - *go-test
+
+go-1.24:
+  image: ${DOCKER_REGISTRY_URL}/golang:1.24-$DEBIAN_STABLE
+  <<: *golang-docker-debian-template
+  <<: *test-template
+  script:
+    - *go-test
+
+debian-testing:
+  image: containers.torproject.org/tpo/tpa/base-images/debian:testing
+  <<: *debian-native-template
+  <<: *test-template
+  script:
+    - *go-test
+
+shadow-integration:
+  image: ${DOCKER_REGISTRY_URL}/golang:1.23-$DEBIAN_STABLE
+  variables:
+    SHADOW_VERSION: "27d0bcf2cf1c7f0d403b6ad3efd575e45ae93126"
+    TGEN_VERSION: "v1.1.2"
+  cache:
+    - key: sf-integration-shadow-$SHADOW_VERSION
+      paths:
+      - opt/shadow
+    - key: sf-integration-tgen-$TGEN_VERSION
+      paths:
+      - opt/tgen
+  artifacts:
+    paths:
+      - shadow.data.tar.gz
+    when: on_failure
+  tags:
+    - amd64
+    - tpa
+  script:
+    - apt-get update
+    - apt-get install -y git tor libglib2.0-0 libigraph3
+    - mkdir -p ~/.local/bin
+    - mkdir -p ~/.local/src
+    - export PATH=$PATH:$CI_PROJECT_DIR/opt/shadow/bin/:$CI_PROJECT_DIR/opt/tgen/bin/
+
+    # Install shadow and tgen
+    - pushd ~/.local/src
+    - |
+      if [ ! -f $CI_PROJECT_DIR/opt/shadow/bin/shadow ]
+      then
+        echo "The required version of shadow was not cached, building from source"
+        git clone --shallow-since=2021-08-01 https://github.com/shadow/shadow.git
+        pushd shadow/
+        git checkout $SHADOW_VERSION
+        CONTAINER=debian:stable-slim ci/container_scripts/install_deps.sh
+        CC=gcc CONTAINER=debian:stable-slim ci/container_scripts/install_extra_deps.sh
+        export PATH="$HOME/.cargo/bin:${PATH}"
+        ./setup build --jobs $(nproc) --prefix $CI_PROJECT_DIR/opt/shadow
+        ./setup install
+        popd
+      fi
+    - |
+      if [ ! -f $CI_PROJECT_DIR/opt/tgen/bin/tgen ]
+      then
+        echo "The required version of tgen was not cached, building from source"
+        git clone --branch $TGEN_VERSION --depth 1 https://github.com/shadow/tgen.git
+        pushd tgen/
+        apt-get install -y cmake libglib2.0-dev libigraph-dev
+        mkdir build && cd build
+        cmake .. -DCMAKE_INSTALL_PREFIX=$CI_PROJECT_DIR/opt/tgen
+        make
+        make install
+        popd
+      fi
+      install $CI_PROJECT_DIR/opt/tgen/bin/tgen ~/.local/bin/tgen
+    - popd
+
+    # Apply snowflake patch(es)
+    - |
+      git clone --depth 1 https://github.com/cohosh/shadow-snowflake-minimal
+      git am -3 shadow-snowflake-minimal/*.patch
+
+    # Install snowflake binaries to .local folder
+    - |
+      for app in "proxy" "client" "server" "broker" "probetest"; do
+        pushd $app
+        go build
+        install $app ~/.local/bin/snowflake-$app
+        popd
+      done
+
+    # Install stun server
+    - GOBIN=~/.local/bin go install github.com/gortc/stund@latest
+
+    # Run a minimal snowflake shadow experiment
+    - pushd shadow-snowflake-minimal/
+    - shadow --log-level=debug --model-unblocked-syscall-latency=true snowflake-minimal.yaml > shadow.log
+
+    # Check to make sure streams succeeded
+    - |
+      if [ $(grep -c "stream-success" shadow.data/hosts/snowflakeclient/tgen.*.stdout) = 10 ]
+      then
+        echo "All streams in shadow completed successfully"
+      else
+        echo "Shadow simulation failed"
+        exit 1
+      fi
+  after_script:
+    - tar -czvf $CI_PROJECT_DIR/shadow.data.tar.gz shadow-snowflake-minimal/shadow.data/ shadow-snowflake-minimal/shadow.log
+
+generate_tarball:
+  stage: deploy
+  image: ${DOCKER_REGISTRY_URL}/golang:1.22-$DEBIAN_STABLE
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - go mod vendor
+    - tar czf ${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar.gz --transform "s,^,${CI_PROJECT_NAME}-${CI_COMMIT_TAG}/," *
+  after_script:
+    - echo TAR_JOB_ID=$CI_JOB_ID >> generate_tarball.env
+  artifacts:
+    paths:
+      - ${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar.gz
+    reports:
+      dotenv: generate_tarball.env
+
+release-job:
+  stage: deploy
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs:
+    - job: generate_tarball
+      artifacts: true
+  script:
+    - echo "running release_job"
+  release:
+    name: 'Release $CI_COMMIT_TAG'
+    description: 'Created using the release-cli'
+    tag_name: '$CI_COMMIT_TAG'
+    ref: '$CI_COMMIT_TAG'
+    assets:
+      links:
+        - name: '${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar.gz'
+          url: '${CI_PROJECT_URL}/-/jobs/${TAR_JOB_ID}/artifacts/file/${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar.gz'
+
+# Build the container only if the commit is to main, or it is a tag.
+# If the commit is to main, then the docker image tag should be set to `nightly`.
+# If it is a tag, then the docker image tag should be set to the tag name.
+build-container:
+  variables:
+    TAG: $CI_COMMIT_TAG # Will not be set on a non-tag build, will be set later 
+  stage: container-build
+  parallel:
+    matrix:
+      - ARCH: amd64
+      - ARCH: arm64
+  tags:
+    - $ARCH
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - if [ $CI_COMMIT_REF_NAME == "main" ]; then export TAG='nightly'; fi
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${CI_REGISTRY_IMAGE}:${TAG}_${ARCH}"
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "main"
+    - if: $CI_COMMIT_TAG
+
+merge-manifests:
+  variables:
+    TAG: $CI_COMMIT_TAG
+  stage: container-build
+  needs:
+    - job: build-container
+      artifacts: false
+  image:
+      name: ${DOCKER_REGISTRY_URL}/mplatform/manifest-tool:alpine
+      entrypoint: [""]
+  script:
+    - if [ $CI_COMMIT_REF_NAME == "main" ]; then export TAG='nightly'; fi
+    - >-
+      manifest-tool
+      --username="${CI_REGISTRY_USER}"
+      --password="${CI_REGISTRY_PASSWORD}"
+      push from-args
+      --platforms linux/amd64,linux/arm64
+      --template "${CI_REGISTRY_IMAGE}:${TAG}_ARCH"
+      --target "${CI_REGISTRY_IMAGE}:${TAG}"
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "main"
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: always
+
+# If this is a tag, then we want to additionally tag the image as `latest`
+tag-container-release:
+  stage: container-build
+  needs:
+    - job: merge-manifests
+      artifacts: false
+  image: 
+      name: gcr.io/go-containerregistry/crane:debug
+      entrypoint: [""]
+  allow_failure: false
+  variables:
+    CI_REGISTRY: $CI_REGISTRY
+    IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+    RELEASE_TAG: $CI_REGISTRY_IMAGE:latest
+  script:
+    - echo "Tagging docker image with stable tag with crane"
+    - echo -n "$CI_JOB_TOKEN" | crane auth login $CI_REGISTRY -u gitlab-ci-token --password-stdin
+    - crane cp $IMAGE_TAG $RELEASE_TAG
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: always
+
+clean-image-tags:
+  stage: container-build
+  needs:
+    - job: merge-manifests
+      artifacts: false
+  image: containers.torproject.org/tpo/tpa/base-images/debian:bookworm
+  before_script:
+    - *apt-template
+    - apt-get install -y jq curl
+  script:
+    - "REGISTRY_ID=$(curl --silent --request GET --header \"JOB-TOKEN: ${CI_JOB_TOKEN}\" \"https://gitlab.torproject.org/api/v4/projects/${CI_PROJECT_ID}/registry/repositories\" | jq '.[].id')"
+    - "curl --request DELETE --data \"name_regex_delete=(latest|${CI_COMMIT_TAG})_.*\" --header \"JOB-TOKEN: ${CI_JOB_TOKEN}\" \"https://gitlab.torproject.org/api/v4/projects/${CI_PROJECT_ID}/registry/repositories/${REGISTRY_ID}/tags\""
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "main"
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: always
+      
+mirror-image-to-dockerhub:
+  stage: container-mirror
+  variables:
+    DOCKERHUB_MIRROR_REPOURL: $DOCKERHUB_MIRROR_REPOURL
+    DOCKERHUB_USERNAME: $DOCKERHUB_MIRROR_USERNAME
+    DOCKERHUB_PASSWORD: $DOCKERHUB_MIRROR_PASSWORD
+  image: 
+    name: gcr.io/go-containerregistry/crane:debug
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "main"
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: always
+  script:
+    - echo "$DOCKERHUB_PASSWORD" | crane auth login docker.io -u $DOCKERHUB_MIRROR_USERNAME --password-stdin
+    - crane cp -a containers.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake $DOCKERHUB_MIRROR_REPOURL
+
+binary_build_step:
+  stage: binary_build
+  image: ${DOCKER_REGISTRY_URL}/golang:1.24-$DEBIAN_STABLE
+  script:
+    - mkdir dist/
+    - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -buildid=" -o dist/client_linux_amd64 ./client
+    - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w -buildid=" -o dist/client_linux_arm64 ./client
+    - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -buildid=" -o dist/proxy_linux_amd64 ./proxy
+    - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w -buildid=" -o dist/proxy_linux_arm64 ./proxy
+  artifacts:
+    name: "${CI_PROJECT_PATH}_${CI_JOB_STAGE}_${CI_JOB_ID}_${CI_COMMIT_REF_NAME}_${CI_COMMIT_SHA}"
+    paths:
+      - dist/
+    expire_in: 1 week
+
+release_job:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  allow_failure: true
+  rules:
+    - if: "$CI_COMMIT_TAG"
+    - when: never
+  artifacts:
+    name: "${CI_PROJECT_PATH}_${CI_JOB_STAGE}_${CI_JOB_ID}_${CI_COMMIT_REF_NAME}_${CI_COMMIT_SHA}"
+    paths:
+      - dist/
+    expire_in: 1 week
+  script:
+    - echo "Generating a release"
+  release:
+    tag_name: '$CI_COMMIT_TAG'
+    description: '$CI_COMMIT_TAG'
+
+release_upload_binary_job:
+  stage: release_upload_binary
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  rules:
+    - if: "$CI_COMMIT_TAG"
+    - when: never
+  artifacts:
+    name: "${CI_PROJECT_PATH}_${CI_JOB_STAGE}_${CI_JOB_ID}_${CI_COMMIT_REF_NAME}_${CI_COMMIT_SHA}"
+    paths:
+      - dist/
+    expire_in: 1 week
+  script:
+    - echo "Uploading everything"
+    - glab auth login --hostname "$CI_SERVER_HOST" --job-token "$CI_JOB_TOKEN"
+    - glab release upload --use-package-registry "$CI_COMMIT_TAG" dist/client_linux_amd64
+    - glab release upload --use-package-registry "$CI_COMMIT_TAG" dist/client_linux_arm64
+    - glab release upload --use-package-registry "$CI_COMMIT_TAG" dist/proxy_linux_amd64
+    - glab release upload --use-package-registry "$CI_COMMIT_TAG" dist/proxy_linux_arm64

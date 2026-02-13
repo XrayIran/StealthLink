@@ -4,20 +4,35 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"stealthlink/internal/metrics"
 )
 
-// FECController manages Forward Error Correction settings
+// lossEvent tracks a packet loss event for the sliding window
+type lossEvent struct {
+	timestamp time.Time
+	lost      bool
+}
+
+// FECController manages Forward Error Correction settings with auto-tuning and parity skip
 type FECController struct {
 	dataShards   atomic.Int32
 	parityShards atomic.Int32
 	autoTune     atomic.Bool
 
-	// Statistics for auto-tuning
-	packetsTotal   atomic.Uint64
-	packetsLost    atomic.Uint64
-	packetsRecovered atomic.Uint64
+	paritySkipEnabled atomic.Bool
+	lastDataTime      atomic.Int64 // UnixNano
+	paritySkipped     atomic.Uint64
 
-	mu sync.RWMutex
+	// Auto-tuning state
+	mu             sync.Mutex
+	lossEvents     []lossEvent
+	lastAdjustTime time.Time
+	lastEvalTime   time.Time
+
+	// Current network metrics (fed from outside)
+	rttVar atomic.Int64 // Milliseconds
 }
 
 // NewFECController creates a new FEC controller
@@ -26,6 +41,11 @@ func NewFECController(dataShards, parityShards int, autoTune bool) *FECControlle
 	fc.dataShards.Store(int32(dataShards))
 	fc.parityShards.Store(int32(parityShards))
 	fc.autoTune.Store(autoTune)
+	fc.paritySkipEnabled.Store(true) // Default enabled per Requirement 15.4
+	fc.lastAdjustTime = time.Now()
+	fc.lastEvalTime = time.Now()
+
+	metrics.SetKCPFECShards(int64(dataShards), int64(parityShards))
 	return fc
 }
 
@@ -36,112 +56,169 @@ func (fc *FECController) GetShards() (dataShards, parityShards int) {
 
 // SetShards sets FEC shard configuration
 func (fc *FECController) SetShards(dataShards, parityShards int) {
-	fc.dataShards.Store(int32(dataShards))
-	fc.parityShards.Store(int32(parityShards))
+	if dataShards < 3 {
+		dataShards = 3
+	}
+	if dataShards > 20 {
+		dataShards = 20
+	}
+	if parityShards < 1 {
+		parityShards = 1
+	}
+	if parityShards > 10 {
+		parityShards = 10
+	}
+
+	oldD := fc.dataShards.Swap(int32(dataShards))
+	oldP := fc.parityShards.Swap(int32(parityShards))
+
+	if oldD != int32(dataShards) || oldP != int32(parityShards) {
+		metrics.IncKCPFECAutoTuneAdjustments()
+		metrics.SetKCPFECShards(int64(dataShards), int64(parityShards))
+	}
 }
 
-// IsAutoTune returns whether auto-tuning is enabled
-func (fc *FECController) IsAutoTune() bool {
-	return fc.autoTune.Load()
+// SetParitySkip enables/disables parity skip optimization
+func (fc *FECController) SetParitySkip(enabled bool) {
+	fc.paritySkipEnabled.Store(enabled)
 }
 
-// SetAutoTune enables/disables auto-tuning
-func (fc *FECController) SetAutoTune(enabled bool) {
-	fc.autoTune.Store(enabled)
+// RecordDataPacket updates the last data transmission time
+func (fc *FECController) RecordDataPacket() {
+	fc.lastDataTime.Store(time.Now().UnixNano())
+}
+
+// ShouldSkipParity returns true if parity should be skipped based on RTO
+func (fc *FECController) ShouldSkipParity(rto time.Duration) bool {
+	if !fc.paritySkipEnabled.Load() {
+		return false
+	}
+
+	lastUnixNano := fc.lastDataTime.Load()
+	if lastUnixNano == 0 {
+		return false
+	}
+
+	lastTime := time.Unix(0, lastUnixNano)
+
+	gap := time.Since(lastTime)
+	if gap > rto {
+		fc.paritySkipped.Add(1)
+		metrics.IncKCPFECParitySkipped()
+		return true
+	}
+	return false
 }
 
 // RecordPacket records packet statistics for auto-tuning
-func (fc *FECController) RecordPacket(lost, recovered bool) {
-	fc.packetsTotal.Add(1)
-	if lost {
-		fc.packetsLost.Add(1)
-		if recovered {
-			fc.packetsRecovered.Add(1)
-		}
-	}
+func (fc *FECController) RecordPacket(lost bool, rttVar time.Duration) {
+	fc.rttVar.Store(rttVar.Milliseconds())
 
-	// Auto-tune every 1000 packets
-	if fc.autoTune.Load() && fc.packetsTotal.Load()%1000 == 0 {
-		fc.autoTuneFEC()
-	}
-}
-
-// autoTuneFEC adjusts FEC parameters based on observed loss
-func (fc *FECController) autoTuneFEC() {
-	total := fc.packetsTotal.Load()
-	lost := fc.packetsLost.Load()
-	recovered := fc.packetsRecovered.Load()
-
-	if total == 0 {
+	if !fc.autoTune.Load() {
 		return
 	}
 
-	lossRate := float64(lost) / float64(total)
-	recoveryRate := float64(recovered) / float64(lost+1)
+	fc.mu.Lock()
+	now := time.Now()
+	fc.lossEvents = append(fc.lossEvents, lossEvent{
+		timestamp: now,
+		lost:      lost,
+	})
 
+	// Clean up events older than 60 seconds
+	cutoff := now.Add(-60 * time.Second)
+	idx := 0
+	for i, ev := range fc.lossEvents {
+		if ev.timestamp.After(cutoff) {
+			idx = i
+			break
+		}
+	}
+	if idx > 0 {
+		fc.lossEvents = fc.lossEvents[idx:]
+	}
+
+	// Re-evaluate every 10 seconds (Requirement 10.3)
+	if now.Sub(fc.lastEvalTime) >= 10*time.Second {
+		fc.lastEvalTime = now
+		fc.autoTuneFEC(now)
+	}
+	fc.mu.Unlock()
+}
+
+// autoTuneFEC adjusts FEC parameters based on observed loss
+// Must be called with fc.mu locked
+func (fc *FECController) autoTuneFEC(now time.Time) {
+	// Cooldown: 30 seconds (Requirement 10.11)
+	if now.Sub(fc.lastAdjustTime) < 30*time.Second {
+		return
+	}
+
+	if len(fc.lossEvents) < 100 {
+		// Not enough data yet
+		return
+	}
+
+	lost := 0
+	for _, ev := range fc.lossEvents {
+		if ev.lost {
+			lost++
+		}
+	}
+
+	lossRate := float64(lost) / float64(len(fc.lossEvents))
 	dataShards, parityShards := fc.GetShards()
 
-	// Adjust based on loss rate
-	switch {
-	case lossRate < 0.001:
-		// Very low loss - reduce FEC overhead
+	adjusted := false
+
+	// Hysteresis rules (Requirement 10.7, 10.8, 10.9)
+	if lossRate < 0.01 {
 		if parityShards > 1 {
 			parityShards--
+			adjusted = true
 		}
-	case lossRate < 0.01:
-		// Low loss - maintain current or slight reduction
-		if parityShards > dataShards/3 && parityShards > 2 {
-			parityShards = dataShards / 3
-		}
-	case lossRate < 0.05:
-		// Moderate loss - increase FEC
-		if parityShards < dataShards/2 {
-			parityShards = dataShards / 2
-		}
-	default:
-		// High loss - aggressive FEC
-		if parityShards < dataShards {
-			parityShards = dataShards
-		}
-	}
-
-	// Adjust based on recovery effectiveness
-	if recoveryRate < 0.5 && lossRate > 0.01 {
-		// FEC not recovering well, increase parity shards
-		if parityShards < dataShards {
+	} else if lossRate > 0.05 {
+		if parityShards < 10 {
 			parityShards++
+			adjusted = true
 		}
 	}
 
-	// Clamp values
-	if dataShards < 1 {
-		dataShards = 1
-	}
-	if parityShards < 0 {
-		parityShards = 0
-	}
-	if dataShards > 255 {
-		dataShards = 255
-	}
-	if parityShards > 255 {
-		parityShards = 255
+	// RTT variance rule (Requirement 10.10)
+	if fc.rttVar.Load() > 50 {
+		if dataShards < 20 {
+			dataShards++
+			adjusted = true
+		}
+	} else if lossRate < 0.01 && dataShards > 5 {
+		// Optimization: decrease data shards if network is stable to reduce computational overhead
+		// (Not explicitly in requirements but good practice)
+		// dataShards--
+		// adjusted = true
 	}
 
-	fc.SetShards(dataShards, parityShards)
+	if adjusted {
+		fc.SetShards(dataShards, parityShards)
+		fc.lastAdjustTime = now
+	}
 }
 
 // GetStats returns FEC statistics
 func (fc *FECController) GetStats() FECStats {
-	total := fc.packetsTotal.Load()
-	lost := fc.packetsLost.Load()
-	recovered := fc.packetsRecovered.Load()
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
 
-	var lossRate, recoveryRate float64
+	total := len(fc.lossEvents)
+	lost := 0
+	for _, ev := range fc.lossEvents {
+		if ev.lost {
+			lost++
+		}
+	}
+
+	var lossRate float64
 	if total > 0 {
 		lossRate = float64(lost) / float64(total)
-	}
-	if lost > 0 {
-		recoveryRate = float64(recovered) / float64(lost)
 	}
 
 	dataShards, parityShards := fc.GetShards()
@@ -151,61 +228,40 @@ func (fc *FECController) GetStats() FECStats {
 	}
 
 	return FECStats{
-		DataShards:     dataShards,
-		ParityShards:   parityShards,
-		TotalPackets:   total,
-		LostPackets:    lost,
-		RecoveredPackets: recovered,
-		LossRate:       lossRate,
-		RecoveryRate:   recoveryRate,
-		Overhead:       overhead,
-		EffectiveLoss:  lossRate * (1 - recoveryRate),
+		DataShards:    dataShards,
+		ParityShards:  parityShards,
+		TotalPackets:  uint64(total),
+		LostPackets:   uint64(lost),
+		LossRate:      lossRate,
+		Overhead:      overhead,
+		ParitySkipped: fc.paritySkipped.Load(),
 	}
 }
 
 // FECStats contains FEC statistics
 type FECStats struct {
-	DataShards       int
-	ParityShards     int
-	TotalPackets     uint64
-	LostPackets      uint64
-	RecoveredPackets uint64
-	LossRate         float64
-	RecoveryRate     float64
-	Overhead         float64
-	EffectiveLoss    float64
+	DataShards    int
+	ParityShards  int
+	TotalPackets  uint64
+	LostPackets   uint64
+	LossRate      float64
+	Overhead      float64
+	ParitySkipped uint64
 }
 
 // CalculateOptimalShards calculates optimal FEC parameters for a given loss rate
 func CalculateOptimalShards(targetLossRate float64, maxOverhead float64) (dataShards, parityShards int) {
-	// Start with default values
 	dataShards = 10
-
-	// Calculate required parity shards for target loss rate
-	// Using simplified Reed-Solomon model
-	// P(recovery) ≈ 1 - P(loss)^(parityShards+1)
-	// We want effective loss rate < targetLossRate
-
-	for parityShards = 1; parityShards <= dataShards; parityShards++ {
+	for parityShards = 1; parityShards <= 10; parityShards++ {
 		overhead := float64(parityShards) / float64(dataShards+parityShards)
 		if overhead > maxOverhead {
-			// Reduce data shards to maintain overhead constraint
-			dataShards = int(float64(parityShards) / maxOverhead) - parityShards
-			if dataShards < 1 {
-				dataShards = 1
-			}
+			break
 		}
-
-		// Calculate effective loss rate with current configuration
-		// Assuming independent losses with probability targetLossRate
 		effectiveLoss := math.Pow(targetLossRate, float64(parityShards+1))
-
 		if effectiveLoss < targetLossRate/10 {
-			// Good enough
 			break
 		}
 	}
-
 	return dataShards, parityShards
 }
 
@@ -230,19 +286,11 @@ func (sc *ShardCalculator) CalculateShardSize(payloadSize int) int {
 	if sc.dataShards == 0 {
 		return payloadSize
 	}
-
-	// Calculate raw shard size
-	shardSize := payloadSize / sc.dataShards
-	if payloadSize%sc.dataShards != 0 {
-		shardSize++
-	}
-
-	// Ensure shard size fits in MTU (accounting for headers)
+	shardSize := (payloadSize + sc.dataShards - 1) / sc.dataShards
 	maxShardSize := sc.mtu - 24 // KCP header overhead
 	if shardSize > maxShardSize {
 		shardSize = maxShardSize
 	}
-
 	return shardSize
 }
 
@@ -251,8 +299,7 @@ func (sc *ShardCalculator) CalculateTotalOverhead(payloadSize int) int {
 	if sc.dataShards == 0 {
 		return 0
 	}
-
 	shardSize := sc.CalculateShardSize(payloadSize)
 	totalShards := sc.dataShards + sc.parityShards
-	return shardSize * totalShards - payloadSize
+	return shardSize*totalShards - payloadSize
 }

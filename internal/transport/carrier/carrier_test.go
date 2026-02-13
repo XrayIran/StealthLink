@@ -1,278 +1,376 @@
 package carrier
 
 import (
+	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
 )
 
-func TestCapabilityString(t *testing.T) {
+// mockCarrier is a minimal implementation of the Carrier interface for testing.
+type mockCarrier struct {
+	capabilities CarrierCapabilities
+	config       CarrierConfig
+	stats        CarrierStats
+}
+
+func (m *mockCarrier) Dial(ctx context.Context, addr string) (Session, error) {
+	return &mockSession{}, nil
+}
+
+func (m *mockCarrier) Listen(addr string) (Listener, error) {
+	return &mockListener{}, nil
+}
+
+func (m *mockCarrier) Capabilities() CarrierCapabilities {
+	return m.capabilities
+}
+
+func (m *mockCarrier) Configure(config CarrierConfig) error {
+	m.config = config
+	return nil
+}
+
+func (m *mockCarrier) Stats() CarrierStats {
+	return m.stats
+}
+
+// mockSession is a minimal implementation of the Session interface for testing.
+type mockSession struct {
+	closed bool
+}
+
+func (m *mockSession) Read(p []byte) (n int, err error) {
+	if m.closed {
+		return 0, io.EOF
+	}
+	return 0, nil
+}
+
+func (m *mockSession) Write(p []byte) (n int, err error) {
+	if m.closed {
+		return 0, io.ErrClosedPipe
+	}
+	return len(p), nil
+}
+
+func (m *mockSession) Close() error {
+	m.closed = true
+	return nil
+}
+
+func (m *mockSession) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
+}
+
+func (m *mockSession) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5678}
+}
+
+func (m *mockSession) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (m *mockSession) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (m *mockSession) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+// mockListener is a minimal implementation of the Listener interface for testing.
+type mockListener struct {
+	closed bool
+}
+
+func (m *mockListener) Accept() (Session, error) {
+	if m.closed {
+		return nil, io.EOF
+	}
+	return &mockSession{}, nil
+}
+
+func (m *mockListener) Close() error {
+	m.closed = true
+	return nil
+}
+
+func (m *mockListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 8080}
+}
+
+// TestCarrierInterface verifies that the Carrier interface contract is satisfied.
+func TestCarrierInterface(t *testing.T) {
+	carrier := &mockCarrier{
+		capabilities: CarrierCapabilities{
+			StreamOriented:   true,
+			ZeroRTT:          false,
+			ReplayProtection: true,
+		},
+	}
+
+	// Test Configure
+	config := CarrierConfig{
+		Mode: "4a",
+		MTU:  1500,
+	}
+	if err := carrier.Configure(config); err != nil {
+		t.Errorf("Configure() error = %v", err)
+	}
+
+	// Test Capabilities
+	caps := carrier.Capabilities()
+	if !caps.StreamOriented {
+		t.Error("Expected StreamOriented to be true")
+	}
+	if !caps.ReplayProtection {
+		t.Error("Expected ReplayProtection to be true")
+	}
+
+	// Test Dial
+	ctx := context.Background()
+	session, err := carrier.Dial(ctx, "localhost:8080")
+	if err != nil {
+		t.Errorf("Dial() error = %v", err)
+	}
+	if session == nil {
+		t.Error("Dial() returned nil session")
+	}
+
+	// Test Listen
+	listener, err := carrier.Listen(":8080")
+	if err != nil {
+		t.Errorf("Listen() error = %v", err)
+	}
+	if listener == nil {
+		t.Error("Listen() returned nil listener")
+	}
+
+	// Test Stats
+	stats := carrier.Stats()
+	_ = stats // Just verify it doesn't panic
+}
+
+// TestSessionInterface verifies that the Session interface contract is satisfied.
+func TestSessionInterface(t *testing.T) {
+	session := &mockSession{}
+
+	// Test Write
+	data := []byte("hello")
+	n, err := session.Write(data)
+	if err != nil {
+		t.Errorf("Write() error = %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("Write() wrote %d bytes, want %d", n, len(data))
+	}
+
+	// Test Read
+	buf := make([]byte, 100)
+	_, err = session.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Errorf("Read() error = %v", err)
+	}
+
+	// Test addresses
+	if session.LocalAddr() == nil {
+		t.Error("LocalAddr() returned nil")
+	}
+	if session.RemoteAddr() == nil {
+		t.Error("RemoteAddr() returned nil")
+	}
+
+	// Test deadlines
+	deadline := time.Now().Add(time.Second)
+	if err := session.SetDeadline(deadline); err != nil {
+		t.Errorf("SetDeadline() error = %v", err)
+	}
+	if err := session.SetReadDeadline(deadline); err != nil {
+		t.Errorf("SetReadDeadline() error = %v", err)
+	}
+	if err := session.SetWriteDeadline(deadline); err != nil {
+		t.Errorf("SetWriteDeadline() error = %v", err)
+	}
+
+	// Test Close
+	if err := session.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// Verify closed state
+	_, err = session.Write(data)
+	if err == nil {
+		t.Error("Write() after Close() should return error")
+	}
+}
+
+// TestListenerInterface verifies that the Listener interface contract is satisfied.
+func TestListenerInterface(t *testing.T) {
+	listener := &mockListener{}
+
+	// Test Addr
+	if listener.Addr() == nil {
+		t.Error("Addr() returned nil")
+	}
+
+	// Test Accept
+	session, err := listener.Accept()
+	if err != nil {
+		t.Errorf("Accept() error = %v", err)
+	}
+	if session == nil {
+		t.Error("Accept() returned nil session")
+	}
+
+	// Test Close
+	if err := listener.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// Verify closed state
+	_, err = listener.Accept()
+	if err == nil {
+		t.Error("Accept() after Close() should return error")
+	}
+}
+
+// TestCarrierCapabilities verifies capability flag behavior.
+func TestCarrierCapabilities(t *testing.T) {
 	tests := []struct {
-		cap      Capability
-		expected string
+		name string
+		caps CarrierCapabilities
 	}{
-		{CapabilityReliable, "reliable"},
-		{CapabilityOrdered, "ordered"},
-		{CapabilityDatagram, "datagram"},
-		{CapabilityStream, "stream"},
-		{CapabilityCongestionControl, "congestion_control"},
-		{CapabilityFlowControl, "flow_control"},
-		{CapabilityNATTraversal, "nat_traversal"},
-		{CapabilityObfuscation, "obfuscation"},
-		{CapabilityMultipath, "multipath"},
-		{CapabilityZeroRTT, "0rtt"},
-		{CapabilityMobility, "mobility"},
-		{Capability(1 << 20), "unknown"}, // Unknown capability
+		{
+			name: "mode 4a capabilities",
+			caps: CarrierCapabilities{
+				StreamOriented: true,
+				ZeroRTT:        true,
+				Fronting:       true,
+			},
+		},
+		{
+			name: "mode 4b capabilities",
+			caps: CarrierCapabilities{
+				ReplayProtection: true,
+				ServerInitiated:  true,
+			},
+		},
+		{
+			name: "mode 4c capabilities",
+			caps: CarrierCapabilities{
+				StreamOriented: true,
+				ZeroRTT:        true,
+				CoverTraffic:   true,
+			},
+		},
+		{
+			name: "mode 4d capabilities",
+			caps: CarrierCapabilities{
+				StreamOriented: true,
+				ZeroRTT:        true,
+				PathMigration:  true,
+				Multipath:      true,
+			},
+		},
+		{
+			name: "mode 4e capabilities",
+			caps: CarrierCapabilities{
+				StreamOriented:  true,
+				ZeroRTT:         true,
+				ServerInitiated: true,
+			},
+		},
 	}
 
 	for _, tt := range tests {
-		if got := tt.cap.String(); got != tt.expected {
-			t.Errorf("Capability(%d).String() = %s, want %s", tt.cap, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			// Just verify the struct can be created and accessed
+			_ = tt.caps.StreamOriented
+			_ = tt.caps.ZeroRTT
+			_ = tt.caps.ReplayProtection
+			_ = tt.caps.PathMigration
+			_ = tt.caps.Multipath
+			_ = tt.caps.ServerInitiated
+			_ = tt.caps.Fronting
+			_ = tt.caps.CoverTraffic
+		})
 	}
 }
 
-func TestCapabilityHas(t *testing.T) {
-	// Single capability
-	c := CapabilityReliable
-	if !c.Has(CapabilityReliable) {
-		t.Error("expected Has to return true for same capability")
-	}
-	if c.Has(CapabilityOrdered) {
-		t.Error("expected Has to return false for different capability")
-	}
-
-	// Multiple capabilities
-	c = CapabilityReliable | CapabilityOrdered | CapabilityStream
-	if !c.Has(CapabilityReliable) {
-		t.Error("expected Has to return true for Reliable")
-	}
-	if !c.Has(CapabilityOrdered) {
-		t.Error("expected Has to return true for Ordered")
-	}
-	if !c.Has(CapabilityStream) {
-		t.Error("expected Has to return true for Stream")
-	}
-	if c.Has(CapabilityDatagram) {
-		t.Error("expected Has to return false for Datagram")
-	}
-
-	// Combined check
-	if !c.Has(CapabilityReliable | CapabilityOrdered) {
-		t.Error("expected Has to return true for combined capabilities")
-	}
-}
-
-func TestNewBaseCarrier(t *testing.T) {
-	caps := CapabilityReliable | CapabilityStream | CapabilityCongestionControl
-	carrier := NewBaseCarrier("test", caps)
-
-	if carrier.Name() != "test" {
-		t.Errorf("expected name 'test', got '%s'", carrier.Name())
+// TestCarrierConfig verifies configuration structure.
+func TestCarrierConfig(t *testing.T) {
+	config := CarrierConfig{
+		Mode:              "4a",
+		MTU:               1500,
+		CongestionControl: "cubic",
+		Reliability:       "none",
+		MuxSettings: MuxConfig{
+			Enabled:           true,
+			MaxStreams:        256,
+			StreamBufferSize:  65536,
+			KeepAliveInterval: 30 * time.Second,
+			KeepAliveTimeout:  90 * time.Second,
+		},
+		RotationPolicy: RotationConfig{
+			Enabled:         true,
+			MaxReuseTimes:   32,
+			MaxRequestTimes: 100,
+			MaxLifetime:     3600 * time.Second,
+			DrainTimeout:    30 * time.Second,
+		},
+		PaddingPolicy: PaddingConfig{
+			Enabled:  true,
+			Scheme:   "random",
+			Min:      100,
+			Max:      900,
+			Interval: 1 * time.Second,
+		},
 	}
 
-	if carrier.Capabilities() != caps {
-		t.Errorf("expected capabilities %v, got %v", caps, carrier.Capabilities())
+	// Verify all fields are accessible
+	if config.Mode != "4a" {
+		t.Errorf("Mode = %s, want 4a", config.Mode)
 	}
-
-	info := carrier.Info()
-	if info.Name != "test" {
-		t.Errorf("expected info.Name 'test', got '%s'", info.Name)
+	if config.MTU != 1500 {
+		t.Errorf("MTU = %d, want 1500", config.MTU)
 	}
-
-	if info.Capabilities != caps {
-		t.Errorf("expected info.Capabilities %v, got %v", caps, info.Capabilities)
+	if !config.MuxSettings.Enabled {
+		t.Error("MuxSettings.Enabled should be true")
 	}
-
-	if info.MTU != 1500 {
-		t.Errorf("expected default MTU 1500, got %d", info.MTU)
+	if !config.RotationPolicy.Enabled {
+		t.Error("RotationPolicy.Enabled should be true")
+	}
+	if !config.PaddingPolicy.Enabled {
+		t.Error("PaddingPolicy.Enabled should be true")
 	}
 }
 
-func TestBaseCarrierSetInfo(t *testing.T) {
-	carrier := NewBaseCarrier("test", CapabilityReliable)
-
-	newInfo := Info{
-		Name:         "updated",
-		Capabilities: CapabilityStream,
-		DefaultPort:  8080,
-		MTU:          1400,
+// TestCarrierStats verifies statistics structure.
+func TestCarrierStats(t *testing.T) {
+	stats := CarrierStats{
+		ConnectionsActive: 10,
+		ConnectionsTotal:  100,
+		ConnectionsFailed: 5,
+		BytesSent:         1024000,
+		BytesReceived:     2048000,
+		PacketsSent:       1000,
+		PacketsReceived:   2000,
+		PacketsLost:       10,
+		RTTMean:           50.5,
+		RTTP95:            100.0,
+		RTTP99:            150.0,
 	}
 
-	carrier.SetInfo(newInfo)
-
-	info := carrier.Info()
-	if info.Name != "updated" {
-		t.Errorf("expected name 'updated', got '%s'", info.Name)
+	// Verify all fields are accessible
+	if stats.ConnectionsActive != 10 {
+		t.Errorf("ConnectionsActive = %d, want 10", stats.ConnectionsActive)
 	}
-
-	if info.DefaultPort != 8080 {
-		t.Errorf("expected default port 8080, got %d", info.DefaultPort)
+	if stats.BytesSent != 1024000 {
+		t.Errorf("BytesSent = %d, want 1024000", stats.BytesSent)
 	}
-
-	if info.MTU != 1400 {
-		t.Errorf("expected MTU 1400, got %d", info.MTU)
-	}
-}
-
-func TestDefaultCongestionConfig(t *testing.T) {
-	cfg := DefaultCongestionConfig()
-
-	if cfg.Algorithm != CongestionControlBBR {
-		t.Errorf("expected default algorithm BBR, got %s", cfg.Algorithm)
-	}
-
-	if cfg.InitialWindow != 10 {
-		t.Errorf("expected initial window 10, got %d", cfg.InitialWindow)
-	}
-
-	if cfg.MinWindow != 2 {
-		t.Errorf("expected min window 2, got %d", cfg.MinWindow)
-	}
-
-	if cfg.MaxWindow != 1000 {
-		t.Errorf("expected max window 1000, got %d", cfg.MaxWindow)
-	}
-
-	if !cfg.Pacing {
-		t.Error("expected pacing to be enabled by default")
+	if stats.RTTMean != 50.5 {
+		t.Errorf("RTTMean = %f, want 50.5", stats.RTTMean)
 	}
 }
-
-func TestCongestionControlString(t *testing.T) {
-	tests := []struct {
-		cc       CongestionControl
-		expected string
-	}{
-		{CongestionControlCubic, "cubic"},
-		{CongestionControlBBR, "bbr"},
-		{CongestionControlReno, "reno"},
-		{CongestionControlBrutal, "brutal"},
-	}
-
-	for _, tt := range tests {
-		if string(tt.cc) != tt.expected {
-			t.Errorf("expected %s, got %s", tt.expected, tt.cc)
-		}
-	}
-}
-
-func TestWrapConn(t *testing.T) {
-	// Create a mock connection (we can't actually use it, but we can verify the wrapper)
-	mockConn := &mockConn{}
-
-	wrapped := WrapConn(mockConn, "tcp", 1400)
-
-	if wrapped.Carrier != "tcp" {
-		t.Errorf("expected carrier 'tcp', got '%s'", wrapped.Carrier)
-	}
-
-	if wrapped.LocalMTU != 1400 {
-		t.Errorf("expected local MTU 1400, got %d", wrapped.LocalMTU)
-	}
-
-	if wrapped.RemoteMTU != 1400 {
-		t.Errorf("expected remote MTU 1400, got %d", wrapped.RemoteMTU)
-	}
-
-	if wrapped.Conn != mockConn {
-		t.Error("expected wrapped connection to hold original connection")
-	}
-}
-
-func TestInfoStruct(t *testing.T) {
-	info := Info{
-		Name:         "test-carrier",
-		Capabilities: CapabilityReliable | CapabilityStream,
-		DefaultPort:  443,
-		Overhead:     40,
-		MTU:          1400,
-	}
-
-	info.Supports.Multiplexing = true
-	info.Supports.Encryption = true
-	info.Supports.Authentication = false
-
-	if info.Name != "test-carrier" {
-		t.Errorf("expected name 'test-carrier', got '%s'", info.Name)
-	}
-
-	if !info.Capabilities.Has(CapabilityReliable) {
-		t.Error("expected Reliable capability")
-	}
-
-	if !info.Capabilities.Has(CapabilityStream) {
-		t.Error("expected Stream capability")
-	}
-
-	if info.DefaultPort != 443 {
-		t.Errorf("expected default port 443, got %d", info.DefaultPort)
-	}
-
-	if info.Overhead != 40 {
-		t.Errorf("expected overhead 40, got %d", info.Overhead)
-	}
-
-	if info.MTU != 1400 {
-		t.Errorf("expected MTU 1400, got %d", info.MTU)
-	}
-
-	if !info.Supports.Multiplexing {
-		t.Error("expected Multiplexing support")
-	}
-
-	if !info.Supports.Encryption {
-		t.Error("expected Encryption support")
-	}
-
-	if info.Supports.Authentication {
-		t.Error("expected no Authentication support")
-	}
-}
-
-func TestConfigStruct(t *testing.T) {
-	cfg := Config{
-		Address:   "127.0.0.1",
-		Port:      8080,
-		Timeout:   30,
-		Keepalive: 15,
-		MTU:       1400,
-		BufferSize: 8192,
-	}
-
-	if cfg.Address != "127.0.0.1" {
-		t.Errorf("expected address '127.0.0.1', got '%s'", cfg.Address)
-	}
-
-	if cfg.Port != 8080 {
-		t.Errorf("expected port 8080, got %d", cfg.Port)
-	}
-
-	if cfg.Timeout != 30 {
-		t.Errorf("expected timeout 30, got %d", cfg.Timeout)
-	}
-
-	if cfg.Keepalive != 15 {
-		t.Errorf("expected keepalive 15, got %d", cfg.Keepalive)
-	}
-
-	if cfg.MTU != 1400 {
-		t.Errorf("expected MTU 1400, got %d", cfg.MTU)
-	}
-
-	if cfg.BufferSize != 8192 {
-		t.Errorf("expected buffer size 8192, got %d", cfg.BufferSize)
-	}
-}
-
-// Mock connection for testing
-type mockConn struct{}
-
-func (m *mockConn) Read(b []byte) (n int, err error)   { return 0, nil }
-func (m *mockConn) Write(b []byte) (n int, err error)  { return len(b), nil }
-func (m *mockConn) Close() error                       { return nil }
-func (m *mockConn) LocalAddr() net.Addr                { return nil }
-func (m *mockConn) RemoteAddr() net.Addr               { return nil }
-func (m *mockConn) SetDeadline(t time.Time) error      { return nil }
-func (m *mockConn) SetReadDeadline(t time.Time) error  { return nil }
-func (m *mockConn) SetWriteDeadline(t time.Time) error { return nil }

@@ -1,19 +1,42 @@
 package behavior
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 
 	"stealthlink/internal/config"
 	"stealthlink/internal/crypto/pqsig"
+)
+
+const (
+	realityVersion = 0x01
+	shortIDLength  = 8
+	authKeyLength  = 16
+	maxHandshakeMs = 30000
+)
+
+type realityState int
+
+const (
+	realityStateInitial realityState = iota
+	realityStateClientHello
+	realityStateServerHello
+	realityStateEstablished
 )
 
 // RealityOverlay ports XTLS REALITY behaviors as a UQSP overlay.
@@ -28,6 +51,10 @@ type RealityOverlay struct {
 	SpiderX         string
 	Show            bool
 
+	// ShortID authentication
+	shortIDKeys map[string][]byte
+	authKeys    map[string]cipher.AEAD
+
 	// Post-quantum signature support (ML-DSA-65)
 	PQSigEnabled bool
 	PQPrivateKey []byte
@@ -36,9 +63,8 @@ type RealityOverlay struct {
 	pqVerifier   *pqsig.MLDSA65Verifier
 }
 
-// NewRealityOverlay creates a new REALITY overlay from config
 func NewRealityOverlay(cfg config.RealityBehaviorConfig) *RealityOverlay {
-	return &RealityOverlay{
+	o := &RealityOverlay{
 		EnabledField:    cfg.Enabled,
 		Dest:            cfg.Dest,
 		ServerNames:     cfg.ServerNames,
@@ -47,10 +73,78 @@ func NewRealityOverlay(cfg config.RealityBehaviorConfig) *RealityOverlay {
 		ShortIDs:        cfg.ShortIDs,
 		SpiderX:         cfg.SpiderX,
 		Show:            cfg.Show,
+		shortIDKeys:     make(map[string][]byte),
+		authKeys:        make(map[string]cipher.AEAD),
+	}
+
+	o.initShortIDKeys()
+	return o
+}
+
+func (o *RealityOverlay) initShortIDKeys() {
+	for _, sid := range o.ShortIDs {
+		if key, err := parseRealityKey(sid); err == nil && len(key) >= shortIDLength {
+			shortID := key[:shortIDLength]
+			authKey := o.deriveAuthKey(key)
+			o.shortIDKeys[string(shortID)] = authKey
+
+			if block, err := aes.NewCipher(authKey); err == nil {
+				if gcm, err := cipher.NewGCM(block); err == nil {
+					o.authKeys[string(shortID)] = gcm
+				}
+			}
+		}
 	}
 }
 
-// EnablePQSignatures enables post-quantum signatures with ML-DSA-65
+func (o *RealityOverlay) deriveAuthKey(key []byte) []byte {
+	salt := []byte("stealthlink-reality-auth-v1")
+	authKey := make([]byte, authKeyLength)
+	r := hkdf.New(sha256.New, key, salt, nil)
+	if _, err := io.ReadFull(r, authKey); err != nil {
+		fallback := sha256.Sum256(append(salt, key...))
+		copy(authKey, fallback[:authKeyLength])
+	}
+	return authKey
+}
+
+func (o *RealityOverlay) generateShortID() ([]byte, error) {
+	sid := make([]byte, shortIDLength)
+	if _, err := rand.Read(sid); err != nil {
+		return nil, err
+	}
+	return sid, nil
+}
+
+func (o *RealityOverlay) validateShortID(shortID []byte, authData []byte) bool {
+	if len(shortID) != shortIDLength {
+		return false
+	}
+
+	_, exists := o.shortIDKeys[string(shortID)]
+	if !exists {
+		return false
+	}
+
+	gcm := o.authKeys[string(shortID)]
+	if gcm == nil {
+		// No AEAD configured for this ShortID — accept if ShortID matches
+		return true
+	}
+
+	// authData must be at least nonce + tag
+	nonceSize := gcm.NonceSize()
+	overhead := gcm.Overhead()
+	if len(authData) < nonceSize+overhead {
+		return false
+	}
+
+	nonce := authData[:nonceSize]
+	ciphertext := authData[nonceSize:]
+	_, err := gcm.Open(nil, nonce, ciphertext, shortID)
+	return err == nil
+}
+
 func (o *RealityOverlay) EnablePQSignatures(privateKey []byte) error {
 	if len(privateKey) == 0 {
 		return fmt.Errorf("private key is required for PQ signatures")
@@ -133,11 +227,15 @@ func (o *RealityOverlay) deriveEd25519PublicKey() ed25519.PublicKey {
 	if err != nil {
 		return nil
 	}
-	material := append([]byte("stealthlink-reality-ed25519:"), privKey...)
-	seed := [32]byte{}
-	copy(seed[:], material)
-	priv := ed25519.NewKeyFromSeed(seed[:])
-	return priv.Public().(ed25519.PublicKey)
+	x25519Public, err := curve25519.X25519(privKey, curve25519.Basepoint)
+	if err != nil {
+		return nil
+	}
+	pub, err := deriveRealityEd25519PublicKeyFromX25519Public(x25519Public)
+	if err != nil {
+		return nil
+	}
+	return pub
 }
 
 // deriveEd25519PrivateKey derives the Ed25519 private key from the X25519 private key
@@ -146,10 +244,11 @@ func (o *RealityOverlay) deriveEd25519PrivateKey() ed25519.PrivateKey {
 	if err != nil {
 		return nil
 	}
-	material := append([]byte("stealthlink-reality-ed25519:"), privKey...)
-	seed := [32]byte{}
-	copy(seed[:], material)
-	return ed25519.NewKeyFromSeed(seed[:])
+	key, err := deriveRealityEd25519PrivateKey(privKey)
+	if err != nil {
+		return nil
+	}
+	return key
 }
 
 // Name returns "reality"
@@ -189,17 +288,6 @@ func (o *RealityOverlay) Apply(conn net.Conn) (net.Conn, error) {
 	return wrapper, nil
 }
 
-// realityState represents the REALITY handshake state
-type realityState int
-
-const (
-	realityStateInitial realityState = iota
-	realityStateClientHello
-	realityStateServerHello
-	realityStateEstablished
-)
-
-// realityConn wraps a connection with REALITY behavior
 type realityConn struct {
 	net.Conn
 	dest            string
@@ -213,6 +301,7 @@ type realityConn struct {
 	state           realityState
 	sharedKey       []byte
 	serverPublic    []byte
+	clientPublic    []byte
 }
 
 // clientHandshake performs the REALITY client handshake
@@ -232,6 +321,7 @@ func (c *realityConn) clientHandshake() error {
 	if err != nil {
 		return fmt.Errorf("generate client key: %w", err)
 	}
+	c.clientPublic = clientPublic
 
 	// Build ClientHello
 	clientHello, err := c.buildClientHello(clientPublic)
@@ -320,7 +410,7 @@ func (c *realityConn) processServerHello(data []byte, clientPrivate []byte) erro
 		if len(expectedServerPublic) != 32 {
 			return fmt.Errorf("invalid server public key length: %d", len(expectedServerPublic))
 		}
-		if !equalBytes(c.serverPublic, expectedServerPublic) {
+		if subtle.ConstantTimeCompare(c.serverPublic, expectedServerPublic) != 1 {
 			return fmt.Errorf("server public key mismatch")
 		}
 	}
@@ -345,8 +435,17 @@ func (c *realityConn) processServerHello(data []byte, clientPrivate []byte) erro
 	}
 	c.sharedKey = sharedKey
 
-	// Verify signature
-	sigData := append(c.serverPublic, c.serverPublic...) // Simplified
+	// Verify signature over handshake transcript:
+	// sigData = serverPublic || clientPublic || timestamp_bytes
+	var sigData []byte
+	sigData = append(sigData, c.serverPublic...)
+	if len(c.clientPublic) > 0 {
+		sigData = append(sigData, c.clientPublic...)
+	}
+	var tsBuf [8]byte
+	binary.BigEndian.PutUint64(tsBuf[:], timestamp)
+	sigData = append(sigData, tsBuf[:]...)
+
 	if !ed25519.Verify(c.deriveServerPublicKey(), sigData, signature) {
 		return fmt.Errorf("signature verification failed")
 	}
@@ -379,10 +478,10 @@ func (c *realityConn) sendHandshakeMessage(msg []byte) error {
 	length := make([]byte, 2)
 	binary.BigEndian.PutUint16(length, uint16(len(msg)))
 
-	if _, err := c.Conn.Write(length); err != nil {
+	if _, err := writeAll(c.Conn, length); err != nil {
 		return err
 	}
-	_, err := c.Conn.Write(msg)
+	_, err := writeAll(c.Conn, msg)
 	return err
 }
 
@@ -392,7 +491,7 @@ func (c *realityConn) receiveHandshakeMessage() ([]byte, error) {
 	defer c.Conn.SetReadDeadline(time.Time{})
 
 	lengthBuf := make([]byte, 2)
-	if _, err := c.Conn.Read(lengthBuf); err != nil {
+	if _, err := io.ReadFull(c.Conn, lengthBuf); err != nil {
 		return nil, err
 	}
 
@@ -402,7 +501,7 @@ func (c *realityConn) receiveHandshakeMessage() ([]byte, error) {
 	}
 
 	msg := make([]byte, length)
-	if _, err := c.Conn.Read(msg); err != nil {
+	if _, err := io.ReadFull(c.Conn, msg); err != nil {
 		return nil, err
 	}
 
@@ -413,10 +512,17 @@ func (c *realityConn) receiveHandshakeMessage() ([]byte, error) {
 func parseRealityKey(key string) ([]byte, error) {
 	key = strings.TrimSpace(key)
 
-	// Try base64 first
-	if decoded, err := base64.StdEncoding.DecodeString(key); err == nil {
-		if len(decoded) == 32 {
-			return decoded, nil
+	// Try common base64 encodings first.
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := enc.DecodeString(key); err == nil {
+			if len(decoded) == 32 {
+				return decoded, nil
+			}
 		}
 	}
 
@@ -470,7 +576,7 @@ func (c *RealityServerConn) ServerHandshake() error {
 	}
 
 	// Build and send ServerHello
-	serverHello, err := c.buildServerHello(serverPublic)
+	serverHello, err := c.buildServerHello(serverPublic, clientPublic)
 	if err != nil {
 		return fmt.Errorf("build server hello: %w", err)
 	}
@@ -539,7 +645,7 @@ func (c *RealityServerConn) processClientHello(data []byte) ([]byte, error) {
 }
 
 // buildServerHello builds the server hello response
-func (c *RealityServerConn) buildServerHello(serverPublic []byte) ([]byte, error) {
+func (c *RealityServerConn) buildServerHello(serverPublic, clientPublic []byte) ([]byte, error) {
 	msg := make([]byte, 1+32+64+8)
 	offset := 0
 
@@ -549,14 +655,23 @@ func (c *RealityServerConn) buildServerHello(serverPublic []byte) ([]byte, error
 	copy(msg[offset:], serverPublic)
 	offset += 32
 
-	// Sign the handshake
-	sigData := append(serverPublic, serverPublic...) // Simplified
+	// Sign handshake transcript: serverPublic || clientPublic || timestamp
+	timestamp := uint64(time.Now().Unix())
+	var sigData []byte
+	sigData = append(sigData, serverPublic...)
+	if len(clientPublic) > 0 {
+		sigData = append(sigData, clientPublic...)
+	}
+	var tsBuf [8]byte
+	binary.BigEndian.PutUint64(tsBuf[:], timestamp)
+	sigData = append(sigData, tsBuf[:]...)
+
 	privateKey := c.deriveEd25519PrivateKey()
 	sig := ed25519.Sign(privateKey, sigData)
 	copy(msg[offset:], sig)
 	offset += 64
 
-	binary.BigEndian.PutUint64(msg[offset:], uint64(time.Now().Unix()))
+	binary.BigEndian.PutUint64(msg[offset:], timestamp)
 
 	return msg, nil
 }
@@ -571,35 +686,34 @@ func (c *RealityServerConn) deriveEd25519PrivateKey() ed25519.PrivateKey {
 }
 
 func deriveRealityEd25519PrivateKey(privateKey []byte) (ed25519.PrivateKey, error) {
+	if len(privateKey) != 32 {
+		return nil, fmt.Errorf("invalid private key length: %d", len(privateKey))
+	}
 	// Bind signing identity to X25519 identity material so server/client derive
 	// consistent verification keys from the same REALITY private key.
 	x25519Public, err := curve25519.X25519(privateKey, curve25519.Basepoint)
 	if err != nil {
 		return nil, err
 	}
-	material := append([]byte("stealthlink-reality-ed25519:"), x25519Public...)
-	seed := [32]byte{}
-	copy(seed[:], material)
+	seed := realitySeedFromX25519Public(x25519Public)
 	return ed25519.NewKeyFromSeed(seed[:]), nil
 }
 
 func deriveRealityEd25519PublicKeyFromX25519Public(serverPublic []byte) (ed25519.PublicKey, error) {
-	material := append([]byte("stealthlink-reality-ed25519:"), serverPublic...)
-	seed := [32]byte{}
-	copy(seed[:], material)
+	if len(serverPublic) != 32 {
+		return nil, fmt.Errorf("invalid server public key length: %d", len(serverPublic))
+	}
+	seed := realitySeedFromX25519Public(serverPublic)
 	return ed25519.NewKeyFromSeed(seed[:]).Public().(ed25519.PublicKey), nil
 }
 
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+func realitySeedFromX25519Public(serverPublic []byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte("stealthlink-reality-ed25519-v2"))
+	h.Write(serverPublic)
+	var seed [32]byte
+	copy(seed[:], h.Sum(nil))
+	return seed
 }
 
 // sendHandshakeMessage sends a handshake message with length prefix
@@ -607,10 +721,10 @@ func (c *RealityServerConn) sendHandshakeMessage(msg []byte) error {
 	length := make([]byte, 2)
 	binary.BigEndian.PutUint16(length, uint16(len(msg)))
 
-	if _, err := c.Conn.Write(length); err != nil {
+	if _, err := writeAll(c.Conn, length); err != nil {
 		return err
 	}
-	_, err := c.Conn.Write(msg)
+	_, err := writeAll(c.Conn, msg)
 	return err
 }
 
@@ -620,7 +734,7 @@ func (c *RealityServerConn) receiveHandshakeMessage() ([]byte, error) {
 	defer c.Conn.SetReadDeadline(time.Time{})
 
 	lengthBuf := make([]byte, 2)
-	if _, err := c.Conn.Read(lengthBuf); err != nil {
+	if _, err := io.ReadFull(c.Conn, lengthBuf); err != nil {
 		return nil, err
 	}
 
@@ -630,7 +744,7 @@ func (c *RealityServerConn) receiveHandshakeMessage() ([]byte, error) {
 	}
 
 	msg := make([]byte, length)
-	if _, err := c.Conn.Read(msg); err != nil {
+	if _, err := io.ReadFull(c.Conn, msg); err != nil {
 		return nil, err
 	}
 
@@ -639,3 +753,18 @@ func (c *RealityServerConn) receiveHandshakeMessage() ([]byte, error) {
 
 // Ensure realityConn implements net.Conn
 var _ net.Conn = (*realityConn)(nil)
+
+func writeAll(conn net.Conn, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := conn.Write(buf[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
+}

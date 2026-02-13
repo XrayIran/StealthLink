@@ -3,7 +3,9 @@ package carrier
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"testing"
+	"time"
 
 	"golang.org/x/net/http2/hpack"
 )
@@ -102,5 +104,60 @@ func TestReadH2Frame(t *testing.T) {
 	}
 	if !bytes.Equal(gotPayload, payload) {
 		t.Fatalf("unexpected payload: %x", gotPayload)
+	}
+}
+
+func TestReadResponseHeaderBlockWithContinuation(t *testing.T) {
+	var b bytes.Buffer
+	enc := hpack.NewEncoder(&b)
+	if err := enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"}); err != nil {
+		t.Fatalf("encode status: %v", err)
+	}
+	if err := enc.WriteField(hpack.HeaderField{Name: "server", Value: "test"}); err != nil {
+		t.Fatalf("encode server: %v", err)
+	}
+	block := b.Bytes()
+	if len(block) < 2 {
+		t.Fatalf("unexpectedly short HPACK block")
+	}
+	split := len(block) / 2
+	first := block[:split]
+	second := block[split:]
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- writeH2Frame(server, 0x09, 0x04, 1, second) // CONTINUATION + END_HEADERS
+	}()
+
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	gotBlock, err := readResponseHeaderBlock(client, 1, first, 0x00)
+	if err != nil {
+		t.Fatalf("readResponseHeaderBlock: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("write continuation: %v", err)
+	}
+
+	status, err := decodeStatusFromHeaderBlock(gotBlock)
+	if err != nil {
+		t.Fatalf("decodeStatusFromHeaderBlock: %v", err)
+	}
+	if status != "200" {
+		t.Fatalf("unexpected status=%q", status)
+	}
+}
+
+func TestExtractDataPayloadPadded(t *testing.T) {
+	payload := []byte{2, 'a', 'b', 'c', 0, 0}
+	got, err := extractDataPayload(payload, 0x08) // PADDED
+	if err != nil {
+		t.Fatalf("extractDataPayload: %v", err)
+	}
+	if string(got) != "abc" {
+		t.Fatalf("unexpected data payload=%q", string(got))
 	}
 }

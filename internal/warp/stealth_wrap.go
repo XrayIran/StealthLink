@@ -78,7 +78,7 @@ func (d *WARPDialer) DialContext(ctx context.Context, network, addr string) (net
 		return d.underlying.DialContext(ctx, network, addr)
 	}
 
-	if d.wrap.mode == "vpn_only" {
+	if !ShouldRouteViaWARP(d.wrap.mode, addr, d.wrap.vpnSubnet) {
 		return d.underlying.DialContext(ctx, network, addr)
 	}
 

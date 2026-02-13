@@ -18,9 +18,13 @@ import (
 	"stealthlink/internal/config"
 	"stealthlink/internal/netutil"
 	"stealthlink/internal/tproxy"
+)
 
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/pcap"
+// Set via -ldflags at build time.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
 )
 
 func main() {
@@ -55,6 +59,8 @@ func main() {
 		cmdTProxy(args)
 	case "status":
 		cmdStatus(args)
+	case "live-stress":
+		cmdLiveStress(args)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
 		printUsage()
@@ -79,6 +85,7 @@ Commands:
   proxy-matrix        Plan/apply transparent proxy mode/backend policy
   tproxy <op> ...     Setup/Cleanup transparent proxy firewall rules
   status [addr]       Query runtime status from metrics endpoint
+  live-stress ...     Run deterministic stress harness (echo server/client)
   version             Show version information
 
 Examples:
@@ -94,6 +101,290 @@ Examples:
   stealthlink-tools proxy-matrix tproxy nftables 15001 1 --apply 10.0.0.0/8 192.168.0.0/16
   stealthlink-tools host-optimize --rollback=hostopt-1700000000
   stealthlink-tools tproxy setup 15001 1 auto`)
+}
+
+func cmdLiveStress(args []string) {
+	// Usage:
+	//   stealthlink-tools live-stress server --tcp <ip:port> --udp <ip:port>
+	//   stealthlink-tools live-stress client --tcp-target <ip:port> --udp-target <ip:port> --tcp-conns 1000 --duration 60s --payload-bytes 1024 --udp-packets 5000
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: stealthlink-tools live-stress <server|client> ...\n")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "server":
+		liveStressServer(args[1:])
+	case "client":
+		liveStressClient(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Usage: stealthlink-tools live-stress <server|client> ...\n")
+		os.Exit(1)
+	}
+}
+
+func liveStressServer(args []string) {
+	var tcpAddr, udpAddr string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--tcp":
+			if i+1 < len(args) {
+				i++
+				tcpAddr = args[i]
+			}
+		case "--udp":
+			if i+1 < len(args) {
+				i++
+				udpAddr = args[i]
+			}
+		default:
+		}
+	}
+	if tcpAddr == "" && udpAddr == "" {
+		fmt.Fprintf(os.Stderr, "Usage: stealthlink-tools live-stress server --tcp <ip:port> --udp <ip:port>\n")
+		os.Exit(1)
+	}
+
+	errCh := make(chan error, 2)
+	if tcpAddr != "" {
+		go func() { errCh <- runStressTCPServer(tcpAddr) }()
+	}
+	if udpAddr != "" {
+		go func() { errCh <- runStressUDPServer(udpAddr) }()
+	}
+
+	// Run until first fatal error (or until process is killed by orchestrator).
+	err := <-errCh
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "live-stress server failed: %v\n", err)
+		os.Exit(2)
+	}
+}
+
+func runStressTCPServer(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go func(conn net.Conn) {
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			buf := make([]byte, 64*1024)
+			n, rerr := conn.Read(buf)
+			if rerr != nil || n <= 0 {
+				return
+			}
+			_, _ = conn.Write(buf[:n])
+		}(c)
+	}
+}
+
+func runStressUDPServer(addr string) error {
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+	c, err := net.ListenUDP("udp", ua)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	buf := make([]byte, 64*1024)
+	for {
+		n, raddr, err := c.ReadFromUDP(buf)
+		if err != nil {
+			return err
+		}
+		_, _ = c.WriteToUDP(buf[:n], raddr)
+	}
+}
+
+type liveStressResult struct {
+	Mode         string  `json:"mode"`
+	TCPAttempted int64   `json:"tcp_attempted"`
+	TCPSucceeded int64   `json:"tcp_succeeded"`
+	TCPFailed    int64   `json:"tcp_failed"`
+	UDPAttempted int64   `json:"udp_attempted"`
+	UDPEchoed    int64   `json:"udp_echoed"`
+	UDPLost      int64   `json:"udp_lost"`
+	DurationSec  float64 `json:"duration_seconds"`
+}
+
+func liveStressClient(args []string) {
+	var tcpTarget, udpTarget string
+	tcpConns := 1000
+	payloadBytes := 1024
+	udpPackets := 5000
+	duration := 60 * time.Second
+	timeout := 10 * time.Second
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--tcp-target":
+			if i+1 < len(args) {
+				i++
+				tcpTarget = args[i]
+			}
+		case "--udp-target":
+			if i+1 < len(args) {
+				i++
+				udpTarget = args[i]
+			}
+		case "--tcp-conns":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil && v > 0 {
+					tcpConns = v
+				}
+			}
+		case "--payload-bytes":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil && v > 0 && v <= 64*1024 {
+					payloadBytes = v
+				}
+			}
+		case "--udp-packets":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil && v >= 0 {
+					udpPackets = v
+				}
+			}
+		case "--duration":
+			if i+1 < len(args) {
+				i++
+				if d, err := time.ParseDuration(args[i]); err == nil && d > 0 {
+					duration = d
+				}
+			}
+		case "--timeout":
+			if i+1 < len(args) {
+				i++
+				if d, err := time.ParseDuration(args[i]); err == nil && d > 0 {
+					timeout = d
+				}
+			}
+		default:
+		}
+	}
+
+	if tcpTarget == "" && udpTarget == "" {
+		fmt.Fprintf(os.Stderr, "Usage: stealthlink-tools live-stress client --tcp-target <ip:port> --udp-target <ip:port> [--tcp-conns N] [--duration 60s] [--payload-bytes 1024] [--udp-packets 5000]\n")
+		os.Exit(1)
+	}
+
+	start := time.Now()
+	deadline := start.Add(duration)
+
+	res := liveStressResult{Mode: "client"}
+
+	// TCP: dial N connections and keep them open until deadline (send 1 echo).
+	if tcpTarget != "" {
+		payload := make([]byte, payloadBytes)
+		if _, err := rand.Read(payload); err != nil {
+			// Best-effort; payload content doesn't matter.
+		}
+		type connOutcome struct{ ok bool }
+		outcomes := make(chan connOutcome, tcpConns)
+		for i := 0; i < tcpConns; i++ {
+			go func() {
+				res.TCPAttempted++
+				d := net.Dialer{Timeout: timeout}
+				c, err := d.Dial("tcp", tcpTarget)
+				if err != nil {
+					outcomes <- connOutcome{ok: false}
+					return
+				}
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(timeout))
+				if _, err := c.Write(payload); err != nil {
+					outcomes <- connOutcome{ok: false}
+					return
+				}
+				buf := make([]byte, len(payload))
+				if _, err := io.ReadFull(c, buf); err != nil {
+					outcomes <- connOutcome{ok: false}
+					return
+				}
+				outcomes <- connOutcome{ok: true}
+				// Hold connection open until deadline.
+				_ = c.SetDeadline(time.Time{})
+				for time.Now().Before(deadline) {
+					time.Sleep(250 * time.Millisecond)
+				}
+			}()
+		}
+		for i := 0; i < tcpConns; i++ {
+			o := <-outcomes
+			if o.ok {
+				res.TCPSucceeded++
+			} else {
+				res.TCPFailed++
+			}
+		}
+	}
+
+	// UDP: send packets and count echoes.
+	if udpTarget != "" && udpPackets > 0 {
+		raddr, err := net.ResolveUDPAddr("udp", udpTarget)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "udp target invalid: %v\n", err)
+			os.Exit(2)
+		}
+		c, err := net.ListenUDP("udp", nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "udp listen failed: %v\n", err)
+			os.Exit(2)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(duration + timeout))
+
+		payload := make([]byte, payloadBytes)
+		if len(payload) < 8 {
+			payload = make([]byte, 8)
+		}
+		for i := 0; i < udpPackets; i++ {
+			// First 8 bytes: seq
+			seq := uint64(i)
+			payload[0] = byte(seq >> 56)
+			payload[1] = byte(seq >> 48)
+			payload[2] = byte(seq >> 40)
+			payload[3] = byte(seq >> 32)
+			payload[4] = byte(seq >> 24)
+			payload[5] = byte(seq >> 16)
+			payload[6] = byte(seq >> 8)
+			payload[7] = byte(seq)
+			res.UDPAttempted++
+			_, _ = c.WriteToUDP(payload, raddr)
+		}
+
+		seen := make(map[uint64]struct{}, udpPackets)
+		buf := make([]byte, 64*1024)
+		for int64(len(seen)) < res.UDPAttempted {
+			n, _, err := c.ReadFromUDP(buf)
+			if err != nil {
+				break
+			}
+			if n < 8 {
+				continue
+			}
+			seq := (uint64(buf[0]) << 56) | (uint64(buf[1]) << 48) | (uint64(buf[2]) << 40) | (uint64(buf[3]) << 32) |
+				(uint64(buf[4]) << 24) | (uint64(buf[5]) << 16) | (uint64(buf[6]) << 8) | uint64(buf[7])
+			seen[seq] = struct{}{}
+			res.UDPEchoed = int64(len(seen))
+		}
+		res.UDPLost = res.UDPAttempted - res.UDPEchoed
+	}
+
+	res.DurationSec = time.Since(start).Seconds()
+	out, _ := json.MarshalIndent(res, "", "  ")
+	fmt.Println(string(out))
 }
 
 // cmdSecret generates a cryptographically secure random key
@@ -244,100 +535,20 @@ func cmdIface(args []string) {
 	fmt.Println()
 	fmt.Println("PCAP Devices:")
 	fmt.Println(strings.Repeat("-", 60))
-
-	devices, err := pcap.FindAllDevs()
-	if err != nil {
-		fmt.Printf("  (error listing pcap devices: %v)\n", err)
-		return
-	}
-
-	for _, dev := range devices {
-		fmt.Printf("\nName:        %s\n", dev.Name)
-		if dev.Description != "" {
-			fmt.Printf("Description: %s\n", dev.Description)
-		}
-		if len(dev.Addresses) > 0 {
-			fmt.Println("Addresses:")
-			for _, addr := range dev.Addresses {
-				fmt.Printf("             IP: %s", addr.IP)
-				if addr.Netmask != nil {
-					fmt.Printf("  Netmask: %s", addr.Netmask)
-				}
-				fmt.Println()
-			}
-		}
-	}
+	printPCAPDevices()
 }
 
 // cmdDump captures and dumps packets on an interface
 func cmdDump(args []string) {
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: stealthlink-tools dump <interface> [filter]\n")
-		fmt.Fprintf(os.Stderr, "\nUse 'stealthlink-tools iface' to list available interfaces.\n")
+	if err := runPCAPDump(args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
-	}
-
-	iface := args[0]
-	filter := ""
-	if len(args) > 1 {
-		filter = args[1]
-	}
-
-	// Open the device
-	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open interface %s: %v\n", iface, err)
-		os.Exit(1)
-	}
-	defer handle.Close()
-
-	// Set BPF filter if provided
-	if filter != "" {
-		if err := handle.SetBPFFilter(filter); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to set filter '%s': %v\n", filter, err)
-			os.Exit(1)
-		}
-		fmt.Printf("Capturing on %s with filter: %s\n", iface, filter)
-	} else {
-		fmt.Printf("Capturing on %s (press Ctrl+C to stop)...\n", iface)
-	}
-
-	// Capture packets
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	count := 0
-	start := time.Now()
-
-	for packet := range packetSource.Packets() {
-		count++
-		elapsed := time.Since(start)
-
-		// Print packet info
-		fmt.Printf("\n[%s] Packet #%d (%d bytes)\n", elapsed, count, len(packet.Data()))
-
-		// Print layers
-		for _, layer := range packet.Layers() {
-			fmt.Printf("  Layer: %s (%d bytes)\n", layer.LayerType(), len(layer.LayerContents()))
-		}
-
-		// Print summary
-		if netLayer := packet.NetworkLayer(); netLayer != nil {
-			fmt.Printf("  Network: %s -> %s\n", netLayer.NetworkFlow().Src(), netLayer.NetworkFlow().Dst())
-		}
-		if transportLayer := packet.TransportLayer(); transportLayer != nil {
-			fmt.Printf("  Transport: %s -> %s\n", transportLayer.TransportFlow().Src(), transportLayer.TransportFlow().Dst())
-		}
-
-		// Limit output
-		if count >= 100 {
-			fmt.Println("\n(Captured 100 packets, stopping...)")
-			break
-		}
 	}
 }
 
 // cmdVersion shows version information
 func cmdVersion() {
-	fmt.Println("Stealthlink Tools")
+	fmt.Printf("stealthlink-tools %s (commit=%s built=%s)\n", version, commit, buildTime)
 	fmt.Printf("Go Version: %s\n", runtime.Version())
 	fmt.Printf("OS/Arch:    %s/%s\n", runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("CPUs:       %d\n", runtime.NumCPU())

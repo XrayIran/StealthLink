@@ -5,10 +5,12 @@ package trusttunnel
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -87,13 +89,13 @@ type TrustTunnel struct {
 	quicConn   quic.Conn //nolint:unused
 
 	// Connection state
-	closed   atomic.Bool
-	closeCh  chan struct{}
+	closed  atomic.Bool
+	closeCh chan struct{}
 
 	// Streams
-	streams    map[uint32]*ttStream
-	streamID   atomic.Uint32
-	streamsMu  sync.RWMutex
+	streams   map[uint32]*ttStream
+	streamID  atomic.Uint32
+	streamsMu sync.RWMutex
 
 	// Statistics
 	bytesIn   atomic.Uint64
@@ -105,19 +107,52 @@ type TrustTunnel struct {
 type ttStream struct {
 	id      uint32
 	tunnel  *TrustTunnel
-	readCh  chan []byte
+	txCh    chan []byte
+	rxCh    chan []byte
 	closeCh chan struct{}
 	closed  atomic.Bool
 
-	// Read buffer for partial reads
+	// Read buffer for partial reads — guarded by readMu
+	readMu     sync.Mutex
 	readBuf    []byte
 	readOffset int
+
+	// Addresses captured from HTTP conn during stream init
+	localAddr  net.Addr
+	remoteAddr net.Addr
+
+	// Deadlines
+	readDeadline  atomic.Value // time.Time
+	writeDeadline atomic.Value // time.Time
 }
 
 // Dial connects to a TrustTunnel server
 func Dial(ctx context.Context, config *Config) (*TrustTunnel, error) {
 	if config == nil {
 		config = DefaultConfig()
+	} else {
+		// Normalize partial configs so callers can set only required fields.
+		if config.Version == "" {
+			config.Version = VersionMux
+		}
+		if config.UserAgent == "" {
+			config.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+		}
+		if config.RequestInterval <= 0 {
+			config.RequestInterval = 30 * time.Second
+		}
+		if config.MaxConcurrent <= 0 {
+			config.MaxConcurrent = 8
+		}
+		if config.StreamTimeout <= 0 {
+			config.StreamTimeout = 60 * time.Second
+		}
+		if config.PaddingMax < config.PaddingMin {
+			config.PaddingMax = config.PaddingMin
+		}
+		if config.Headers == nil {
+			config.Headers = make(map[string]string)
+		}
 	}
 
 	// Determine protocol version
@@ -127,10 +162,10 @@ func Dial(ctx context.Context, config *Config) (*TrustTunnel, error) {
 	}
 
 	t := &TrustTunnel{
-		config:    config,
-		version:   version,
-		closeCh:   make(chan struct{}),
-		streams:   make(map[uint32]*ttStream),
+		config:  config,
+		version: version,
+		closeCh: make(chan struct{}),
+		streams: make(map[uint32]*ttStream),
 	}
 
 	// Setup HTTP client based on version
@@ -176,22 +211,51 @@ func negotiateVersion(config *Config) ProtocolVersion {
 	return VersionH1
 }
 
-// probeH3 probes for HTTP/3 support
+// probeH3 probes for HTTP/3 support via QUIC ALPN handshake.
 func probeH3(host string) bool {
-	// Simplified: assume H3 if port is 443 and host looks modern
-	return strings.HasSuffix(host, ":443") || !strings.Contains(host, ":")
+	if !strings.Contains(host, ":") {
+		host = host + ":443"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, host, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}, nil)
+	if err != nil {
+		return false
+	}
+	_ = conn.CloseWithError(0, "probe")
+	return true
 }
 
-// probeH2 probes for HTTP/2 support
+// probeH2 probes for HTTP/2 support via TLS ALPN negotiation.
 func probeH2(serverURL string) bool {
-	return true // Assume H2 support
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return false
+	}
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host = host + ":443"
+	}
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", host, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2", "http/1.1"},
+	})
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	return conn.ConnectionState().NegotiatedProtocol == "h2"
 }
 
 // setupH1 configures HTTP/1.1 transport
 func (t *TrustTunnel) setupH1() error {
 	t.httpClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: t.config.TLSConfig,
+			TLSClientConfig:   t.config.TLSConfig,
 			ForceAttemptHTTP2: false,
 		},
 		Timeout: t.config.StreamTimeout,
@@ -199,10 +263,17 @@ func (t *TrustTunnel) setupH1() error {
 	return nil
 }
 
-// setupH2 configures HTTP/2 transport
+// setupH2 configures HTTP/2 transport with TLS session ticket support
 func (t *TrustTunnel) setupH2() error {
+	tlsCfg := t.config.TLSConfig
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{}
+	}
+	// Enable TLS session resumption via session tickets
+	tlsCfg.ClientSessionCache = tls.NewLRUClientSessionCache(32)
+
 	transport := &http.Transport{
-		TLSClientConfig: t.config.TLSConfig,
+		TLSClientConfig: tlsCfg,
 	}
 
 	if err := http2.ConfigureTransport(transport); err != nil {
@@ -210,22 +281,28 @@ func (t *TrustTunnel) setupH2() error {
 	}
 
 	t.httpClient = &http.Client{
-		Transport:     transport,
-		Timeout:       t.config.StreamTimeout,
+		Transport: transport,
+		Timeout:   t.config.StreamTimeout,
 	}
 	return nil
 }
 
-// setupH3 configures HTTP/3 transport
+// setupH3 configures HTTP/3 transport with session resumption
 func (t *TrustTunnel) setupH3() error {
-	// HTTP/3 requires QUIC
+	tlsCfg := t.config.TLSConfig
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{}
+	}
+	// Enable TLS session cache for QUIC 0-RTT resumption
+	tlsCfg.ClientSessionCache = tls.NewLRUClientSessionCache(32)
+
 	transport := &http3.Transport{
-		TLSClientConfig: t.config.TLSConfig,
+		TLSClientConfig: tlsCfg,
 	}
 
 	t.httpClient = &http.Client{
-		Transport:     transport,
-		Timeout:       t.config.StreamTimeout,
+		Transport: transport,
+		Timeout:   t.config.StreamTimeout,
 	}
 	return nil
 }
@@ -240,7 +317,8 @@ func (t *TrustTunnel) OpenStream() (net.Conn, error) {
 	stream := &ttStream{
 		id:      streamID,
 		tunnel:  t,
-		readCh:  make(chan []byte, 16),
+		txCh:    make(chan []byte, 64),
+		rxCh:    make(chan []byte, 64),
 		closeCh: make(chan struct{}),
 	}
 
@@ -312,6 +390,11 @@ func (t *TrustTunnel) initiateStream(stream *ttStream) {
 		return
 	}
 
+	// Capture addresses from the underlying HTTP connection for net.Conn interface
+	if u, parseErr := url.Parse(t.config.Server); parseErr == nil {
+		stream.remoteAddr = &net.TCPAddr{IP: net.ParseIP(u.Hostname())}
+	}
+
 	// Read response body and feed to stream
 	go t.readResponse(stream, resp.Body)
 }
@@ -328,17 +411,23 @@ func (t *TrustTunnel) getRequestBody(stream *ttStream) io.Reader {
 			select {
 			case <-stream.closeCh:
 				return
-			case data := <-stream.readCh:
-				// Add framing: [4-byte length][data]
-				lengthBuf := make([]byte, 4)
-				binary.BigEndian.PutUint32(lengthBuf, uint32(len(data)))
-				if _, err := pw.Write(lengthBuf); err != nil {
+			case data := <-stream.txCh:
+				// Framing: [type(1)][len(4)][pad_len(2)][data][padding]
+				padding := t.generatePadding()
+				frame := make([]byte, 1+4+2+len(data)+padding)
+				if len(data) == 0 {
+					frame[0] = 0x02 // DPD ping
+				} else {
+					frame[0] = 0x01 // Data frame
+				}
+				binary.BigEndian.PutUint32(frame[1:5], uint32(len(data)))
+				binary.BigEndian.PutUint16(frame[5:7], uint16(padding))
+				copy(frame[7:], data)
+				// Padding tail is zero-filled by make()
+				if _, err := pw.Write(frame); err != nil {
 					return
 				}
-				if _, err := pw.Write(data); err != nil {
-					return
-				}
-				t.bytesOut.Add(uint64(len(data) + 4))
+				t.bytesOut.Add(uint64(len(frame)))
 			}
 		}
 	}()
@@ -354,28 +443,56 @@ func (t *TrustTunnel) readResponse(stream *ttStream, body io.ReadCloser) {
 	reader := bufio.NewReader(body)
 
 	for {
-		// Read frame length
-		lengthBuf := make([]byte, 4)
-		if _, err := io.ReadFull(reader, lengthBuf); err != nil {
+		// Read frame header: [type(1)][len(4)][pad_len(2)]
+		header := make([]byte, 7)
+		if _, err := io.ReadFull(reader, header); err != nil {
 			return
 		}
 
-		length := binary.BigEndian.Uint32(lengthBuf)
+		frameType := header[0]
+		length := binary.BigEndian.Uint32(header[1:5])
+		padLen := int(binary.BigEndian.Uint16(header[5:7]))
+
+		// Reject excessively large frames to prevent memory exhaustion attacks.
+		const maxFrameSize = 16 << 20 // 16 MiB
+		if length > maxFrameSize || padLen > 65535 {
+			return
+		}
+
 		if length == 0 {
+			if frameType == 0x02 {
+				// DPD ping — respond with pong (empty data frame)
+				select {
+				case stream.txCh <- []byte{}:
+				default:
+				}
+			}
+			if padLen > 0 {
+				if _, err := io.CopyN(io.Discard, reader, int64(padLen)); err != nil {
+					return
+				}
+			}
 			continue
 		}
 
-		// Read data
 		data := make([]byte, length)
 		if _, err := io.ReadFull(reader, data); err != nil {
 			return
 		}
+		if padLen > 0 {
+			if _, err := io.CopyN(io.Discard, reader, int64(padLen)); err != nil {
+				return
+			}
+		}
 
-		t.bytesIn.Add(uint64(length + 4))
+		t.bytesIn.Add(uint64(length + 7 + uint32(padLen)))
 
-		// Send to stream
+		if frameType == 0x02 {
+			continue // DPD, don't deliver to application
+		}
+
 		select {
-		case stream.readCh <- data:
+		case stream.rxCh <- data:
 		case <-stream.closeCh:
 			return
 		}
@@ -385,9 +502,17 @@ func (t *TrustTunnel) readResponse(stream *ttStream, body io.ReadCloser) {
 // generatePadding generates random padding size
 func (t *TrustTunnel) generatePadding() int {
 	if t.config.PaddingMax <= t.config.PaddingMin {
-		return 0
+		if t.config.PaddingMin < 0 {
+			return 0
+		}
+		return t.config.PaddingMin
 	}
-	return t.config.PaddingMin + int(time.Now().UnixNano())%(t.config.PaddingMax-t.config.PaddingMin)
+	span := t.config.PaddingMax - t.config.PaddingMin + 1
+	r, err := rand.Int(rand.Reader, big.NewInt(int64(span)))
+	if err != nil {
+		return t.config.PaddingMin
+	}
+	return t.config.PaddingMin + int(r.Int64())
 }
 
 // keepaliveLoop sends periodic keepalives
@@ -418,19 +543,30 @@ func (t *TrustTunnel) sendKeepalive() {
 	for _, s := range streams {
 		// Send empty data as keepalive
 		select {
-		case s.readCh <- []byte{}:
+		case s.txCh <- []byte{}:
 		default:
 		}
 	}
 }
 
-// Close closes the TrustTunnel
+// Close closes the TrustTunnel and all active streams.
+// A brief drain period allows pending txCh data to be flushed before closing.
 func (t *TrustTunnel) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 
+	t.streamsMu.RLock()
+	for _, s := range t.streams {
+		s.drain(100 * time.Millisecond)
+	}
+	t.streamsMu.RUnlock()
+
 	close(t.closeCh)
+
+	if t.httpClient != nil {
+		t.httpClient.CloseIdleConnections()
+	}
 
 	t.streamsMu.Lock()
 	for _, s := range t.streams {
@@ -446,8 +582,11 @@ func (t *TrustTunnel) Close() error {
 
 func (s *ttStream) Read(p []byte) (n int, err error) {
 	if s.closed.Load() {
-		return 0, fmt.Errorf("stream closed")
+		return 0, io.EOF
 	}
+
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
 
 	// Check buffered data first
 	if s.readOffset < len(s.readBuf) {
@@ -460,16 +599,29 @@ func (s *ttStream) Read(p []byte) (n int, err error) {
 		return n, nil
 	}
 
+	// Build deadline channel if set
+	var deadlineCh <-chan time.Time
+	if dl, ok := s.readDeadline.Load().(time.Time); ok && !dl.IsZero() {
+		remaining := time.Until(dl)
+		if remaining <= 0 {
+			return 0, fmt.Errorf("read deadline exceeded")
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		deadlineCh = timer.C
+	}
+
 	// Read from channel
 	select {
-	case data := <-s.readCh:
+	case data := <-s.rxCh:
 		n = copy(p, data)
 		if n < len(data) {
-			// Buffer remaining
 			s.readBuf = data[n:]
 			s.readOffset = 0
 		}
 		return n, nil
+	case <-deadlineCh:
+		return 0, fmt.Errorf("read deadline exceeded")
 	case <-s.closeCh:
 		return 0, fmt.Errorf("stream closed")
 	}
@@ -484,11 +636,41 @@ func (s *ttStream) Write(p []byte) (n int, err error) {
 	data := make([]byte, len(p))
 	copy(data, p)
 
+	// Build deadline channel if set
+	var deadlineCh <-chan time.Time
+	if dl, ok := s.writeDeadline.Load().(time.Time); ok && !dl.IsZero() {
+		remaining := time.Until(dl)
+		if remaining <= 0 {
+			return 0, fmt.Errorf("write deadline exceeded")
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		deadlineCh = timer.C
+	}
+
 	select {
-	case s.readCh <- data:
+	case s.txCh <- data:
 		return len(p), nil
+	case <-deadlineCh:
+		return 0, fmt.Errorf("write deadline exceeded")
 	case <-s.closeCh:
 		return 0, fmt.Errorf("stream closed")
+	}
+}
+
+func (s *ttStream) drain(timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		if len(s.txCh) == 0 {
+			return
+		}
+		select {
+		case <-timer.C:
+			return
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 
@@ -506,12 +688,35 @@ func (s *ttStream) Close() error {
 	return nil
 }
 
-func (s *ttStream) LocalAddr() net.Addr  { return nil }
-func (s *ttStream) RemoteAddr() net.Addr { return nil }
+func (s *ttStream) LocalAddr() net.Addr {
+	if s.localAddr != nil {
+		return s.localAddr
+	}
+	return &net.TCPAddr{}
+}
 
-func (s *ttStream) SetDeadline(t time.Time) error      { return nil }
-func (s *ttStream) SetReadDeadline(t time.Time) error  { return nil }
-func (s *ttStream) SetWriteDeadline(t time.Time) error { return nil }
+func (s *ttStream) RemoteAddr() net.Addr {
+	if s.remoteAddr != nil {
+		return s.remoteAddr
+	}
+	return &net.TCPAddr{}
+}
+
+func (s *ttStream) SetDeadline(t time.Time) error {
+	s.readDeadline.Store(t)
+	s.writeDeadline.Store(t)
+	return nil
+}
+
+func (s *ttStream) SetReadDeadline(t time.Time) error {
+	s.readDeadline.Store(t)
+	return nil
+}
+
+func (s *ttStream) SetWriteDeadline(t time.Time) error {
+	s.writeDeadline.Store(t)
+	return nil
+}
 
 // GetStats returns tunnel statistics
 func (t *TrustTunnel) GetStats() TTStats {
@@ -520,11 +725,11 @@ func (t *TrustTunnel) GetStats() TTStats {
 	t.streamsMu.RUnlock()
 
 	return TTStats{
-		BytesIn:     t.bytesIn.Load(),
-		BytesOut:    t.bytesOut.Load(),
-		Streams:     uint64(streamCount),
+		BytesIn:      t.bytesIn.Load(),
+		BytesOut:     t.bytesOut.Load(),
+		Streams:      uint64(streamCount),
 		StreamsTotal: t.streamsIn.Load(),
-		Version:     string(t.version),
+		Version:      string(t.version),
 	}
 }
 

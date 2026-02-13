@@ -1,38 +1,57 @@
-# Protocol Bridge Decision (OpenConnect, ocserv, TrustTunnel)
+# Protocol Integration Decision (OpenConnect, ocserv, TrustTunnel)
 
-Date: 2026-02-06
-Status: Accepted
+Date: 2026-02-10  
+Status: **Completed & Canonical** (Supersedes 2026-02-06 sidecar decision)  
 Scope: `sources/openconnect`, `sources/ocserv`, `sources/TrustTunnel`
 
 ## Decision
 
-StealthLink will integrate OpenConnect/ocserv/TrustTunnel as **sidecar bridges**, not in-core stealth transports.
+StealthLink treats mode `4e` as **in-core canonical**.  
+TrustTunnel/CSTP/DTLS behavior is implemented in-core and wired through the unified UQSP runtime.
+
+External sidecars may still be used for interoperability experiments, but they are no longer the architecture default and must not redefine the primary runtime path.
+
+## Implementation Status (As of 2026-02-10)
+
+**All mode 4e components are now complete:**
+
+- ✅ **TrustTunnel Carrier**: Full HTTP/1.1 upgrade, HTTP/2 SETTINGS frames, HTTP/3 (QUIC-based) support in `internal/transport/uqsp/carrier/trusttunnel.go`
+- ✅ **TrustTunnel Race Condition Fix**: ttStream.Read now properly synchronized with readMu mutex
+- ✅ **TrustTunnel Session Resumption**: TLS session ticket support in setupH2() and setupH3()
+- ✅ **CSTP Behavior**: Complete CSTP framing and DPD keepalive in `internal/transport/uqsp/behavior/cstp.go`
+- ✅ **H2/H3 Probes**: Real ALPN negotiation with proper timeout handling
+- ✅ **Reverse Mode Integration**: HTTP-based reverse registration for CDN compatibility
+- ✅ **WARP Integration**: Full Noise IK handshake with HKDF+BLAKE2s key derivation
 
 ## Why
 
-- These are full protocol stacks with independent auth/session/state machines.
-- In-core integration would increase the attack surface and complexity of the critical data path.
-- Sidecar boundaries keep stealth carrier performance paths (TCP/UDP/ICMP) isolated and easier to harden.
-- Sidecars allow independent release cadence and targeted protocol compatibility work.
+- Project goal is full in-core consolidation across 5 customized modes (`4a..4e`).
+- In-core mode `4e` gives a single control plane for reverse mode, WARP routing, metrics, and lifecycle management.
+- Operational reliability is improved when systemd/CLI/install tooling controls one runtime shape instead of mixed in-core/sidecar stacks.
 
-## Integration Shape
+## Canonical Runtime Shape
 
-- Sidecar processes terminate external protocols and forward traffic into StealthLink over existing carriers.
-- Preferred handoff path:
-  - TCP flows: `transport.type=stealth` with `carrier.kind=tcp|kcp|awg`
-  - UDP flows: `carrier.kind=raw` with `raw.mode=udp_over_tcp` (or native UDP-capable carriers where available)
-  - ICMP path remains in-core via `carrier.kind=raw` + `raw.mode=icmp`
-- Control-plane integration should be via explicit local sockets and authenticated service identities.
+- `transport.type=uqsp` (or unified stealth runtime path)
+- `variant_profile=4e`
+- carrier: `trusttunnel`
+- behaviors: `cstp` (+ optional `tlsfrag`, `qpp`, `violated_tcp`)
+- reverse mode and WARP are applied uniformly by variant builders
 
-## Non-Goals
+## Sidecar Policy
 
-- No direct in-core protocol parser/state-machine implementation for OpenConnect/ocserv/TrustTunnel in the stealth transport package.
-- No silent protocol fallback from sidecar mode to in-core experimental code.
+- Allowed only as explicitly selected compatibility adapters.
+- Must be clearly labeled non-canonical in docs/config examples.
+- Must not silently replace in-core `4e` behavior.
 
-## Exit Criteria For Reconsidering In-Core
+## Test Coverage
 
-Revisit this decision only if all are met:
+- ✅ Unit tests: `internal/transport/trusttunnel/trusttunnel_test.go` (concurrent read race, H2/H3 probes)
+- ✅ Integration tests: `test/integration/e2e_test.go` and `test/integration/uqsp_variants_test.go` include mode 4e
 
-- sidecar bottleneck is measured and material under production load,
-- protocol behavior can be reduced to a minimal, auditable subset,
-- test coverage proves no regression in stealth core reliability/security.
+## Exit Criteria To Reconsider
+
+Reconsider in-core canonical status only if all are true:
+
+- repeatable benchmark evidence shows in-core `4e` cannot meet throughput/latency targets,
+- critical security or correctness gaps remain unresolved after hardening,
+- compatibility requirements cannot be met without external protocol termination.

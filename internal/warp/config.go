@@ -10,6 +10,7 @@ import (
 // Config holds WARP configuration.
 type Config struct {
 	Enabled       bool          `yaml:"enabled"`
+	Required      bool          `yaml:"required"`       // Fail-fast if WARP cannot start (default: best-effort)
 	Mode          string        `yaml:"mode"`           // "builtin" (wireguard-go) or "wgquick" (system)
 	PrivateKey    string        `yaml:"private_key"`    // WireGuard private key (base64)
 	PublicKey     string        `yaml:"public_key"`     // Cloudflare WARP server public key

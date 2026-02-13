@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -12,9 +13,23 @@ import (
 	"stealthlink/internal/gateway"
 )
 
+// Set via -ldflags at build time.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 func main() {
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	configPath := flag.String("config", "config.yaml", "Path to config file")
+	validateOnly := flag.Bool("validate", false, "Validate config and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("stealthlink-gateway %s (commit=%s built=%s)\n", version, commit, buildTime)
+		return
+	}
 
 	reloader, err := config.NewReloadable(*configPath)
 	if err != nil {
@@ -24,6 +39,12 @@ func main() {
 	cfg := reloader.Get()
 	if cfg.Role != "gateway" {
 		log.Fatalf("config role must be gateway")
+	}
+
+	// If validate-only mode, exit after successful config load
+	if *validateOnly {
+		fmt.Printf("Configuration valid: %s\n", *configPath)
+		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

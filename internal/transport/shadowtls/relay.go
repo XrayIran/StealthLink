@@ -34,12 +34,15 @@ func relay(conn1, conn2 net.Conn, timeout time.Duration) error {
 		close(done)
 	}()
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case <-done:
 		return nil
 	case err := <-errCh:
 		return err
-	case <-time.After(timeout):
+	case <-timer.C:
 		return nil // Timeout is not an error for handshake relay
 	}
 }

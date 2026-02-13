@@ -78,7 +78,10 @@ func SelectCarrier(cfg config.UQSPCarrierConfig, smuxCfg *smux.Config, authToken
 		return NewTrustTunnelCarrier(cfg.TrustTunnel, smuxCfg), nil
 
 	case "rawtcp":
-		return NewRawTCPCarrier(cfg.RawTCP.Raw, cfg.RawTCP.KCP, smuxCfg), nil
+		return NewRawTCPCarrier(cfg.RawTCP.Raw, cfg.RawTCP.KCP, smuxCfg, authToken), nil
+
+	case "faketcp":
+		return NewFakeTCPCarrier(cfg.FakeTCP, smuxCfg, authToken), nil
 
 	case "icmptun":
 		return NewICMPCarrier(cfg.ICMPTun, smuxCfg, authToken), nil
@@ -126,8 +129,38 @@ func SelectCarrier(cfg config.UQSPCarrierConfig, smuxCfg *smux.Config, authToken
 			TLSInsecureSkipVerify: cfg.XHTTP.TLSInsecureSkipVerify,
 			TLSServerName:         cfg.XHTTP.TLSServerName,
 			TLSFingerprint:        cfg.XHTTP.TLSFingerprint,
+			Metadata: XHTTPMetadataConfig{
+				Session: XHTTPMetadataFieldConfig{
+					Placement: cfg.XHTTP.Metadata.Session.Placement,
+					Key:       cfg.XHTTP.Metadata.Session.Key,
+				},
+				Seq: XHTTPMetadataFieldConfig{
+					Placement: cfg.XHTTP.Metadata.Seq.Placement,
+					Key:       cfg.XHTTP.Metadata.Seq.Key,
+				},
+				Mode: XHTTPMetadataFieldConfig{
+					Placement: cfg.XHTTP.Metadata.Mode.Placement,
+					Key:       cfg.XHTTP.Metadata.Mode.Key,
+				},
+			},
+			XMux: XMuxConfig{
+				Enabled:          cfg.XHTTP.XMux.Enabled,
+				MaxConnections:   cfg.XHTTP.XMux.MaxConnections,
+				MaxConcurrency:   cfg.XHTTP.XMux.MaxConcurrency,
+				MaxConnectionAge: cfg.XHTTP.XMux.MaxConnectionAge,
+				CMaxReuseTimes:   cfg.XHTTP.XMux.CMaxReuseTimes,
+				HMaxRequestTimes: cfg.XHTTP.XMux.HMaxRequestTimes,
+				HMaxReusableSecs: cfg.XHTTP.XMux.HMaxReusableSecs,
+				DrainTimeout:     cfg.XHTTP.XMux.DrainTimeout,
+			},
 		}
 		return NewXHTTPCarrier(xhCfg, smuxCfg), nil
+	case "anytls":
+		c, err := NewAnyTLSCarrier(cfg.AnyTLS, smuxCfg)
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
 
 	default:
 		return nil, fmt.Errorf("unknown carrier type: %s", carrierType)
@@ -143,6 +176,8 @@ func IsCarrierAvailable(carrierType string) bool {
 		return true
 	case "rawtcp":
 		return IsRawTCPAvailable()
+	case "faketcp":
+		return true
 	case "icmptun":
 		return IsICMPTunAvailable()
 	case "webtunnel":
@@ -150,6 +185,32 @@ func IsCarrierAvailable(carrierType string) bool {
 	case "chisel":
 		return true
 	case "xhttp":
+		return true
+	case "anytls":
+		return true
+	default:
+		return false
+	}
+}
+
+// SupportsListen reports whether a carrier supports server/listener role.
+func SupportsListen(carrierType string) bool {
+	switch carrierType {
+	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "icmptun", "webtunnel":
+		return true
+	case "xhttp", "chisel":
+		return false
+	case "anytls":
+		return true
+	default:
+		return false
+	}
+}
+
+// SupportsDial reports whether a carrier supports client/dialer role.
+func SupportsDial(carrierType string) bool {
+	switch carrierType {
+	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "icmptun", "webtunnel", "xhttp", "chisel", "anytls":
 		return true
 	default:
 		return false
@@ -198,6 +259,12 @@ func GetCarrierInfo() []CarrierInfo {
 			Description: "Raw TCP packet crafting with KCP (requires CAP_NET_RAW)",
 		},
 		{
+			Name:        "faketcp",
+			Network:     "udp",
+			Available:   true,
+			Description: "TCP-like session semantics over UDP (tcpraw/udp2raw-style)",
+		},
+		{
 			Name:        "icmptun",
 			Network:     "icmp",
 			Available:   IsICMPTunAvailable(),
@@ -220,6 +287,12 @@ func GetCarrierInfo() []CarrierInfo {
 			Network:     "tcp",
 			Available:   true,
 			Description: "SplitHTTP/XHTTP transport with request/response splitting",
+		},
+		{
+			Name:        "anytls",
+			Network:     "tcp",
+			Available:   true,
+			Description: "TLS fingerprint-resistant transport with custom padding",
 		},
 	}
 }

@@ -1,3 +1,6 @@
+//go:build cgo
+// +build cgo
+
 package rawtcp
 
 import (
@@ -46,6 +49,7 @@ type SendHandle struct {
 	srcPort     uint16
 	time        uint32
 	tsCounter   uint32
+	ttl         uint8 // IP TTL from fingerprint profile
 	tcpF        tcpFlagState
 	ethPool     sync.Pool
 	ipv4Pool    sync.Pool
@@ -62,6 +66,44 @@ type tcpOptBuf struct {
 	ackTS [8]byte
 	syn   [5]layers.TCPOption
 	ack   [3]layers.TCPOption
+}
+
+// newTCPOptBufWithProfile creates TCP options matching the given fingerprint profile.
+func newTCPOptBufWithProfile(profile string) *tcpOptBuf {
+	mss := uint16(1460)
+	ws := uint8(8)
+	switch profile {
+	case "chrome_win10":
+		mss = 1460
+		ws = 8
+	case "safari_macos":
+		mss = 1460
+		ws = 6
+	case "linux_default":
+		mss = 1460
+		ws = 7
+	case "android":
+		mss = 1400
+		ws = 7
+	case "random":
+		mss = 1360 + uint16(time.Now().UnixNano()%101)
+		ws = 5 + uint8(time.Now().UnixNano()%4)
+	}
+	b := &tcpOptBuf{
+		ws: [1]byte{ws},
+	}
+	b.mss[0] = byte(mss >> 8)
+	b.mss[1] = byte(mss)
+	b.syn[0] = layers.TCPOption{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: b.mss[:]}
+	b.syn[1] = layers.TCPOption{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2}
+	b.syn[2] = layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: b.synTS[:]}
+	b.syn[3] = layers.TCPOption{OptionType: layers.TCPOptionKindNop, OptionLength: 1}
+	b.syn[4] = layers.TCPOption{OptionType: layers.TCPOptionKindWindowScale, OptionLength: 3, OptionData: b.ws[:]}
+
+	b.ack[0] = layers.TCPOption{OptionType: layers.TCPOptionKindNop, OptionLength: 1}
+	b.ack[1] = layers.TCPOption{OptionType: layers.TCPOptionKindNop, OptionLength: 1}
+	b.ack[2] = layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: b.ackTS[:]}
+	return b
 }
 
 func newTCPOptBuf() *tcpOptBuf {
@@ -127,10 +169,22 @@ func NewSendHandle(cfg *packetConfig) (*SendHandle, error) {
 		},
 		optPool: sync.Pool{
 			New: func() any {
+				if cfg.fingerprintProfile != "" {
+					return newTCPOptBufWithProfile(cfg.fingerprintProfile)
+				}
 				return newTCPOptBuf()
 			},
 		},
 	}
+	// Set TTL from fingerprint profile
+	sh.ttl = 64 // default
+	switch cfg.fingerprintProfile {
+	case "chrome_win10":
+		sh.ttl = 128
+	case "safari_macos", "linux_default", "android":
+		sh.ttl = 64
+	}
+
 	if cfg.ipv4Addr != nil {
 		sh.srcIPv4 = cfg.ipv4Addr.IP
 		sh.srcIPv4RHWA = cfg.ipv4Router
@@ -143,12 +197,16 @@ func NewSendHandle(cfg *packetConfig) (*SendHandle, error) {
 }
 
 func (h *SendHandle) buildIPv4Header(dstIP net.IP) *layers.IPv4 {
+	ttl := h.ttl
+	if ttl == 0 {
+		ttl = 64
+	}
 	ip := h.ipv4Pool.Get().(*layers.IPv4)
 	*ip = layers.IPv4{
 		Version:  4,
 		IHL:      5,
 		TOS:      184,
-		TTL:      64,
+		TTL:      ttl,
 		Flags:    layers.IPv4DontFragment,
 		Protocol: layers.IPProtocolTCP,
 		SrcIP:    h.srcIPv4,
@@ -158,11 +216,15 @@ func (h *SendHandle) buildIPv4Header(dstIP net.IP) *layers.IPv4 {
 }
 
 func (h *SendHandle) buildIPv6Header(dstIP net.IP) *layers.IPv6 {
+	hopLimit := h.ttl
+	if hopLimit == 0 {
+		hopLimit = 64
+	}
 	ip := h.ipv6Pool.Get().(*layers.IPv6)
 	*ip = layers.IPv6{
 		Version:      6,
 		TrafficClass: 184,
-		HopLimit:     64,
+		HopLimit:     hopLimit,
 		NextHeader:   layers.IPProtocolTCP,
 		SrcIP:        h.srcIPv6,
 		DstIP:        dstIP,

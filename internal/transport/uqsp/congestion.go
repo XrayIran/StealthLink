@@ -2,6 +2,7 @@ package uqsp
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"stealthlink/internal/transport/bbr"
@@ -211,31 +212,44 @@ func (n *NoOpCongestionController) InRecovery() bool {
 
 // Pacer implements packet pacing
 type Pacer struct {
-	// congestionController is the congestion controller
 	congestionController CongestionController
-
-	// lastSendTime is the last packet send time
-	lastSendTime time.Time
-
-	// pacingBudget is the current pacing budget
-	pacingBudget uint64
+	lastSendTime         time.Time
+	pacingBudget         uint64
+	rttEstimate          atomic.Int64
 }
+
+const defaultPacerRTT = 100 * time.Millisecond
 
 // NewPacer creates a new pacer
 func NewPacer(cc CongestionController) *Pacer {
-	return &Pacer{
+	p := &Pacer{
 		congestionController: cc,
 		pacingBudget:         65535,
 	}
+	p.rttEstimate.Store(int64(defaultPacerRTT))
+	return p
+}
+
+// UpdateRTT updates the measured RTT estimate used for pacing calculations.
+func (p *Pacer) UpdateRTT(rtt time.Duration) {
+	if rtt > 0 {
+		p.rttEstimate.Store(int64(rtt))
+	}
+}
+
+func (p *Pacer) getRTT() time.Duration {
+	if v := p.rttEstimate.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return defaultPacerRTT
 }
 
 // CanSend returns true if we can send now
 func (p *Pacer) CanSend(now time.Time, packetSize uint64) bool {
-	// Update pacing budget
 	if !p.lastSendTime.IsZero() {
 		elapsed := now.Sub(p.lastSendTime)
 		cwnd := p.congestionController.GetCongestionWindow()
-		rtt := 100 * time.Millisecond // Default RTT estimate
+		rtt := p.getRTT()
 
 		if rtt > 0 {
 			increment := uint64(elapsed) * cwnd / uint64(rtt)
@@ -266,7 +280,7 @@ func (p *Pacer) TimeUntilSend(packetSize uint64) time.Duration {
 	}
 
 	cwnd := p.congestionController.GetCongestionWindow()
-	rtt := 100 * time.Millisecond // Default RTT estimate
+	rtt := p.getRTT()
 
 	if cwnd == 0 {
 		return 0

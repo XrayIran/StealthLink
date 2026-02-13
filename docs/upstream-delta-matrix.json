@@ -1,0 +1,336 @@
+{
+  "generated_at": "2026-02-13T18:57:08Z",
+  "rule_version": 1,
+  "statuses": [
+    "integrated",
+    "needs_patch",
+    "out_of_scope_l3",
+    "verify_only"
+  ],
+  "rows": [
+    {
+      "upstream": "tcpraw",
+      "mode_stack": "4b-raw",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/tcpraw",
+      "destinations": [
+        "internal/transport/rawtcp",
+        "internal/transport/faketcp"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "paqctl",
+      "mode_stack": "4b-raw",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/paqctl",
+      "destinations": [
+        "internal/transport/rawtcp",
+        "internal/transport/packet_guard.go"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "Tunnel",
+      "mode_stack": "reverse-orchestration",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/Tunnel",
+      "destinations": [
+        "internal/transport/reverse",
+        "internal/robot"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "sing-box",
+      "mode_stack": "4c-4e-tls-lookalike",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/sing-box",
+      "destinations": [
+        "internal/transport/shadowtls",
+        "internal/transport/anytls"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "anytls-go",
+      "mode_stack": "4c-4e-tls-lookalike",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/anytls-go",
+      "destinations": [
+        "internal/transport/anytls",
+        "internal/transport/uqsp/carrier/anytls.go"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "shadowsocks-rust",
+      "mode_stack": "4c-4e-tls-lookalike",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/shadowsocks-rust",
+      "destinations": [
+        "internal/dns/fakedns",
+        "internal/security/bloom"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "smux",
+      "mode_stack": "mux-and-reliability",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/smux",
+      "destinations": [
+        "internal/mux",
+        "internal/transport/uqsp/carrier"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "kcp-go",
+      "mode_stack": "udp-reliability",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/kcp-go",
+      "destinations": [
+        "internal/transport/kcpbase",
+        "internal/transport/batch"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "kcptun",
+      "mode_stack": "udp-reliability",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/kcptun",
+      "destinations": [
+        "internal/transport/kcpmux",
+        "internal/transport/kcputil"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "qtun",
+      "mode_stack": "4d-udp-quic",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/qtun",
+      "destinations": [
+        "internal/transport/quicmux",
+        "internal/crypto/qpp"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "juicity",
+      "mode_stack": "4d-udp-quic",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/juicity",
+      "destinations": [
+        "internal/transport/quicmux",
+        "internal/transport/uqsp"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "ocserv",
+      "mode_stack": "4e-cstp-dtls-http",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/ocserv",
+      "destinations": [
+        "internal/transport/uqsp/behavior/cstp.go",
+        "internal/transport/anyconnect"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "openconnect",
+      "mode_stack": "4e-cstp-dtls-http",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/openconnect",
+      "destinations": [
+        "internal/transport/uqsp/behavior/cstp.go",
+        "internal/transport/dtls"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "TrustTunnel",
+      "mode_stack": "4e-cstp-dtls-http",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/TrustTunnel",
+      "destinations": [
+        "internal/transport/trusttunnel",
+        "internal/transport/uqsp/carrier/trusttunnel.go"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "amnezia-client",
+      "mode_stack": "awg-faketcp",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/amnezia-client",
+      "destinations": [
+        "internal/transport/wireguard/junk.go",
+        "internal/transport/uqsp/behavior/awg.go"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "udp2raw",
+      "mode_stack": "awg-faketcp",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/udp2raw",
+      "destinations": [
+        "internal/transport/faketcp",
+        "internal/transport/icmptun"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "lyrebird",
+      "mode_stack": "fronting-obfuscation-rendezvous",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/lyrebird",
+      "destinations": [
+        "internal/transport/uqsp/behavior/obfs4.go",
+        "internal/transport/psiphon/meek.go"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "psiphon-tunnel-core",
+      "mode_stack": "fronting-obfuscation-rendezvous",
+      "status": "integrated",
+      "base_status": "integrated",
+      "source_exists": true,
+      "source_path": "sources/psiphon-tunnel-core",
+      "destinations": [
+        "internal/transport/psiphon"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "conjure",
+      "mode_stack": "fronting-obfuscation-rendezvous",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/conjure",
+      "destinations": [
+        "internal/transport/uqsp/behavior/domainfront.go",
+        "internal/transport/uqsp/reverse.go"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "snowflake",
+      "mode_stack": "fronting-obfuscation-rendezvous",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/snowflake",
+      "destinations": [
+        "internal/transport/uqsp/reverse.go",
+        "internal/transport/psiphon/meek.go"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "haproxy",
+      "mode_stack": "fronting-obfuscation-rendezvous",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/haproxy",
+      "destinations": [
+        "internal/transport/uqsp/behavior/domainfront.go",
+        "internal/transport/tlsmux"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "dae",
+      "mode_stack": "routing-policy",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/dae",
+      "destinations": [
+        "internal/routing",
+        "internal/transport/underlay"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "mihomo",
+      "mode_stack": "routing-policy",
+      "status": "verify_only",
+      "base_status": "verify_only",
+      "source_exists": true,
+      "source_path": "sources/mihomo",
+      "destinations": [
+        "internal/routing",
+        "internal/config"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "EasyTier",
+      "mode_stack": "topology-routing",
+      "status": "out_of_scope_l3",
+      "base_status": "out_of_scope_l3",
+      "source_exists": true,
+      "source_path": "sources/EasyTier",
+      "destinations": [
+        "internal/tun",
+        "internal/routing"
+      ],
+      "missing_destinations": []
+    },
+    {
+      "upstream": "VortexL2",
+      "mode_stack": "topology-routing",
+      "status": "out_of_scope_l3",
+      "base_status": "out_of_scope_l3",
+      "source_exists": true,
+      "source_path": "sources/VortexL2",
+      "destinations": [
+        "internal/tun",
+        "internal/routing"
+      ],
+      "missing_destinations": []
+    }
+  ]
+}

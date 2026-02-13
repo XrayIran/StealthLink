@@ -3,15 +3,21 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"stealthlink/internal/config"
+	"stealthlink/internal/transport/uqsp"
 	"stealthlink/internal/vpn"
+
+	"github.com/xtaci/smux"
 )
 
 // mockStream implements net.Conn for testing VPN bridge without real transport.
@@ -190,7 +196,7 @@ func TestAllFiveMethodConfigs(t *testing.T) {
 		{"Method 4b: Raw TCP + obfs4", "rawtcp"},
 		{"Method 4c: XHTTP + REALITY", "xhttp"},
 		{"Method 4d: UDP (native QUIC)", "quic"},
-		{"Method 4e: TLS tunnel (WebTunnel)", "webtunnel"},
+		{"Method 4e: TLS tunnel (TrustTunnel)", "trusttunnel"},
 	}
 
 	for _, m := range methods {
@@ -200,7 +206,7 @@ func TestAllFiveMethodConfigs(t *testing.T) {
 			}
 			// Basic validation that carrier types are recognized
 			switch m.carrierType {
-			case "quic", "rawtcp", "icmptun", "webtunnel", "chisel", "xhttp", "trusttunnel":
+			case "quic", "rawtcp", "faketcp", "icmptun", "webtunnel", "chisel", "xhttp", "trusttunnel":
 				// Valid carrier type
 			default:
 				t.Errorf("unknown carrier type: %s", m.carrierType)
@@ -264,4 +270,91 @@ func TestVPNE2ENetworkNamespaces(t *testing.T) {
 func runCmd(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	return cmd.Run()
+}
+
+// ---------------------------------------------------------------------------
+// Variant transport round-trip integration tests
+// ---------------------------------------------------------------------------
+
+func TestVariantTransportRoundTrip4a(t *testing.T) {
+	testVariantTransportRoundTrip(t, "4a", "xhttp", []string{"gfwresist_tls"})
+}
+
+func TestVariantTransportRoundTrip4b(t *testing.T) {
+	testVariantTransportRoundTrip(t, "4b", "rawtcp", []string{"gfwresist_tcp"})
+}
+
+func TestVariantTransportRoundTrip4c(t *testing.T) {
+	testVariantTransportRoundTrip(t, "4c", "xhttp", []string{"tlsmirror"})
+}
+
+func TestVariantTransportRoundTrip4d(t *testing.T) {
+	testVariantTransportRoundTrip(t, "4d", "quic", nil)
+}
+
+func TestVariantTransportRoundTrip4e(t *testing.T) {
+	testVariantTransportRoundTrip(t, "4e", "trusttunnel", []string{"cstp"})
+}
+
+// testVariantTransportRoundTrip verifies that a variant builds, produces a
+// non-nil carrier, and that all expected overlays are present.  This is an
+// integration-level check that exercises BuildVariantForRole end-to-end.
+func testVariantTransportRoundTrip(t *testing.T, variantID, expectedCarrier string, expectedOverlays []string) {
+	t.Helper()
+
+	cfg := newVariantConfig(variantID, expectedCarrier)
+
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"uqsp-integration-test"},
+	}
+
+	proto, variant, err := uqsp.BuildVariantForRole(cfg, tlsCfg, smux.DefaultConfig(), "test-token")
+	if err != nil {
+		t.Fatalf("BuildVariantForRole(%s): %v", variantID, err)
+	}
+	if proto == nil {
+		t.Fatalf("BuildVariantForRole(%s) returned nil protocol", variantID)
+	}
+
+	expectedVariant := uqsp.VariantFromName(variantID)
+	if variant != expectedVariant {
+		t.Fatalf("expected variant %d, got %d", expectedVariant, variant)
+	}
+
+	for _, name := range expectedOverlays {
+		if !protocolHasOverlay(proto, name) {
+			t.Errorf("variant %s: expected overlay %q not found", variantID, name)
+		}
+	}
+
+	// Verify the protocol can produce a valid Dial function (does not panic).
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	// We expect Dial to fail (no real server), but it should not panic.
+	_, dialErr := proto.Dial(ctx, "127.0.0.1:0")
+	if dialErr == nil {
+		t.Logf("variant %s: Dial unexpectedly succeeded (likely no real listener)", variantID)
+	}
+}
+
+func newVariantConfig(variantID, carrierType string) *config.Config {
+	cfg := &config.Config{}
+	cfg.Role = "agent"
+	cfg.Variant = variantID
+	cfg.Transport.Type = "uqsp"
+	cfg.Transport.UQSP.Carrier.Type = carrierType
+
+	// Apply variant profile defaults so overlays are populated.
+	uqsp.ApplyVariantProfile(cfg)
+	return cfg
+}
+
+func protocolHasOverlay(proto *uqsp.UnifiedProtocol, name string) bool {
+	for _, o := range proto.Overlays() {
+		if strings.EqualFold(strings.TrimSpace(o.Name()), name) {
+			return true
+		}
+	}
+	return false
 }

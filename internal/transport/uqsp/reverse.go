@@ -11,9 +11,13 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
+	mathrand "math/rand"
 	"net"
 	"net/http"
+	"stealthlink/internal/metrics"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,14 +25,22 @@ import (
 // ReverseMode configures reverse proxy mode where the server initiates connections
 // to the client instead of the client connecting to the server. This makes it
 // harder to detect the server since it appears as an outbound connection.
+//
+// Roles:
+// - "client": Traditional mode - client dials server (server listens)
+// - "server": Traditional mode - server listens for client connections
+// - "rendezvous": Reverse mode - client listens, server dials out (for NAT traversal)
 type ReverseMode struct {
 	Enabled bool   `yaml:"enabled"`
-	Role    string `yaml:"role"` // "dialer" (normally client) or "listener" (normally server)
+	Role    string `yaml:"role"` // "client" | "server" | "rendezvous"
 
 	// Connection settings
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
 	ReconnectDelay    time.Duration `yaml:"reconnect_delay"`
+	ReconnectBackoff  time.Duration `yaml:"reconnect_backoff"`   // Initial backoff (exponential)
+	MaxReconnectDelay time.Duration `yaml:"max_reconnect_delay"` // Max backoff (default: 60s)
 	MaxRetries        int           `yaml:"max_retries"`
+	KeepaliveInterval time.Duration `yaml:"keepalive_interval"` // Keepalive for persistent connections
 
 	// Address configuration
 	ClientAddress string `yaml:"client_address"` // Address for server to connect to (when server is dialer)
@@ -49,12 +61,15 @@ type ReverseMode struct {
 type ReverseDialer struct {
 	mode      *ReverseMode
 	tlsConfig *tls.Config
+	dialFn    func(ctx context.Context, network, addr string) (net.Conn, error)
 	connChan  chan net.Conn
 	mu        sync.RWMutex
 	closed    bool
 	stopCh    chan struct{}
 	qualityMu sync.RWMutex
 	quality   ReverseQuality
+	randMu    sync.Mutex
+	rng       *mathrand.Rand
 }
 
 type ReverseQuality struct {
@@ -67,12 +82,47 @@ type ReverseQuality struct {
 
 // NewReverseDialer creates a new reverse dialer
 func NewReverseDialer(mode *ReverseMode, tlsConfig *tls.Config) *ReverseDialer {
+	return NewReverseDialerWithDialFunc(mode, tlsConfig, nil)
+}
+
+// NewReverseDialerWithDialFunc creates a new reverse dialer with an explicit dial function.
+// This is used to route reverse-init connections through the configured underlay (SOCKS/WARP).
+func NewReverseDialerWithDialFunc(mode *ReverseMode, tlsConfig *tls.Config, dialFn func(ctx context.Context, network, addr string) (net.Conn, error)) *ReverseDialer {
+	seed := int64(1)
+	if mode != nil {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(mode.ClientAddress))
+		_, _ = h.Write([]byte(mode.ServerAddress))
+		_, _ = h.Write([]byte(mode.AuthToken))
+		seed = int64(h.Sum64())
+	}
+	if dialFn == nil {
+		dialer := &net.Dialer{Timeout: 30 * time.Second}
+		dialFn = dialer.DialContext
+	}
 	return &ReverseDialer{
 		mode:      mode,
 		tlsConfig: tlsConfig,
+		dialFn:    dialFn,
 		connChan:  make(chan net.Conn, 10),
 		stopCh:    make(chan struct{}),
+		rng:       mathrand.New(mathrand.NewSource(seed)),
 	}
+}
+
+func (d *ReverseDialer) backoffWithJitter(base, max time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	d.randMu.Lock()
+	defer d.randMu.Unlock()
+	jitterFrac := 0.15
+	j := time.Duration(float64(base) * (d.rng.Float64() * jitterFrac))
+	out := base + j
+	if max > 0 && out > max {
+		return max
+	}
+	return out
 }
 
 // Start starts the reverse dialer based on role
@@ -82,16 +132,45 @@ func (d *ReverseDialer) Start(ctx context.Context) error {
 	}
 
 	switch d.mode.Role {
+	case "client":
+		// Traditional mode: client dials server
+		// This is handled by normal dialing, not reverse mode
+		return fmt.Errorf("role 'client' should use normal dialing, not reverse mode")
+	case "server":
+		// Traditional mode: server listens for client connections
+		// This is handled by normal listening, not reverse mode
+		return fmt.Errorf("role 'server' should use normal listening, not reverse mode")
+	case "rendezvous":
+		// Rendezvous mode: determine actual behavior based on system role
+		// If we're the server, we dial out to the client
+		// If we're the client, we listen for server connections
+		return d.startRendezvous(ctx)
 	case "dialer":
-		// In reverse mode, the "dialer" role means we initiate connections
-		// (typically the server's role, but in reverse mode it's the client)
+		// Legacy compatibility: "dialer" means we initiate connections
 		return d.startDialer(ctx)
 	case "listener":
-		// In reverse mode, the "listener" role means we accept connections
-		// (typically the client's role, but in reverse mode it's the server)
+		// Legacy compatibility: "listener" means we accept connections
 		return d.startListener(ctx)
 	default:
-		return fmt.Errorf("unknown role: %s", d.mode.Role)
+		return fmt.Errorf("unknown role: %s (must be 'client', 'server', 'rendezvous', or legacy 'dialer'/'listener')", d.mode.Role)
+	}
+}
+
+// startRendezvous starts rendezvous mode based on system role
+// In rendezvous mode, the server dials out to the client (client listens)
+func (d *ReverseDialer) startRendezvous(ctx context.Context) error {
+	// Determine if we should dial or listen based on addresses configured
+	// If ClientAddress is set, we're the server dialing to the client
+	// If ServerAddress is set, we're the client listening for the server
+
+	if d.mode.ClientAddress != "" {
+		// We're the server, dial out to the client
+		return d.startDialer(ctx)
+	} else if d.mode.ServerAddress != "" {
+		// We're the client, listen for server connections
+		return d.startListener(ctx)
+	} else {
+		return fmt.Errorf("rendezvous mode requires either client_address (for server) or server_address (for client)")
 	}
 }
 
@@ -106,11 +185,16 @@ func (d *ReverseDialer) startDialer(ctx context.Context) error {
 	return nil
 }
 
-// dialLoop continuously attempts to connect
+// dialLoop continuously attempts to connect with exponential backoff
 func (d *ReverseDialer) dialLoop(ctx context.Context, addr string) {
-	retryDelay := d.mode.ReconnectDelay
-	if retryDelay == 0 {
-		retryDelay = 5 * time.Second
+	initialBackoff := d.mode.ReconnectBackoff
+	if initialBackoff == 0 {
+		initialBackoff = 1 * time.Second
+	}
+
+	maxBackoff := d.mode.MaxReconnectDelay
+	if maxBackoff == 0 {
+		maxBackoff = 60 * time.Second
 	}
 
 	maxRetries := d.mode.MaxRetries
@@ -119,6 +203,8 @@ func (d *ReverseDialer) dialLoop(ctx context.Context, addr string) {
 	}
 
 	retries := 0
+	currentBackoff := initialBackoff
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -131,40 +217,88 @@ func (d *ReverseDialer) dialLoop(ctx context.Context, addr string) {
 		conn, err := d.dialWithRetry(addr)
 		if err != nil {
 			retries++
+			metrics.IncReverseReconnectAttempts()
+
+			// Track reconnection reason based on error type
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				metrics.IncReverseReconnectTimeout()
+			} else if opErr, ok := err.(*net.OpError); ok && opErr.Err != nil {
+				errStr := opErr.Err.Error()
+				if strings.Contains(strings.ToLower(errStr), "refused") {
+					metrics.IncReverseReconnectRefused()
+				} else if strings.Contains(strings.ToLower(errStr), "reset") {
+					metrics.IncReverseReconnectReset()
+				}
+			}
+
 			if retries >= maxRetries {
 				return
 			}
-			time.Sleep(retryDelay)
+
+			// Exponential backoff with bounded deterministic jitter.
+			time.Sleep(d.backoffWithJitter(currentBackoff, maxBackoff))
+			currentBackoff *= 2
+			if currentBackoff > maxBackoff {
+				currentBackoff = maxBackoff
+			}
 			continue
 		}
 
+		// Connection successful, reset backoff
 		retries = 0
+		currentBackoff = initialBackoff
+		metrics.IncReverseConnectionsActive()
 
 		// Send the connection to the channel
 		select {
 		case d.connChan <- conn:
 		case <-ctx.Done():
 			conn.Close()
+			metrics.DecReverseConnectionsActive()
 			return
 		case <-d.stopCh:
 			conn.Close()
+			metrics.DecReverseConnectionsActive()
 			return
 		}
 
 		// Wait for connection to close before reconnecting
 		d.waitForClose(conn)
+		metrics.DecReverseConnectionsActive()
+
+		// After connection closes, apply reconnect delay before next attempt
+		select {
+		case <-time.After(d.mode.ReconnectDelay):
+		case <-ctx.Done():
+			return
+		case <-d.stopCh:
+			return
+		}
 	}
 }
 
 // dialWithRetry attempts to dial with authentication
 func (d *ReverseDialer) dialWithRetry(addr string) (net.Conn, error) {
 	start := time.Now()
-	dialer := &net.Dialer{
-		Timeout: 30 * time.Second,
-	}
-
-	conn, err := dialer.Dial("tcp", addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := d.dialFn(ctx, "tcp", addr)
 	if err != nil {
+		// Track reconnection reason based on error type
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Timeout error
+			// Note: We'll track this in the dialLoop when we retry
+		} else if opErr, ok := err.(*net.OpError); ok {
+			// Check for connection refused or reset
+			if opErr.Err != nil {
+				errStr := opErr.Err.Error()
+				if contains(errStr, "refused") {
+					// Connection refused - will be tracked in dialLoop
+				} else if contains(errStr, "reset") {
+					// Connection reset - will be tracked in dialLoop
+				}
+			}
+		}
 		return nil, err
 	}
 
@@ -197,6 +331,13 @@ func (d *ReverseDialer) dialWithRetry(addr string) (net.Conn, error) {
 	d.recordSuccess(time.Since(start))
 
 	return conn, nil
+}
+
+// contains checks if a string contains a substring (case-insensitive)
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
+		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
+			len(s) > len(substr)*2 && s[len(s)/2-len(substr)/2:len(s)/2+len(substr)/2+len(substr)%2] == substr))
 }
 
 // sendAuth sends authentication token

@@ -1,0 +1,34 @@
+# Example: SOCKS5 underlay dialer
+# Routes StealthLink traffic through a SOCKS5 proxy
+
+role: agent
+
+agent:
+  id: agent-003
+  gateway_addr: gateway.example.com:443
+
+transport:
+  type: stealth
+  mode: "4a"  # XHTTP + Domain Fronting
+  
+  # Underlay dialer configuration
+  dialer: socks  # Route through SOCKS5 proxy
+  
+  # SOCKS5 dialer configuration
+  socks_dialer:
+    address: "127.0.0.1:1080"  # SOCKS5 proxy address
+    username: ""                # Optional: SOCKS5 username
+    password: ""                # Optional: SOCKS5 password
+  
+  stealth:
+    carrier:
+      kind: tcp
+    camouflage:
+      mode: tls
+      tls:
+        server_name: gateway.example.com
+
+services:
+  - name: web
+    listen: 127.0.0.1:8080
+    target: 10.0.0.1:80

@@ -158,40 +158,21 @@ func (c *WebTunnelCarrier) dialH2(ctx context.Context, addr string) (net.Conn, e
 	}
 
 	// Send HTTP/2 connection preface
-	if _, err := conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
+	if _, err := writeAll(conn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("write h2 preface: %w", err)
 	}
 
 	// Send SETTINGS frame
-	settingsFrame := []byte{
-		0x00, 0x00, 0x00, // Length: 0
-		0x04,                   // Type: SETTINGS
-		0x00,                   // Flags: none
-		0x00, 0x00, 0x00, 0x00, // Stream ID: 0
-	}
-	if _, err := conn.Write(settingsFrame); err != nil {
+	if err := writeH2Frame(conn, 0x04, 0x00, 0, nil); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("write h2 settings: %w", err)
 	}
 
-	// Read server SETTINGS
-	settingsBuf := make([]byte, 9)
-	if _, err := io.ReadFull(conn, settingsBuf); err != nil {
+	// Read and ACK server SETTINGS (payload can be non-empty in real deployments).
+	if err := awaitInitialH2Settings(conn); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read h2 settings: %w", err)
-	}
-
-	// Send SETTINGS ACK
-	settingsAck := []byte{
-		0x00, 0x00, 0x00, // Length: 0
-		0x04,                   // Type: SETTINGS
-		0x01,                   // Flags: ACK
-		0x00, 0x00, 0x00, 0x00, // Stream ID: 0
-	}
-	if _, err := conn.Write(settingsAck); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("write h2 settings ack: %w", err)
 	}
 
 	// Send CONNECT request on stream 1
@@ -225,7 +206,7 @@ func (c *WebTunnelCarrier) dialH2(ctx context.Context, addr string) (net.Conn, e
 	headersFrame[8] = 0x01 // Stream ID: 1
 	copy(headersFrame[9:], hpackBlock)
 
-	if _, err := conn.Write(headersFrame); err != nil {
+	if _, err := writeAll(conn, headersFrame); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("write h2 headers: %w", err)
 	}
@@ -241,19 +222,31 @@ func (c *WebTunnelCarrier) dialH2(ctx context.Context, addr string) (net.Conn, e
 			return nil, fmt.Errorf("read h2 response frame: %w", err)
 		}
 
-		// Ignore connection-level frames and other streams.
-		if streamID != 1 {
+		if streamID == 0 {
+			if err := handleH2ControlFrame(conn, frameType, flags, payload); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("h2 control frame: %w", err)
+			}
 			continue
 		}
 		if frameType == 0x07 { // GOAWAY
 			conn.Close()
 			return nil, fmt.Errorf("received GOAWAY from server")
 		}
+		if streamID != 1 {
+			continue
+		}
 		if frameType != 0x01 { // HEADERS
 			continue
 		}
 
-		status, err := decodeStatusFromHeadersFrame(payload, flags)
+		block, err := readResponseHeaderBlock(conn, streamID, payload, flags)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("collect h2 response headers: %w", err)
+		}
+
+		status, err := decodeStatusFromHeaderBlock(block)
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("decode h2 response headers: %w", err)
@@ -335,6 +328,10 @@ func decodeStatusFromHeadersFrame(payload []byte, flags byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return decodeStatusFromHeaderBlock(block)
+}
+
+func decodeStatusFromHeaderBlock(block []byte) (string, error) {
 	status := ""
 	dec := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
 		if f.Name == ":status" {
@@ -387,52 +384,65 @@ func (c *h2Conn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	// Read DATA frame header
-	header := make([]byte, 9)
-	if _, err := c.Conn.Read(header); err != nil {
-		return 0, err
+	for {
+		frameType, flags, streamID, payload, err := readH2Frame(c.Conn)
+		if err != nil {
+			return 0, err
+		}
+
+		if streamID == 0 {
+			if err := handleH2ControlFrame(c.Conn, frameType, flags, payload); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		if streamID != c.streamID {
+			continue
+		}
+
+		switch frameType {
+		case 0x00: // DATA
+			data, err := extractDataPayload(payload, flags)
+			if err != nil {
+				return 0, err
+			}
+			if len(data) == 0 {
+				if flags&0x01 != 0 { // END_STREAM
+					return 0, io.EOF
+				}
+				continue
+			}
+			n := copy(b, data)
+			if n < len(data) {
+				c.buf = append(c.buf[:0], data[n:]...)
+			}
+			return n, nil
+		case 0x03: // RST_STREAM
+			return 0, fmt.Errorf("stream reset by peer")
+		case 0x07: // GOAWAY
+			return 0, io.EOF
+		default:
+			// Ignore non-data frames for this stream.
+		}
 	}
-
-	length := int(header[0])<<16 | int(header[1])<<8 | int(header[2])
-	// frameType := header[3]
-	// flags := header[4]
-	// streamID := binary.BigEndian.Uint32(header[5:9]) & 0x7FFFFFFF
-
-	// Read payload
-	payload := make([]byte, length)
-	if _, err := c.Conn.Read(payload); err != nil {
-		return 0, err
-	}
-
-	n := copy(b, payload)
-	if n < len(payload) {
-		c.buf = payload[n:]
-	}
-
-	return n, nil
 }
 
 // Write writes to the HTTP/2 stream.
 func (c *h2Conn) Write(b []byte) (int, error) {
-	// Build DATA frame
-	length := len(b)
-	frame := make([]byte, 9+length)
-	frame[0] = byte(length >> 16)
-	frame[1] = byte(length >> 8)
-	frame[2] = byte(length)
-	frame[3] = 0x00 // Type: DATA
-	frame[4] = 0x00 // Flags: none
-	frame[5] = byte(c.streamID >> 24)
-	frame[6] = byte(c.streamID >> 16)
-	frame[7] = byte(c.streamID >> 8)
-	frame[8] = byte(c.streamID)
-	copy(frame[9:], b)
-
-	if _, err := c.Conn.Write(frame); err != nil {
-		return 0, err
+	const maxFramePayload = 16 * 1024
+	total := 0
+	for len(b) > 0 {
+		chunk := len(b)
+		if chunk > maxFramePayload {
+			chunk = maxFramePayload
+		}
+		if err := writeH2Frame(c.Conn, 0x00, 0x00, c.streamID, b[:chunk]); err != nil {
+			return total, err
+		}
+		total += chunk
+		b = b[chunk:]
 	}
-
-	return len(b), nil
+	return total, nil
 }
 
 // Network returns the network type.
@@ -588,4 +598,123 @@ func webTunnelClientHandshake(conn net.Conn, config *WebTunnelConfig) error {
 func webTunnelServerHandshake(conn net.Conn, config *WebTunnelConfig) error {
 	// Read and verify authentication if configured
 	return nil
+}
+
+func awaitInitialH2Settings(conn net.Conn) error {
+	for {
+		frameType, flags, streamID, payload, err := readH2Frame(conn)
+		if err != nil {
+			return err
+		}
+		if streamID != 0 {
+			continue
+		}
+		if frameType == 0x04 { // SETTINGS
+			if flags&0x01 != 0 { // ACK
+				continue
+			}
+			if len(payload)%6 != 0 {
+				return fmt.Errorf("invalid SETTINGS payload length: %d", len(payload))
+			}
+			return writeH2Frame(conn, 0x04, 0x01, 0, nil)
+		}
+		if err := handleH2ControlFrame(conn, frameType, flags, payload); err != nil {
+			return err
+		}
+	}
+}
+
+func readResponseHeaderBlock(conn net.Conn, streamID uint32, firstPayload []byte, firstFlags byte) ([]byte, error) {
+	first, err := extractHeaderBlockFragment(firstPayload, firstFlags)
+	if err != nil {
+		return nil, err
+	}
+	block := append([]byte(nil), first...)
+	if firstFlags&0x04 != 0 { // END_HEADERS
+		return block, nil
+	}
+
+	for {
+		frameType, flags, sid, payload, err := readH2Frame(conn)
+		if err != nil {
+			return nil, err
+		}
+		if sid != streamID {
+			return nil, fmt.Errorf("unexpected interleaved frame stream=%d while waiting CONTINUATION", sid)
+		}
+		if frameType != 0x09 { // CONTINUATION
+			return nil, fmt.Errorf("expected CONTINUATION frame, got type=%d", frameType)
+		}
+		block = append(block, payload...)
+		if flags&0x04 != 0 { // END_HEADERS
+			return block, nil
+		}
+	}
+}
+
+func extractDataPayload(payload []byte, flags byte) ([]byte, error) {
+	if flags&0x08 == 0 { // not padded
+		return payload, nil
+	}
+	if len(payload) < 1 {
+		return nil, fmt.Errorf("padded DATA frame missing pad length")
+	}
+	padLen := int(payload[0])
+	if padLen > len(payload)-1 {
+		return nil, fmt.Errorf("invalid DATA padding")
+	}
+	return payload[1 : len(payload)-padLen], nil
+}
+
+func handleH2ControlFrame(conn net.Conn, frameType byte, flags byte, payload []byte) error {
+	switch frameType {
+	case 0x04: // SETTINGS
+		if flags&0x01 == 0 { // non-ACK
+			if len(payload)%6 != 0 {
+				return fmt.Errorf("invalid SETTINGS payload length: %d", len(payload))
+			}
+			return writeH2Frame(conn, 0x04, 0x01, 0, nil)
+		}
+	case 0x06: // PING
+		if len(payload) != 8 {
+			return fmt.Errorf("invalid PING payload length: %d", len(payload))
+		}
+		if flags&0x01 == 0 {
+			return writeH2Frame(conn, 0x06, 0x01, 0, payload)
+		}
+	case 0x07: // GOAWAY
+		return fmt.Errorf("received GOAWAY")
+	}
+	return nil
+}
+
+func writeH2Frame(w io.Writer, frameType byte, flags byte, streamID uint32, payload []byte) error {
+	if len(payload) > 0xFFFFFF {
+		return fmt.Errorf("frame payload too large: %d", len(payload))
+	}
+	frame := make([]byte, 9+len(payload))
+	frame[0] = byte(len(payload) >> 16)
+	frame[1] = byte(len(payload) >> 8)
+	frame[2] = byte(len(payload))
+	frame[3] = frameType
+	frame[4] = flags
+	binary.BigEndian.PutUint32(frame[5:9], streamID&0x7FFFFFFF)
+	copy(frame[9:], payload)
+	_, err := writeAll(w, frame)
+	return err
+}
+
+func writeAll(w io.Writer, p []byte) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := w.Write(p[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
 }

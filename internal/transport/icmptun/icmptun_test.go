@@ -1,6 +1,12 @@
 package icmptun
 
-import "testing"
+import (
+	"errors"
+	"syscall"
+	"testing"
+
+	"stealthlink/internal/transport/transportutil"
+)
 
 func TestXorPayloadRoundTrip(t *testing.T) {
 	orig := []byte("hello-icmp")
@@ -49,5 +55,27 @@ func TestSocketBufferBounds(t *testing.T) {
 	}
 	if v := socketBufferBytes(1500, 50000); v > 16<<20 {
 		t.Fatalf("expected max 16MB, got %d", v)
+	}
+}
+
+func TestIsTransientICMPBufferError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "enobufs", err: syscall.ENOBUFS, want: true},
+		{name: "enomem", err: syscall.ENOMEM, want: true},
+		{name: "string", err: errors.New("socket: ENOBUFS"), want: true},
+		{name: "other", err: errors.New("permission denied"), want: false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := transportutil.IsTransientBufferError(tc.err); got != tc.want {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+		})
 	}
 }

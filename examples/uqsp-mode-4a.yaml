@@ -1,4 +1,5 @@
 role: agent
+variant: "4a"
 
 agent:
   id: "agent-4a"
@@ -13,6 +14,18 @@ transport:
         server: "cdn.example.com:443"
         mode: stream-one
         tls_fingerprint: "chrome_auto"
+        # XHTTP Metadata Placement (Phase 2)
+        session_placement: path   # OPTIONS: path | query | header | cookie
+        session_key: "sid"        # Custom key for session ID
+        sequence_placement: query # OPTIONS: path | query | header | cookie
+        sequence_key: "seq"       # Custom key for sequence number
+        metadata_placement: path  # OPTIONS: path | query | header | cookie (applies to mode key)
+        
+        # Xmux Connection Lifecycle (Phase 3)
+        reuse_limit: 100          # Max times a connection is reused for new streams
+        request_limit: 1000       # Max total requests per connection
+        max_reusable_secs: 600    # Max connection age before rotation
+        drain_timeout: 30s        # Time to drain existing requests before close
     behaviors:
       ech:
         enabled: true
@@ -24,11 +37,25 @@ transport:
         front_domain: "cdn.cloudflare.com"
         real_host: "real.example.com"
         rotate_ips: true
+        # Failover domains are tried automatically if the primary front fails.
+        # Each dial rotates through the combined front pool.
+        failover_domains:
+          - "www.cloudflare.com"
+          - "cloudflare.com"
       vision:
         enabled: true
       tlsfrag:
         enabled: true
         strategy: sni_split
+
+    # Per-variant WARP/reverse policy (overrides global warp.enabled).
+    # Keys: 4a, 4b, 4c, 4d, 4e
+    variant_policy:
+      "4a":
+        warp_enabled: true
+
+warp:
+  enabled: false  # global off; per-variant policy above enables for 4a only
 
 security:
   shared_key: "replace-with-secure-shared-key"

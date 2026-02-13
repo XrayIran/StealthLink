@@ -60,6 +60,23 @@ func (o *TLSMirrorOverlay) Apply(conn net.Conn) (net.Conn, error) {
 	return wrapper, nil
 }
 
+// mirrorConfig holds mirror parameters received from the control channel.
+type mirrorConfig struct {
+	RecordSizes    []int   // Common record sizes to mimic
+	PaddingPolicy  string  // "random", "bucket", "none"
+	ContentWeights [4]int  // Weights for content types 0x14-0x17
+	MaxRecordSize  int     // Max TLS record size
+}
+
+func defaultMirrorConfig() *mirrorConfig {
+	return &mirrorConfig{
+		RecordSizes:    []int{256, 512, 1024, 2048, 4096, 8192, 16384},
+		PaddingPolicy:  "bucket",
+		ContentWeights: [4]int{1, 1, 5, 93}, // CCS, Alert, Handshake, AppData
+		MaxRecordSize:  16384,
+	}
+}
+
 // tlsMirrorConn wraps a connection with TLSMirror behavior
 type tlsMirrorConn struct {
 	net.Conn
@@ -68,19 +85,86 @@ type tlsMirrorConn struct {
 	enrolled           bool
 	recordBuf          []byte
 	mu                 sync.Mutex
+	mirror             *mirrorConfig
 }
 
-// enroll performs TLSMirror enrollment
+// enroll performs TLSMirror enrollment by connecting to the control channel,
+// exchanging capabilities, and receiving mirror configuration.
 func (c *tlsMirrorConn) enroll() error {
 	if c.enrolled {
 		return nil
 	}
 
-	// TLSMirror enrollment:
-	// 1. Connect to control channel
-	// 2. Exchange capabilities
-	// 3. Receive mirror configuration
+	if c.controlChannel == "" {
+		// No control channel — use defaults
+		c.mirror = defaultMirrorConfig()
+		c.enrolled = true
+		return nil
+	}
 
+	// Connect to control channel
+	ctlConn, err := net.DialTimeout("tcp", c.controlChannel, 5*time.Second)
+	if err != nil {
+		// Fallback to defaults on connection failure
+		c.mirror = defaultMirrorConfig()
+		c.enrolled = true
+		return nil
+	}
+	defer ctlConn.Close()
+	_ = ctlConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Exchange capabilities: send magic + version + caps
+	magic := []byte("TLSM")
+	version := []byte{0x01}
+	caps := []byte{0x01} // Supports record mirroring
+	envelope := append(magic, version...)
+	envelope = append(envelope, caps...)
+	if _, err := ctlConn.Write(envelope); err != nil {
+		c.mirror = defaultMirrorConfig()
+		c.enrolled = true
+		return nil
+	}
+
+	// Receive mirror config: [record_count(1)][sizes(2*N)][padding_policy(1)][max_record(2)]
+	header := make([]byte, 1)
+	if _, err := ctlConn.Read(header); err != nil {
+		c.mirror = defaultMirrorConfig()
+		c.enrolled = true
+		return nil
+	}
+	recordCount := int(header[0])
+	if recordCount == 0 || recordCount > 32 {
+		recordCount = 7
+	}
+
+	cfg := defaultMirrorConfig()
+	sizeBuf := make([]byte, 2*recordCount)
+	if n, _ := ctlConn.Read(sizeBuf); n == len(sizeBuf) {
+		cfg.RecordSizes = make([]int, recordCount)
+		for i := 0; i < recordCount; i++ {
+			cfg.RecordSizes[i] = int(binary.BigEndian.Uint16(sizeBuf[i*2 : i*2+2]))
+		}
+	}
+
+	policyBuf := make([]byte, 3) // policy(1) + max_record(2)
+	if n, _ := ctlConn.Read(policyBuf); n >= 1 {
+		switch policyBuf[0] {
+		case 0x00:
+			cfg.PaddingPolicy = "none"
+		case 0x01:
+			cfg.PaddingPolicy = "random"
+		case 0x02:
+			cfg.PaddingPolicy = "bucket"
+		}
+		if n >= 3 {
+			cfg.MaxRecordSize = int(binary.BigEndian.Uint16(policyBuf[1:3]))
+			if cfg.MaxRecordSize <= 0 || cfg.MaxRecordSize > 16384 {
+				cfg.MaxRecordSize = 16384
+			}
+		}
+	}
+
+	c.mirror = cfg
 	c.enrolled = true
 	return nil
 }
@@ -184,9 +268,13 @@ func (c *tlsMirrorConn) extractPayload(record []byte) ([]byte, error) {
 	return record[5 : 5+length], nil
 }
 
-// wrapInTLSRecords wraps payload in TLS ApplicationData records
+// wrapInTLSRecords wraps payload in TLS ApplicationData records,
+// using mirror config record sizes when available.
 func (c *tlsMirrorConn) wrapInTLSRecords(payload []byte) [][]byte {
-	const maxRecordSize = 16384 // TLS max plaintext record size
+	maxRecordSize := 16384
+	if c.mirror != nil && c.mirror.MaxRecordSize > 0 {
+		maxRecordSize = c.mirror.MaxRecordSize
+	}
 
 	var records [][]byte
 	for len(payload) > 0 {
@@ -195,18 +283,43 @@ func (c *tlsMirrorConn) wrapInTLSRecords(payload []byte) [][]byte {
 			size = maxRecordSize
 		}
 
+		// Use bucket sizes from mirror config if available
+		if c.mirror != nil && c.mirror.PaddingPolicy == "bucket" && len(c.mirror.RecordSizes) > 0 {
+			// Find the smallest bucket that fits
+			for _, bs := range c.mirror.RecordSizes {
+				if bs >= size {
+					size = bs
+					break
+				}
+			}
+			if size > len(payload) {
+				size = len(payload)
+			}
+		}
+
 		record := make([]byte, 5+size)
 		record[0] = 0x17 // ApplicationData content type
 		record[1] = 0x03 // TLS 1.2
 		record[2] = 0x03
 		binary.BigEndian.PutUint16(record[3:5], uint16(size))
-		copy(record[5:], payload[:size])
+		copy(record[5:], payload[:tlsMin(size, len(payload))])
+		// Zero-pad if bucket size exceeds payload (padding)
 
 		records = append(records, record)
+		if size >= len(payload) {
+			break
+		}
 		payload = payload[size:]
 	}
 
 	return records
+}
+
+func tlsMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Ensure tlsMirrorConn implements net.Conn

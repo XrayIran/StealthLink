@@ -16,6 +16,7 @@ import (
 )
 
 type Config struct {
+	Variant          string                 `yaml:"variant"` // Optional explicit 4a..4e mode selector
 	Role             string                 `yaml:"role"`
 	Gateway          Gateway                `yaml:"gateway"`
 	Agent            Agent                  `yaml:"agent"`
@@ -59,6 +60,7 @@ type Agent struct {
 
 type Transport struct {
 	Type         string                `yaml:"type"`
+	Mode         string                `yaml:"mode"` // "4a" | "4b" | "4c" | "4d" | "4e" - StealthLink mode profile
 	Stealth      StealthConfig         `yaml:"stealth"`
 	UQSP         UQSPConfig            `yaml:"uqsp"`
 	Experimental bool                  `yaml:"experimental"`
@@ -88,6 +90,27 @@ type Transport struct {
 	Noize        NoizeConfig           `yaml:"noize"`
 	QPP          QPPConfig             `yaml:"qpp"`
 	HalfDuplex   HalfDuplexConfig      `yaml:"halfduplex"`
+
+	// Mode-specific configurations
+	Mode4a Mode4aConfig `yaml:"mode_4a"` // XHTTP + Domain Fronting configuration
+	Mode4b Mode4bConfig `yaml:"mode_4b"` // FakeTCP + Anti-DPI configuration
+	Mode4c Mode4cConfig `yaml:"mode_4c"` // TLS-Like + REALITY/AnyTLS configuration
+	Mode4d Mode4dConfig `yaml:"mode_4d"` // QUIC + Brutal CC configuration
+	Mode4e Mode4eConfig `yaml:"mode_4e"` // TrustTunnel + CSTP configuration
+
+	// Underlay dialer configuration
+	Dialer      string      `yaml:"dialer"`       // "direct" (default) | "warp" | "socks"
+	WARPDialer  WARPDialer  `yaml:"warp_dialer"`  // WARP dialer configuration
+	SOCKSDialer SOCKSDialer `yaml:"socks_dialer"` // SOCKS dialer configuration
+
+	// Upstream compatibility adapters (OPTIONAL)
+	// Use ONLY when interoperability with upstream clients is required
+	CompatMode string              `yaml:"compat_mode"` // "none" (default) | "xray" | "singbox"
+	Xray       XrayCompatConfig    `yaml:"xray"`        // Xray-core adapter configuration
+	Singbox    SingboxCompatConfig `yaml:"singbox"`     // sing-box adapter configuration
+
+	// Adaptive connection pool configuration
+	Pool AdaptivePoolConfig `yaml:"pool"`
 }
 
 // TFOConfig configures TCP Fast Open.
@@ -130,6 +153,35 @@ type DSCPConfig struct {
 type Proxy struct {
 	// URL supports schemes: http, https, socks5, socks5h. Empty disables proxy.
 	URL string `yaml:"url"`
+}
+
+// WARPDialer configures Cloudflare WARP as transport underlay
+type WARPDialer struct {
+	// Mode is the operator-facing WARP operational model.
+	// It is intentionally distinct from internal/warp.Config.Mode (engine selection).
+	//
+	// Accepted values (by convention): "consumer" | "zero-trust" | "connector".
+	// This field does not currently change low-level tunnel engine behavior.
+	Mode string `yaml:"mode"`
+
+	// Engine selects which WARP tunnel engine to use:
+	// - "builtin" (default): in-process WireGuard implementation
+	// - "wgquick": use system wg-quick tooling
+	Engine string `yaml:"engine"`
+
+	// Required controls whether selecting dialer=warp should hard-fail startup if
+	// WARP cannot be initialized. Default false is safer for dev/test, but operators
+	// should set true when WARP is used as an anti-blocking measure (to avoid silent IP leak).
+	Required bool `yaml:"required"`
+
+	DeviceID string `yaml:"device_id"` // WARP device registration ID
+}
+
+// SOCKSDialer configures SOCKS5 proxy as transport underlay
+type SOCKSDialer struct {
+	Address  string `yaml:"address"`  // SOCKS5 proxy address (host:port)
+	Username string `yaml:"username"` // Optional SOCKS5 username
+	Password string `yaml:"password"` // Optional SOCKS5 password
 }
 
 type TLSConfig struct {
@@ -338,6 +390,15 @@ type PortHopConfig struct {
 	Randomize bool          `yaml:"randomize"`  // Randomize port selection
 }
 
+// AdaptivePoolConfig configures the auto-scaling connection pool.
+type AdaptivePoolConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	Mode         string `yaml:"mode"` // normal, aggressive
+	MinSize      int    `yaml:"min_size"`
+	MaxSize      int    `yaml:"max_size"`
+	CooldownSecs int    `yaml:"cooldown_secs"`
+}
+
 // BrutalCCConfig configures Brutal congestion control.
 type BrutalCCConfig struct {
 	Enabled       bool `yaml:"enabled"`        // Enable brutal CC
@@ -345,12 +406,14 @@ type BrutalCCConfig struct {
 }
 
 type RawTCPConfig struct {
-	Interface string     `yaml:"interface"`
-	GUID      string     `yaml:"guid"`
-	IPv4      RawTCPAddr `yaml:"ipv4"`
-	IPv6      RawTCPAddr `yaml:"ipv6"`
-	PCAP      RawTCPPCAP `yaml:"pcap"`
-	TCP       RawTCPTCP  `yaml:"tcp"`
+	Interface          string     `yaml:"interface"`
+	GUID               string     `yaml:"guid"`
+	IPv4               RawTCPAddr `yaml:"ipv4"`
+	IPv6               RawTCPAddr `yaml:"ipv6"`
+	PCAP               RawTCPPCAP `yaml:"pcap"`
+	TCP                RawTCPTCP  `yaml:"tcp"`
+	FingerprintProfile string     `yaml:"fingerprint_profile"` // TCP option mimicry: chrome_win10, safari_macos, linux_default, android, random
+	BPFProfile         string     `yaml:"bpf_profile"`         // BPF filter mode: basic, strict, stealth
 
 	iface *net.Interface `yaml:"-"`
 	port  int            `yaml:"-"`
@@ -394,13 +457,21 @@ type TCPFlags struct {
 }
 
 type Mux struct {
-	MaxStreamsPerSession  int    `yaml:"max_streams_per_session"`
-	MaxStreamsTotal       int    `yaml:"max_streams_total"`
-	HeaderTimeout         string `yaml:"header_timeout"`
-	SmuxKeepAliveInterval string `yaml:"smux_keepalive_interval"`
-	SmuxKeepAliveTimeout  string `yaml:"smux_keepalive_timeout"`
-	MaxStreamBuffer       int    `yaml:"max_stream_buffer"`
-	MaxReceiveBuffer      int    `yaml:"max_receive_buffer"`
+	MaxStreamsPerSession  int                  `yaml:"max_streams_per_session"`
+	MaxStreamsTotal       int                  `yaml:"max_streams_total"`
+	HeaderTimeout         string               `yaml:"header_timeout"`
+	SmuxKeepAliveInterval string               `yaml:"smux_keepalive_interval"`
+	SmuxKeepAliveTimeout  string               `yaml:"smux_keepalive_timeout"`
+	MaxStreamBuffer       int                  `yaml:"max_stream_buffer"`
+	MaxReceiveBuffer      int                  `yaml:"max_receive_buffer"`
+	Shaper                PriorityShaperConfig `yaml:"shaper"`
+}
+
+// PriorityShaperConfig configures the smux priority shaper.
+type PriorityShaperConfig struct {
+	Enabled         bool `yaml:"enabled"`
+	MaxControlBurst int  `yaml:"max_control_burst"` // default: 16
+	QueueSize       int  `yaml:"queue_size"`        // default: 1024
 }
 
 type Service struct {
@@ -540,6 +611,7 @@ func (c *Config) applyDefaults() {
 	// Apply UQSP defaults if using UQSP transport
 	if c.UQSPEnabled() {
 		c.ApplyUQSPDefaults()
+		c.applyVariantPreset()
 	}
 	if c.Security.ReplayCapacity == 0 {
 		c.Security.ReplayCapacity = 1000000
@@ -562,8 +634,31 @@ func (c *Config) applyDefaults() {
 	if c.Mux.MaxReceiveBuffer == 0 {
 		c.Mux.MaxReceiveBuffer = 4 * 1024 * 1024
 	}
+	if c.Mux.Shaper.MaxControlBurst == 0 {
+		c.Mux.Shaper.MaxControlBurst = 16
+	}
+	if c.Mux.Shaper.QueueSize == 0 {
+		c.Mux.Shaper.QueueSize = 1024
+	}
 	c.applyExtensionDefaults()
 	c.applyStealthDefaults()
+	c.ApplyCompatDefaults()
+	c.applyPoolDefaults()
+}
+
+func (c *Config) applyPoolDefaults() {
+	if c.Transport.Pool.MinSize <= 0 {
+		c.Transport.Pool.MinSize = 2
+	}
+	if c.Transport.Pool.MaxSize <= 0 {
+		c.Transport.Pool.MaxSize = 32
+	}
+	if c.Transport.Pool.CooldownSecs <= 0 {
+		c.Transport.Pool.CooldownSecs = 30
+	}
+	if c.Transport.Pool.Mode == "" {
+		c.Transport.Pool.Mode = "normal"
+	}
 }
 
 func (c *Config) validate() error {
@@ -584,6 +679,19 @@ func (c *Config) validate() error {
 
 	// Validate UQSP configuration
 	if err := c.ValidateUQSP(); err != nil {
+		return err
+	}
+	if err := c.ValidateVariant(); err != nil {
+		return err
+	}
+
+	// Validate mode configuration
+	if err := c.ValidateMode(); err != nil {
+		return err
+	}
+
+	// Validate compatibility mode configuration
+	if err := c.ValidateCompatMode(); err != nil {
 		return err
 	}
 
@@ -913,6 +1021,16 @@ func (r *RawTCPConfig) validate(role, listen string) error {
 			}
 		}
 	}
+	switch strings.ToLower(strings.TrimSpace(r.FingerprintProfile)) {
+	case "", "chrome_win10", "safari_macos", "linux_default", "android", "random":
+	default:
+		allErrors = append(allErrors, fmt.Errorf("transport.rawtcp.fingerprint_profile must be one of: chrome_win10, safari_macos, linux_default, android, random"))
+	}
+	switch strings.ToLower(strings.TrimSpace(r.BPFProfile)) {
+	case "", "basic", "strict", "stealth":
+	default:
+		allErrors = append(allErrors, fmt.Errorf("transport.rawtcp.bpf_profile must be one of: basic, strict, stealth"))
+	}
 
 	allErrors = append(allErrors, r.PCAP.validate()...)
 	allErrors = append(allErrors, r.TCP.validate()...)
@@ -1104,4 +1222,482 @@ func isValidKCPBlock(block string) bool {
 
 func kcpKeyRequired(block string) bool {
 	return block != "none" && block != "null"
+}
+
+// GetActiveMode returns the active StealthLink mode.
+// Priority: transport.mode > variant > default ("4a")
+func (c *Config) GetActiveMode() string {
+	if c.Transport.Mode != "" {
+		return c.Transport.Mode
+	}
+	if c.Variant != "" {
+		return c.Variant
+	}
+	return "4a" // default mode
+}
+
+// GetMode4aConfig returns the Mode 4a configuration with defaults applied.
+func (c *Config) GetMode4aConfig() Mode4aConfig {
+	cfg := c.Transport.Mode4a
+	defaults := DefaultMode4aConfig()
+
+	// Apply defaults for zero values
+	if cfg.SessionPlacement == "" {
+		cfg.SessionPlacement = defaults.SessionPlacement
+	}
+	if cfg.SessionKey == "" {
+		cfg.SessionKey = defaults.SessionKey
+	}
+	if cfg.SequencePlacement == "" {
+		cfg.SequencePlacement = defaults.SequencePlacement
+	}
+	if cfg.SequenceKey == "" {
+		cfg.SequenceKey = defaults.SequenceKey
+	}
+	if cfg.CMaxReuseTimes == 0 {
+		cfg.CMaxReuseTimes = defaults.CMaxReuseTimes
+	}
+	if cfg.HMaxRequestTimes == 0 {
+		cfg.HMaxRequestTimes = defaults.HMaxRequestTimes
+	}
+	if cfg.HMaxReusableSecs == 0 {
+		cfg.HMaxReusableSecs = defaults.HMaxReusableSecs
+	}
+	if cfg.DrainTimeout == 0 {
+		cfg.DrainTimeout = defaults.DrainTimeout
+	}
+
+	return cfg
+}
+
+// GetMode4bConfig returns the Mode 4b configuration with defaults applied.
+func (c *Config) GetMode4bConfig() Mode4bConfig {
+	cfg := c.Transport.Mode4b
+	defaults := DefaultMode4bConfig()
+
+	// Apply defaults for zero values
+	if cfg.AEADMode == "" {
+		cfg.AEADMode = defaults.AEADMode
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = defaults.BatchSize
+	}
+	if cfg.TCPFingerprint == "" {
+		cfg.TCPFingerprint = defaults.TCPFingerprint
+	}
+
+	return cfg
+}
+
+// GetMode4cConfig returns the Mode 4c configuration with defaults applied.
+func (c *Config) GetMode4cConfig() Mode4cConfig {
+	cfg := c.Transport.Mode4c
+	defaults := DefaultMode4cConfig()
+
+	// Apply defaults for zero values
+	if cfg.TLSMode == "" {
+		cfg.TLSMode = defaults.TLSMode
+	}
+	if cfg.SpiderX == "" {
+		cfg.SpiderX = defaults.SpiderX
+	}
+	if cfg.SpiderY == [10]int{} {
+		cfg.SpiderY = defaults.SpiderY
+	}
+	if cfg.SpiderConcurrency == 0 {
+		cfg.SpiderConcurrency = defaults.SpiderConcurrency
+	}
+	if cfg.SpiderTimeout == 0 {
+		cfg.SpiderTimeout = defaults.SpiderTimeout
+	}
+	if cfg.MaxDepth == 0 {
+		cfg.MaxDepth = defaults.MaxDepth
+	}
+	if cfg.MaxTotalFetches == 0 {
+		cfg.MaxTotalFetches = defaults.MaxTotalFetches
+	}
+	if cfg.PerHostCap == 0 {
+		cfg.PerHostCap = defaults.PerHostCap
+	}
+	if cfg.PaddingScheme == "" {
+		cfg.PaddingScheme = defaults.PaddingScheme
+	}
+	if cfg.PaddingMin == 0 {
+		cfg.PaddingMin = defaults.PaddingMin
+	}
+	if cfg.PaddingMax == 0 {
+		cfg.PaddingMax = defaults.PaddingMax
+	}
+	if cfg.IdleSessionTimeout == 0 {
+		cfg.IdleSessionTimeout = defaults.IdleSessionTimeout
+	}
+	if cfg.RotationInterval == 0 {
+		cfg.RotationInterval = defaults.RotationInterval
+	}
+
+	return cfg
+}
+
+// GetMode4dConfig returns the Mode 4d configuration with defaults applied.
+func (c *Config) GetMode4dConfig() Mode4dConfig {
+	cfg := c.Transport.Mode4d
+	defaults := DefaultMode4dConfig()
+
+	// Apply defaults for zero values
+	if cfg.BrutalBandwidth == 0 {
+		cfg.BrutalBandwidth = defaults.BrutalBandwidth
+	}
+	if cfg.DataShards == 0 {
+		cfg.DataShards = defaults.DataShards
+	}
+	if cfg.ParityShards == 0 {
+		cfg.ParityShards = defaults.ParityShards
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = defaults.BatchSize
+	}
+
+	return cfg
+}
+
+// GetMode4eConfig returns the Mode 4e configuration with defaults applied.
+func (c *Config) GetMode4eConfig() Mode4eConfig {
+	cfg := c.Transport.Mode4e
+	defaults := DefaultMode4eConfig()
+
+	// Apply defaults for zero values
+	if cfg.HTTPVersion == "" {
+		cfg.HTTPVersion = defaults.HTTPVersion
+	}
+	if cfg.CSTPPath == "" {
+		cfg.CSTPPath = defaults.CSTPPath
+	}
+	if cfg.ICMPMuxMode == "" {
+		cfg.ICMPMuxMode = defaults.ICMPMuxMode
+	}
+	if cfg.RecoveryTimeout == 0 {
+		cfg.RecoveryTimeout = defaults.RecoveryTimeout
+	}
+	if cfg.MaxRecoveryAttempts == 0 {
+		cfg.MaxRecoveryAttempts = defaults.MaxRecoveryAttempts
+	}
+	if cfg.ReconnectBackoff == 0 {
+		cfg.ReconnectBackoff = defaults.ReconnectBackoff
+	}
+
+	return cfg
+}
+
+// ValidateMode validates the transport.mode configuration and mode-specific settings.
+func (c *Config) ValidateMode() error {
+	mode := c.GetActiveMode()
+
+	// Validate mode value
+	validModes := map[string]bool{
+		"4a": true,
+		"4b": true,
+		"4c": true,
+		"4d": true,
+		"4e": true,
+	}
+
+	if !validModes[mode] {
+		return fmt.Errorf("transport.mode must be one of: 4a, 4b, 4c, 4d, 4e (got: %s)", mode)
+	}
+
+	// Validate mode-specific configuration
+	switch mode {
+	case "4a":
+		return c.validateMode4a()
+	case "4b":
+		return c.validateMode4b()
+	case "4c":
+		return c.validateMode4c()
+	case "4d":
+		return c.validateMode4d()
+	case "4e":
+		return c.validateMode4e()
+	}
+
+	return nil
+}
+
+// validateMode4a validates Mode 4a (XHTTP + Domain Fronting) configuration.
+func (c *Config) validateMode4a() error {
+	cfg := c.GetMode4aConfig()
+
+	// Validate session placement
+	validPlacements := map[string]bool{
+		"path":   true,
+		"query":  true,
+		"header": true,
+		"cookie": true,
+	}
+
+	if !validPlacements[cfg.SessionPlacement] {
+		return fmt.Errorf("transport.mode_4a.session_placement must be one of: path, query, header, cookie (got: %s)", cfg.SessionPlacement)
+	}
+
+	if !validPlacements[cfg.SequencePlacement] {
+		return fmt.Errorf("transport.mode_4a.sequence_placement must be one of: path, query, header, cookie (got: %s)", cfg.SequencePlacement)
+	}
+
+	// Validate key names are not empty
+	if cfg.SessionKey == "" {
+		return fmt.Errorf("transport.mode_4a.session_key cannot be empty")
+	}
+
+	if cfg.SequenceKey == "" {
+		return fmt.Errorf("transport.mode_4a.sequence_key cannot be empty")
+	}
+
+	// Check for key collision
+	if cfg.SessionKey == cfg.SequenceKey && cfg.SessionPlacement == cfg.SequencePlacement {
+		return fmt.Errorf("transport.mode_4a: session_key and sequence_key cannot be the same when using the same placement type")
+	}
+
+	// Validate Xmux limits
+	if cfg.XmuxEnabled {
+		if cfg.CMaxReuseTimes < 1 {
+			return fmt.Errorf("transport.mode_4a.c_max_reuse_times must be >= 1 (got: %d)", cfg.CMaxReuseTimes)
+		}
+
+		if cfg.HMaxRequestTimes < 1 {
+			return fmt.Errorf("transport.mode_4a.h_max_request_times must be >= 1 (got: %d)", cfg.HMaxRequestTimes)
+		}
+
+		if cfg.HMaxReusableSecs < 1 {
+			return fmt.Errorf("transport.mode_4a.h_max_reusable_secs must be >= 1 (got: %d)", cfg.HMaxReusableSecs)
+		}
+
+		if cfg.DrainTimeout < 1*time.Second {
+			return fmt.Errorf("transport.mode_4a.drain_timeout must be >= 1s (got: %v)", cfg.DrainTimeout)
+		}
+	}
+
+	// Validate domain fronting configuration
+	if cfg.FrontingEnabled {
+		if cfg.FrontingDomain == "" {
+			return fmt.Errorf("transport.mode_4a.fronting_domain is required when fronting_enabled is true")
+		}
+
+		if cfg.TargetDomain == "" {
+			return fmt.Errorf("transport.mode_4a.target_domain is required when fronting_enabled is true")
+		}
+	}
+
+	return nil
+}
+
+// validateMode4b validates Mode 4b (FakeTCP + Anti-DPI) configuration.
+func (c *Config) validateMode4b() error {
+	cfg := c.GetMode4bConfig()
+
+	// Validate AEAD mode
+	validAEADModes := map[string]bool{
+		"off":              true,
+		"chacha20poly1305": true,
+		"aesgcm":           true,
+	}
+
+	if !validAEADModes[cfg.AEADMode] {
+		return fmt.Errorf("transport.mode_4b.aead_mode must be one of: off, chacha20poly1305, aesgcm (got: %s)", cfg.AEADMode)
+	}
+
+	// Validate shared secret is provided if AEAD is enabled
+	if cfg.AEADMode != "off" && cfg.SharedSecret == "" {
+		return fmt.Errorf("transport.mode_4b.shared_secret is required when aead_mode is not 'off'")
+	}
+
+	// Validate batch I/O configuration
+	if cfg.BatchIOEnabled {
+		if cfg.BatchSize < 1 || cfg.BatchSize > 64 {
+			return fmt.Errorf("transport.mode_4b.batch_size must be between 1 and 64 (got: %d)", cfg.BatchSize)
+		}
+	}
+
+	// Validate TCP fingerprint
+	validFingerprints := map[string]bool{
+		"linux":   true,
+		"windows": true,
+		"macos":   true,
+	}
+
+	if !validFingerprints[cfg.TCPFingerprint] {
+		return fmt.Errorf("transport.mode_4b.tcp_fingerprint must be one of: linux, windows, macos (got: %s)", cfg.TCPFingerprint)
+	}
+
+	// Validate fragment configuration
+	if cfg.FragmentEnabled && cfg.FragmentSize < 1 {
+		return fmt.Errorf("transport.mode_4b.fragment_size must be >= 1 when fragment_enabled is true (got: %d)", cfg.FragmentSize)
+	}
+
+	return nil
+}
+
+// validateMode4c validates Mode 4c (TLS-Like + REALITY/AnyTLS) configuration.
+func (c *Config) validateMode4c() error {
+	cfg := c.GetMode4cConfig()
+
+	// Validate TLS mode
+	validTLSModes := map[string]bool{
+		"reality": true,
+		"anytls":  true,
+	}
+
+	if !validTLSModes[cfg.TLSMode] {
+		return fmt.Errorf("transport.mode_4c.tls_mode must be one of: reality, anytls (got: %s)", cfg.TLSMode)
+	}
+
+	// Validate REALITY configuration
+	if cfg.REALITYEnabled {
+		if cfg.SpiderX == "" {
+			return fmt.Errorf("transport.mode_4c.spider_x is required when reality_enabled is true")
+		}
+
+		if cfg.SpiderConcurrency < 1 || cfg.SpiderConcurrency > 16 {
+			return fmt.Errorf("transport.mode_4c.spider_concurrency must be between 1 and 16 (got: %d)", cfg.SpiderConcurrency)
+		}
+
+		if cfg.SpiderTimeout < 1 {
+			return fmt.Errorf("transport.mode_4c.spider_timeout must be >= 1 (got: %d)", cfg.SpiderTimeout)
+		}
+
+		if cfg.MaxDepth < 1 || cfg.MaxDepth > 10 {
+			return fmt.Errorf("transport.mode_4c.max_depth must be between 1 and 10 (got: %d)", cfg.MaxDepth)
+		}
+
+		if cfg.MaxTotalFetches < 1 {
+			return fmt.Errorf("transport.mode_4c.max_total_fetches must be >= 1 (got: %d)", cfg.MaxTotalFetches)
+		}
+
+		if cfg.PerHostCap < 1 {
+			return fmt.Errorf("transport.mode_4c.per_host_cap must be >= 1 (got: %d)", cfg.PerHostCap)
+		}
+	}
+
+	// Validate AnyTLS configuration
+	if cfg.AnyTLSEnabled {
+		validPaddingSchemes := map[string]bool{
+			"random":   true,
+			"fixed":    true,
+			"burst":    true,
+			"adaptive": true,
+		}
+
+		if !validPaddingSchemes[cfg.PaddingScheme] {
+			return fmt.Errorf("transport.mode_4c.padding_scheme must be one of: random, fixed, burst, adaptive (got: %s)", cfg.PaddingScheme)
+		}
+
+		if cfg.PaddingMin < 0 {
+			return fmt.Errorf("transport.mode_4c.padding_min must be >= 0 (got: %d)", cfg.PaddingMin)
+		}
+
+		if cfg.PaddingMax < cfg.PaddingMin {
+			return fmt.Errorf("transport.mode_4c.padding_max must be >= padding_min (got: max=%d, min=%d)", cfg.PaddingMax, cfg.PaddingMin)
+		}
+
+		if cfg.IdleSessionTimeout < 1 {
+			return fmt.Errorf("transport.mode_4c.idle_session_timeout must be >= 1 (got: %d)", cfg.IdleSessionTimeout)
+		}
+	}
+
+	// Validate that at least one mode is enabled
+	if !cfg.REALITYEnabled && !cfg.AnyTLSEnabled {
+		return fmt.Errorf("transport.mode_4c: either reality_enabled or anytls_enabled must be true")
+	}
+
+	// Validate rotation configuration
+	if cfg.RotationEnabled && cfg.RotationInterval < 1 {
+		return fmt.Errorf("transport.mode_4c.rotation_interval must be >= 1 when rotation_enabled is true (got: %d)", cfg.RotationInterval)
+	}
+
+	return nil
+}
+
+// validateMode4d validates Mode 4d (QUIC + Brutal CC) configuration.
+func (c *Config) validateMode4d() error {
+	cfg := c.GetMode4dConfig()
+
+	// Validate Brutal CC configuration
+	if cfg.BrutalEnabled {
+		if cfg.BrutalBandwidth < 1 {
+			return fmt.Errorf("transport.mode_4d.brutal_bandwidth must be >= 1 Mbps (got: %d)", cfg.BrutalBandwidth)
+		}
+	}
+
+	// Validate FEC configuration
+	if cfg.FECEnabled {
+		if cfg.DataShards < 3 || cfg.DataShards > 20 {
+			return fmt.Errorf("transport.mode_4d.data_shards must be between 3 and 20 (got: %d)", cfg.DataShards)
+		}
+
+		if cfg.ParityShards < 1 || cfg.ParityShards > 10 {
+			return fmt.Errorf("transport.mode_4d.parity_shards must be between 1 and 10 (got: %d)", cfg.ParityShards)
+		}
+	}
+
+	// Validate batch I/O configuration
+	if cfg.BatchIOEnabled {
+		if cfg.BatchSize < 1 || cfg.BatchSize > 64 {
+			return fmt.Errorf("transport.mode_4d.batch_size must be between 1 and 64 (got: %d)", cfg.BatchSize)
+		}
+	}
+
+	// Validate junk packet configuration
+	if cfg.JunkPacketsEnabled && cfg.JunkPacketRate < 1 {
+		return fmt.Errorf("transport.mode_4d.junk_packet_rate must be >= 1 when junk_packets_enabled is true (got: %d)", cfg.JunkPacketRate)
+	}
+
+	return nil
+}
+
+// validateMode4e validates Mode 4e (TrustTunnel + CSTP) configuration.
+func (c *Config) validateMode4e() error {
+	cfg := c.GetMode4eConfig()
+
+	// Validate HTTP version
+	validHTTPVersions := map[string]bool{
+		"http2": true,
+		"http3": true,
+	}
+
+	if !validHTTPVersions[cfg.HTTPVersion] {
+		return fmt.Errorf("transport.mode_4e.http_version must be one of: http2, http3 (got: %s)", cfg.HTTPVersion)
+	}
+
+	// Validate CSTP configuration
+	if cfg.CSTPEnabled && cfg.CSTPPath == "" {
+		return fmt.Errorf("transport.mode_4e.cstp_path is required when cstp_enabled is true")
+	}
+
+	// Validate ICMP mux configuration
+	if cfg.ICMPMuxEnabled {
+		validICMPModes := map[string]bool{
+			"echo":      true,
+			"timestamp": true,
+		}
+
+		if !validICMPModes[cfg.ICMPMuxMode] {
+			return fmt.Errorf("transport.mode_4e.icmp_mux_mode must be one of: echo, timestamp (got: %s)", cfg.ICMPMuxMode)
+		}
+	}
+
+	// Validate session recovery configuration
+	if cfg.SessionRecoveryEnabled {
+		if cfg.RecoveryTimeout < 1 {
+			return fmt.Errorf("transport.mode_4e.recovery_timeout must be >= 1 (got: %d)", cfg.RecoveryTimeout)
+		}
+
+		if cfg.MaxRecoveryAttempts < 1 {
+			return fmt.Errorf("transport.mode_4e.max_recovery_attempts must be >= 1 (got: %d)", cfg.MaxRecoveryAttempts)
+		}
+	}
+
+	// Validate reconnection configuration
+	if cfg.ReconnectEnabled && cfg.ReconnectBackoff < 1 {
+		return fmt.Errorf("transport.mode_4e.reconnect_backoff must be >= 1 when reconnect_enabled is true (got: %d)", cfg.ReconnectBackoff)
+	}
+
+	return nil
 }

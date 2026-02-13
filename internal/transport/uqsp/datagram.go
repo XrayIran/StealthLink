@@ -1,11 +1,15 @@
 package uqsp
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"stealthlink/internal/metrics"
 )
 
 // DatagramFragment represents a fragment of a larger datagram
@@ -63,78 +67,172 @@ func (f *DatagramFragment) Decode(data []byte) error {
 
 // DatagramReassembler reassembles fragmented datagrams
 type DatagramReassembler struct {
-	// fragments maps sessionID+fragmentID to fragments
-	fragments map[uint64][]*DatagramFragment
+	// fragments maps sessionID+fragmentID to reassembly buckets
+	fragments map[uint64]*datagramReassemblyBucket
 	mu        sync.Mutex
 
-	// timeout for incomplete reassemblies
-	timeout int64
+	timeout      time.Duration
+	maxBytes     int
+	currentBytes int
 }
 
 // NewDatagramReassembler creates a new datagram reassembler
 func NewDatagramReassembler() *DatagramReassembler {
+	return NewDatagramReassemblerWithConfig(30*time.Second, 4<<20)
+}
+
+// NewDatagramReassemblerWithConfig creates a new datagram reassembler with
+// explicit timeout and memory cap.
+func NewDatagramReassemblerWithConfig(timeout time.Duration, maxBytes int) *DatagramReassembler {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if maxBytes <= 0 {
+		maxBytes = 4 << 20 // 4 MiB aggregate fragment memory cap
+	}
 	return &DatagramReassembler{
-		fragments: make(map[uint64][]*DatagramFragment),
-		timeout:   30, // 30 seconds
+		fragments: make(map[uint64]*datagramReassemblyBucket),
+		timeout:   timeout,
+		maxBytes:  maxBytes,
 	}
 }
 
 // AddFragment adds a fragment and attempts reassembly
 func (r *DatagramReassembler) AddFragment(fragment *DatagramFragment) ([]byte, error) {
+	if fragment == nil {
+		return nil, fmt.Errorf("nil fragment")
+	}
+	if fragment.TotalFragments == 0 {
+		return nil, fmt.Errorf("invalid total fragments: 0")
+	}
+	if fragment.FragmentIndex >= fragment.TotalFragments {
+		return nil, fmt.Errorf("invalid fragment index %d for total %d", fragment.FragmentIndex, fragment.TotalFragments)
+	}
+
 	key := r.makeKey(fragment.SessionID, fragment.FragmentID)
+	now := time.Now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.cleanupExpiredLocked(now)
 
-	// Initialize fragment list if needed
-	if r.fragments[key] == nil {
-		r.fragments[key] = make([]*DatagramFragment, 0, fragment.TotalFragments)
+	bucket, ok := r.fragments[key]
+	if !ok {
+		bucket = &datagramReassemblyBucket{
+			total:     fragment.TotalFragments,
+			fragments: make(map[uint8][]byte, fragment.TotalFragments),
+			updatedAt: now,
+		}
+		r.fragments[key] = bucket
+	}
+	if bucket.total != fragment.TotalFragments {
+		return nil, fmt.Errorf("fragment total mismatch: got %d want %d", fragment.TotalFragments, bucket.total)
 	}
 
-	// Add fragment
-	r.fragments[key] = append(r.fragments[key], fragment)
+	if _, exists := bucket.fragments[fragment.FragmentIndex]; !exists {
+		cp := make([]byte, len(fragment.Data))
+		copy(cp, fragment.Data)
 
-	// Check if we have all fragments
-	if uint8(len(r.fragments[key])) >= fragment.TotalFragments {
-		return r.reassemble(key, fragment.TotalFragments)
+		if err := r.reserveBytesLocked(len(cp)); err != nil {
+			return nil, err
+		}
+
+		bucket.fragments[fragment.FragmentIndex] = cp
+		bucket.received++
+		bucket.bytes += len(cp)
+		r.currentBytes += len(cp)
+	}
+	bucket.updatedAt = now
+
+	// Check if complete.
+	if bucket.received >= bucket.total {
+		return r.reassembleLocked(key)
 	}
 
 	return nil, nil // Not complete yet
 }
 
-// reassemble reassembles fragments into a complete datagram
-func (r *DatagramReassembler) reassemble(key uint64, total uint8) ([]byte, error) {
-	fragments := r.fragments[key]
-	delete(r.fragments, key)
+func (r *DatagramReassembler) reserveBytesLocked(size int) error {
+	if size < 0 {
+		return fmt.Errorf("invalid fragment size %d", size)
+	}
+	if size > r.maxBytes {
+		return fmt.Errorf("fragment size %d exceeds reassembly memory cap %d", size, r.maxBytes)
+	}
+	for r.currentBytes+size > r.maxBytes {
+		if !r.evictOldestLocked() {
+			return fmt.Errorf("reassembly memory cap exceeded")
+		}
+	}
+	return nil
+}
 
-	if uint8(len(fragments)) < total {
+func (r *DatagramReassembler) evictOldestLocked() bool {
+	var (
+		oldestKey uint64
+		oldestAt  time.Time
+		found     bool
+	)
+	for key, bucket := range r.fragments {
+		if !found || bucket.updatedAt.Before(oldestAt) {
+			found = true
+			oldestKey = key
+			oldestAt = bucket.updatedAt
+		}
+	}
+	if !found {
+		return false
+	}
+	bucket := r.fragments[oldestKey]
+	r.currentBytes -= bucket.bytes
+	delete(r.fragments, oldestKey)
+	metrics.IncUQSPReassemblyEviction()
+	return true
+}
+
+func (r *DatagramReassembler) cleanupExpiredLocked(now time.Time) {
+	for key, bucket := range r.fragments {
+		if now.Sub(bucket.updatedAt) > r.timeout {
+			r.currentBytes -= bucket.bytes
+			delete(r.fragments, key)
+			metrics.IncUQSPReassemblyEviction()
+		}
+	}
+	if r.currentBytes < 0 {
+		r.currentBytes = 0
+	}
+}
+
+// reassembleLocked reassembles fragments into a complete datagram.
+// Caller must hold r.mu.
+func (r *DatagramReassembler) reassembleLocked(key uint64) ([]byte, error) {
+	bucket, ok := r.fragments[key]
+	if !ok {
+		return nil, fmt.Errorf("reassembly bucket not found")
+	}
+	delete(r.fragments, key)
+	r.currentBytes -= bucket.bytes
+	if r.currentBytes < 0 {
+		r.currentBytes = 0
+	}
+
+	if bucket.received < bucket.total {
 		return nil, fmt.Errorf("incomplete fragments")
 	}
 
-	// Sort fragments by index and calculate total size
 	totalSize := 0
-	sorted := make([]*DatagramFragment, total)
-	for _, f := range fragments {
-		if f.FragmentIndex >= total {
-			return nil, fmt.Errorf("invalid fragment index")
-		}
-		sorted[f.FragmentIndex] = f
-		totalSize += len(f.Data)
-	}
-
-	// Check for missing fragments
-	for i := uint8(0); i < total; i++ {
-		if sorted[i] == nil {
+	for i := uint8(0); i < bucket.total; i++ {
+		payload, ok := bucket.fragments[i]
+		if !ok {
 			return nil, fmt.Errorf("missing fragment %d", i)
 		}
+		totalSize += len(payload)
 	}
 
-	// Reassemble
 	result := make([]byte, 0, totalSize)
-	for _, f := range sorted {
-		result = append(result, f.Data...)
+	for i := uint8(0); i < bucket.total; i++ {
+		result = append(result, bucket.fragments[i]...)
 	}
-
 	return result, nil
 }
 
@@ -143,11 +241,25 @@ func (r *DatagramReassembler) makeKey(sessionID uint32, fragmentID uint16) uint6
 	return (uint64(sessionID) << 16) | uint64(fragmentID)
 }
 
-// DatagramFragmenter fragments large datagrams
+type datagramReassemblyBucket struct {
+	total     uint8
+	received  uint8
+	fragments map[uint8][]byte
+	bytes     int
+	updatedAt time.Time
+}
+
+// DatagramFragmenter fragments large datagrams.
+// When PaddingMin/PaddingMax are set, random padding is appended to the
+// original datagram *before* fragmentation so that all fragments carry
+// the same padding policy and reassembly strips it cleanly.
 type DatagramFragmenter struct {
 	// nextFragmentID is the next fragment ID to use
 	nextID uint16
 	mu     sync.Mutex
+
+	PaddingMin int
+	PaddingMax int
 }
 
 // NewDatagramFragmenter creates a new datagram fragmenter
@@ -157,8 +269,28 @@ func NewDatagramFragmenter() *DatagramFragmenter {
 	}
 }
 
-// Fragment fragments a datagram into smaller pieces
+// Fragment fragments a datagram into smaller pieces.
+// If padding is configured, it is applied to the whole datagram before
+// fragmentation so reassembly can strip it using the original length.
 func (f *DatagramFragmenter) Fragment(sessionID uint32, data []byte) []*DatagramFragment {
+	// Apply padding before fragmentation
+	if f.PaddingMax > 0 && f.PaddingMax >= f.PaddingMin {
+		padLen := f.PaddingMin
+		delta := f.PaddingMax - f.PaddingMin
+		if delta > 0 {
+			var b [2]byte
+			rand.Read(b[:])
+			padLen += int(binary.BigEndian.Uint16(b[:])) % (delta + 1)
+		}
+		if padLen > 0 {
+			// Prepend 2-byte original length header + data + padding
+			padded := make([]byte, 2+len(data)+padLen)
+			binary.BigEndian.PutUint16(padded[0:2], uint16(len(data)))
+			copy(padded[2:], data)
+			// Padding bytes remain zero
+			data = padded
+		}
+	}
 	if len(data) <= MaxFragmentSize {
 		// No fragmentation needed
 		return []*DatagramFragment{
@@ -277,28 +409,29 @@ func (r *UDPRelay) SendToPeer(sessionID uint32, data []byte) error {
 
 // ReceiveFromPeer receives a UDP datagram from the peer via UQSP
 func (r *UDPRelay) ReceiveFromPeer(sessionID uint32) ([]byte, *net.UDPAddr, error) {
-	dg, err := r.sessionManager.ReceiveDatagram(sessionID)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Try to decode as fragment
-	frag := &DatagramFragment{}
-	if err := frag.Decode(dg.Data); err == nil {
-		// It's a fragment, try to reassemble
-		data, err := r.reassembler.AddFragment(frag)
+	for i := 0; i < 1024; i++ {
+		dg, err := r.sessionManager.ReceiveDatagram(sessionID)
 		if err != nil {
 			return nil, nil, err
 		}
-		if data == nil {
-			// Not complete yet, wait for more fragments
-			return r.ReceiveFromPeer(sessionID)
-		}
-		return data, dg.TargetAddr, nil
-	}
 
-	// Not a fragment, return as-is
-	return dg.Data, dg.TargetAddr, nil
+		// Try to decode as fragment.
+		frag := &DatagramFragment{}
+		if err := frag.Decode(dg.Data); err == nil {
+			data, err := r.reassembler.AddFragment(frag)
+			if err != nil {
+				return nil, nil, err
+			}
+			if data == nil {
+				continue
+			}
+			return data, dg.TargetAddr, nil
+		}
+
+		// Not a fragment, return as-is.
+		return dg.Data, dg.TargetAddr, nil
+	}
+	return nil, nil, fmt.Errorf("datagram reassembly exceeded wait budget")
 }
 
 // LocalAddr returns the local UDP address
@@ -376,6 +509,9 @@ type HysteriaUDPManager struct {
 	// Local UDP connections
 	udpConns map[uint32]*net.UDPConn
 	connMu   sync.RWMutex
+
+	// done signals the cleanup goroutine to stop.
+	done chan struct{}
 }
 
 // hysteriaPacket tracks fragments for reassembly
@@ -390,33 +526,70 @@ type hysteriaPacket struct {
 
 // HysteriaUDPSession represents a UDP session
 type HysteriaUDPSession struct {
-	SessionID   uint32
-	LocalAddr   *net.UDPAddr
-	RemoteAddr  *net.UDPAddr
-	CreatedAt   time.Time
-	LastActive  time.Time
-	bytesIn     uint64
-	bytesOut    uint64
-	fullCone    bool
+	SessionID  uint32
+	LocalAddr  *net.UDPAddr
+	RemoteAddr *net.UDPAddr
+	CreatedAt  time.Time
+	lastActive atomic.Int64 // UnixNano; use LastActiveTime()/touch()
+	bytesIn    atomic.Uint64
+	bytesOut   atomic.Uint64
+	fullCone   bool
 }
 
-// NewHysteriaUDPManager creates a new Hysteria UDP manager
+// touch updates the last-active timestamp atomically.
+func (s *HysteriaUDPSession) touch() {
+	s.lastActive.Store(time.Now().UnixNano())
+}
+
+// LastActiveTime returns the last-active timestamp.
+func (s *HysteriaUDPSession) LastActiveTime() time.Time {
+	return time.Unix(0, s.lastActive.Load())
+}
+
+// NewHysteriaUDPManager creates a new Hysteria UDP manager with a background
+// cleanup goroutine that evicts stale sessions and incomplete packets every 30s.
 func NewHysteriaUDPManager() *HysteriaUDPManager {
-	return &HysteriaUDPManager{
+	m := &HysteriaUDPManager{
 		sessions: make(map[uint32]*HysteriaUDPSession),
 		packets:  make(map[uint64]*hysteriaPacket),
 		udpConns: make(map[uint32]*net.UDPConn),
+		done:     make(chan struct{}),
+	}
+	go m.cleanupLoop()
+	return m
+}
+
+// cleanupLoop periodically evicts stale sessions and packets.
+func (h *HysteriaUDPManager) cleanupLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			h.Cleanup(2 * time.Minute)
+		case <-h.done:
+			return
+		}
+	}
+}
+
+// Stop shuts down the background cleanup goroutine.
+func (h *HysteriaUDPManager) Stop() {
+	select {
+	case <-h.done:
+	default:
+		close(h.done)
 	}
 }
 
 // CreateSession creates a new UDP session
 func (h *HysteriaUDPManager) CreateSession(sessionID uint32, remoteAddr string) (*HysteriaUDPSession, error) {
 	sess := &HysteriaUDPSession{
-		SessionID:  sessionID,
-		CreatedAt:  time.Now(),
-		LastActive: time.Now(),
-		fullCone:   true,
+		SessionID: sessionID,
+		CreatedAt: time.Now(),
+		fullCone:  true,
 	}
+	sess.touch()
 
 	if remoteAddr != "" {
 		addr, err := net.ResolveUDPAddr("udp", remoteAddr)
@@ -441,7 +614,7 @@ func (h *HysteriaUDPManager) GetSession(sessionID uint32) (*HysteriaUDPSession, 
 	return sess, ok
 }
 
-// RemoveSession removes a session
+// RemoveSession removes a session and cleans up its orphaned packets.
 func (h *HysteriaUDPManager) RemoveSession(sessionID uint32) {
 	h.sessMu.Lock()
 	delete(h.sessions, sessionID)
@@ -453,6 +626,15 @@ func (h *HysteriaUDPManager) RemoveSession(sessionID uint32) {
 		delete(h.udpConns, sessionID)
 	}
 	h.connMu.Unlock()
+
+	// Purge incomplete packets belonging to this session.
+	h.pktMu.Lock()
+	for key, pkt := range h.packets {
+		if pkt.sessionID == sessionID {
+			delete(h.packets, key)
+		}
+	}
+	h.pktMu.Unlock()
 }
 
 // SendDatagram sends a UDP datagram via Hysteria format
@@ -468,8 +650,8 @@ func (h *HysteriaUDPManager) SendDatagram(sessionID uint32, payload []byte) (*Hy
 
 	sess, ok := h.GetSession(sessionID)
 	if ok {
-		sess.bytesOut += uint64(len(payload))
-		sess.LastActive = time.Now()
+		sess.bytesOut.Add(uint64(len(payload)))
+		sess.touch()
 	}
 
 	return dg, nil
@@ -480,8 +662,8 @@ func (h *HysteriaUDPManager) ReceiveDatagram(dg *HysteriaDatagram) ([]byte, erro
 	// Update session activity
 	sess, ok := h.GetSession(dg.SessionID)
 	if ok {
-		sess.bytesIn += uint64(len(dg.Payload))
-		sess.LastActive = time.Now()
+		sess.bytesIn.Add(uint64(len(dg.Payload)))
+		sess.touch()
 	}
 
 	// If single fragment, return immediately
@@ -495,10 +677,18 @@ func (h *HysteriaUDPManager) ReceiveDatagram(dg *HysteriaDatagram) ([]byte, erro
 
 // reassemblePacket reassembles fragmented packets
 func (h *HysteriaUDPManager) reassemblePacket(dg *HysteriaDatagram) ([]byte, error) {
+	if dg.FragmentCount == 0 {
+		return nil, fmt.Errorf("invalid fragment count 0")
+	}
+	if dg.FragmentID >= dg.FragmentCount {
+		return nil, fmt.Errorf("invalid fragment id %d/%d", dg.FragmentID, dg.FragmentCount)
+	}
+
 	key := (uint64(dg.SessionID) << 16) | uint64(dg.PacketID)
 
 	h.pktMu.Lock()
 	defer h.pktMu.Unlock()
+	h.cleanupPacketsLocked(30 * time.Second)
 
 	// Get or create packet tracker
 	pkt, ok := h.packets[key]
@@ -511,10 +701,12 @@ func (h *HysteriaUDPManager) reassemblePacket(dg *HysteriaDatagram) ([]byte, err
 			timestamp: time.Now(),
 		}
 		h.packets[key] = pkt
+	} else if pkt.total != dg.FragmentCount {
+		return nil, fmt.Errorf("fragment count mismatch for packet %d", dg.PacketID)
 	}
 
 	// Add fragment
-	if dg.FragmentID < dg.FragmentCount {
+	if _, exists := pkt.fragments[dg.FragmentID]; !exists {
 		pkt.fragments[dg.FragmentID] = dg.Payload
 		pkt.received++
 	}
@@ -524,27 +716,45 @@ func (h *HysteriaUDPManager) reassemblePacket(dg *HysteriaDatagram) ([]byte, err
 		// Reassemble
 		var result []byte
 		for i := uint8(0); i < pkt.total; i++ {
-			result = append(result, pkt.fragments[i]...)
+			part, ok := pkt.fragments[i]
+			if !ok {
+				return nil, nil
+			}
+			result = append(result, part...)
 		}
 		delete(h.packets, key)
 		return result, nil
 	}
 
-	return nil, fmt.Errorf("packet incomplete")
+	return nil, nil
+}
+
+func (h *HysteriaUDPManager) cleanupPacketsLocked(timeout time.Duration) {
+	now := time.Now()
+	for key, pkt := range h.packets {
+		if now.Sub(pkt.timestamp) > timeout {
+			delete(h.packets, key)
+		}
+	}
 }
 
 // Cleanup removes expired sessions and packets
 func (h *HysteriaUDPManager) Cleanup(timeout time.Duration) {
 	now := time.Now()
 
-	// Clean sessions
-	h.sessMu.Lock()
+	// Collect expired session IDs under read lock, then remove.
+	var expired []uint32
+	h.sessMu.RLock()
 	for id, sess := range h.sessions {
-		if now.Sub(sess.LastActive) > timeout {
-			delete(h.sessions, id)
+		if now.Sub(sess.LastActiveTime()) > timeout {
+			expired = append(expired, id)
 		}
 	}
-	h.sessMu.Unlock()
+	h.sessMu.RUnlock()
+
+	for _, id := range expired {
+		h.RemoveSession(id)
+	}
 
 	// Clean packets
 	h.pktMu.Lock()

@@ -1,0 +1,49 @@
+role: agent
+variant: "4d"
+
+agent:
+  id: "agent-vpn-1"
+  gateway_addr: "gateway.example.com:8443"
+  reconnect_backoff: "3s"
+
+transport:
+  type: uqsp
+  uqsp:
+    carrier:
+      type: quic
+    congestion:
+      algorithm: brutal
+      bandwidth_mbps: 200
+    capsules:
+      connect_ip: true
+
+security:
+  # IMPORTANT: Must match the gateway's shared_key exactly.
+  # Generate your own key via: stealthlink-ctl secret
+  shared_key: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+
+services:
+  - name: "vpnlink"
+    protocol: "tun"
+    tun:
+      name: "sl0"
+      mode: "tun"
+      mtu: 1400
+
+vpn:
+  enabled: true
+  mode: "tun"
+  name: "sl0"
+  interface_ip: "10.77.0.2/30"
+  peer_ip: "10.77.0.1"
+  mtu: 1400
+  routes:
+    - destination: "0.0.0.0/0"
+      gateway: "10.77.0.1"
+      metric: 100
+  dns:
+    - "1.1.1.1"
+    - "8.8.8.8"
+
+metrics:
+  listen: "127.0.0.1:9092"

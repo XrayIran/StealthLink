@@ -1,0 +1,28 @@
+# Example: Direct underlay dialer (default behavior)
+# This is the default configuration - traffic goes directly to the gateway
+
+role: agent
+
+agent:
+  id: agent-001
+  gateway_addr: gateway.example.com:443
+
+transport:
+  type: stealth
+  mode: "4a"  # XHTTP + Domain Fronting
+  
+  # Underlay dialer configuration
+  dialer: direct  # Use direct network dialing (default)
+  
+  stealth:
+    carrier:
+      kind: tcp
+    camouflage:
+      mode: tls
+      tls:
+        server_name: gateway.example.com
+
+services:
+  - name: web
+    listen: 127.0.0.1:8080
+    target: 10.0.0.1:80

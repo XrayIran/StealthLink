@@ -35,6 +35,7 @@ type DomainFrontOverlay struct {
 	mu         sync.RWMutex
 	currentIP  string
 	ipIndex    int
+	frontIndex int // cycles through FrontDomain + FailoverDomains
 	httpClient *http.Client
 }
 
@@ -82,18 +83,33 @@ func (d *DomainFrontOverlay) Apply(conn net.Conn) (net.Conn, error) {
 }
 
 // PrepareContext wires domain-fronting options into dial path.
+// Each call rotates the active front domain so successive dials distribute
+// across the primary + failover domains.
 func (d *DomainFrontOverlay) PrepareContext(ctx context.Context) (context.Context, error) {
 	if !d.EnabledField {
 		return ctx, nil
 	}
+	activeFront := d.SelectFront()
 	connectIP := d.SelectIP()
+
+	// Build failover list excluding the active front (it's already primary).
+	var failover []string
+	if d.FrontDomain != "" && d.FrontDomain != activeFront {
+		failover = append(failover, d.FrontDomain)
+	}
+	for _, h := range d.FailoverDomains {
+		if h != activeFront {
+			failover = append(failover, h)
+		}
+	}
+
 	opts := tlsutil.FrontDialOptions{
 		Enabled:       true,
-		FrontDomain:   d.FrontDomain,
+		FrontDomain:   activeFront,
 		RealHost:      d.RealHost,
 		ConnectIP:     connectIP,
 		CFWorker:      d.CFWorker,
-		FailoverHosts: append([]string(nil), d.FailoverDomains...),
+		FailoverHosts: failover,
 	}
 	return tlsutil.WithFrontDialOptions(ctx, opts), nil
 }
@@ -116,6 +132,32 @@ func (d *DomainFrontOverlay) GetHTTPHost() string {
 		return ""
 	}
 	return d.RealHost
+}
+
+// SelectFront returns the current front domain and advances the rotation index.
+// The rotation pool is [FrontDomain] + FailoverDomains; when the pool is empty
+// or exhausted, it wraps around.
+func (d *DomainFrontOverlay) SelectFront() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	pool := d.frontPool()
+	if len(pool) == 0 {
+		return d.FrontDomain
+	}
+	front := pool[d.frontIndex%len(pool)]
+	d.frontIndex = (d.frontIndex + 1) % len(pool)
+	return front
+}
+
+// frontPool builds the combined front domain list (must hold d.mu).
+func (d *DomainFrontOverlay) frontPool() []string {
+	pool := make([]string, 0, 1+len(d.FailoverDomains))
+	if d.FrontDomain != "" {
+		pool = append(pool, d.FrontDomain)
+	}
+	pool = append(pool, d.FailoverDomains...)
+	return pool
 }
 
 // SelectIP selects an IP to connect to (for rotation)

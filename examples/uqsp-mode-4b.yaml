@@ -1,4 +1,5 @@
 role: agent
+variant: "4b"
 
 agent:
   id: "agent-4b"
@@ -12,6 +13,43 @@ transport:
       rawtcp:
         raw:
           interface: "eth0"
+          ipv4:
+            addr: "192.0.2.10:443"
+            router_mac: "aa:bb:cc:dd:ee:ff"
+          pcap:
+            sockbuf: 4194304
+          tcp:
+            local_flag: ["PA", "SA", "FA"]
+            remote_flag: ["PA", "SA", "FA"]
+            randomize: true
+            cycle_mode: random
+          # TCP fingerprint mimicry: chrome_win10, safari_macos, linux_default, android, random
+          fingerprint_profile: "chrome_win10"
+          # BPF filter profile: basic (default), strict (payload-only), stealth (strict + anti-scan)
+          bpf_profile: "stealth"
+        kcp:
+          block: "aes"
+          mode: "fast3"
+          packet_guard: true
+          packet_guard_magic: "PQT1"
+          packet_guard_window: 30
+          packet_guard_skew: 1
+        
+        # New: FakeTCP Directional Encryption
+        crypto:
+          aead: "chacha20poly1305"  # options: chacha20poly1305, aesgcm, off
+          key: "replace-faketcp-shared-secret"
+
+        # New: System Optimization
+        sys:
+          udp_batch_enabled: true
+          udp_batch_size: 16
+
+    # New: Adaptive Connection Pool
+    pool:
+      mode: "aggressive"  # options: normal, aggressive
+      min_size: 4
+      max_size: 64
     obfuscation:
       profile: adaptive
       padding_min: 32
@@ -20,8 +58,7 @@ transport:
     behaviors:
       obfs4:
         enabled: true
-        node_id: "replace-node-id"
-        public_key: "replace-public-key"
+        seed: "replace-shared-obfs4-seed"
         iat_mode: 1
       awg:
         enabled: true

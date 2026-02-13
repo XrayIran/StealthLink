@@ -128,7 +128,10 @@ type Psiphon struct {
 	bytesOut atomic.Uint64
 }
 
-// Dial connects to a Psiphon server using best available protocol
+// Dial connects to a Psiphon server using best available protocol.
+// It retries the full protocol×server matrix up to 3 times with exponential
+// backoff (1s → 2s → 4s) so transient CDN/network failures don't immediately
+// cause a permanent connection failure.
 func Dial(ctx context.Context, config *Config) (*Psiphon, error) {
 	if config == nil {
 		config = DefaultConfig()
@@ -150,21 +153,37 @@ func Dial(ctx context.Context, config *Config) (*Psiphon, error) {
 		return nil, fmt.Errorf("no servers available")
 	}
 
-	// Try each protocol in order
-	for _, protocol := range config.Protocols {
-		for _, server := range servers {
-			if server.Protocol != protocol && server.Protocol != "" {
-				continue
-			}
+	const maxAttempts = 3
+	backoff := 1 * time.Second
+	var lastErr error
 
-			p, err := tryConnect(ctx, config, &server, protocol)
-			if err == nil {
-				return p, nil
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		// Try each protocol in order
+		for _, protocol := range config.Protocols {
+			for _, server := range servers {
+				if server.Protocol != protocol && server.Protocol != "" {
+					continue
+				}
+
+				p, err := tryConnect(ctx, config, &server, protocol)
+				if err == nil {
+					return p, nil
+				}
+				lastErr = err
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("failed to connect with any protocol")
+	return nil, fmt.Errorf("failed to connect after %d attempts: %w", maxAttempts, lastErr)
 }
 
 // discoverServers fetches server list from discovery service
@@ -334,99 +353,131 @@ func connectSSH(ctx context.Context, config *Config, server *ServerEntry) (*Psip
 	return p, nil
 }
 
-// connectMeek connects using meek (CDN tunneling)
+// connectMeek connects using meek (CDN tunneling).
+// It rotates through FrontingHosts (falling back to FrontingDomain) so that a
+// single blocked CDN edge doesn't prevent connection.
 func connectMeek(ctx context.Context, config *Config, server *ServerEntry) (*Psiphon, error) {
-	// Build meek configuration
-	meekConfig := &MeekConfig{
-		FrontingDomain: server.MeekFrontingDomain,
-		FrontingHosts:  server.MeekFrontingHosts,
-		Path:           "/",
-		MaxBodySize:    65536,
-		PollInterval:   100 * time.Millisecond,
-		DisableSNI:     server.TLSDisableSNI,
+	// Build the ordered list of fronting hosts to try.
+	// Primary domain first, then any additional hosts from the server entry,
+	// then any global CDN hosts from config.
+	var frontHosts []string
+	if server.MeekFrontingDomain != "" {
+		frontHosts = append(frontHosts, server.MeekFrontingDomain)
+	}
+	for _, h := range server.MeekFrontingHosts {
+		if h != "" && h != server.MeekFrontingDomain {
+			frontHosts = append(frontHosts, h)
+		}
+	}
+	for _, h := range config.MeekCDNFrontingHosts {
+		if h != "" {
+			frontHosts = append(frontHosts, h)
+		}
+	}
+	if len(frontHosts) == 0 {
+		frontHosts = []string{""} // empty string = no fronting
 	}
 
-	// Construct server URL
 	scheme := "https"
 	if server.Protocol == ProtocolMeek {
 		scheme = "http"
 	}
 	serverURL := fmt.Sprintf("%s://%s:%d", scheme, server.IPAddress, server.Port)
 
-	// Create underlying TCP connection
-	tcpConn, err := net.DialTimeout("tcp", net.JoinHostPort(server.IPAddress, fmt.Sprintf("%d", server.Port)), config.DialTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("tcp dial failed: %w", err)
-	}
-
-	// Wrap with TLS if using meek_https
-	var conn net.Conn = tcpConn
-	if server.Protocol == ProtocolMeekHTTPS {
-		tlsConfig := config.TLSConfig.Clone()
-		if tlsConfig == nil {
-			tlsConfig = &tls.Config{}
+	var lastErr error
+	for _, frontHost := range frontHosts {
+		meekConfig := &MeekConfig{
+			FrontingDomain: frontHost,
+			FrontingHosts:  server.MeekFrontingHosts,
+			Path:           "/",
+			MaxBodySize:    65536,
+			PollInterval:   100 * time.Millisecond,
+			DisableSNI:     server.TLSDisableSNI,
 		}
 
-		if server.TLSServerName != "" {
-			tlsConfig.ServerName = server.TLSServerName
+		// Create underlying TCP connection
+		tcpConn, err := net.DialTimeout("tcp", net.JoinHostPort(server.IPAddress, fmt.Sprintf("%d", server.Port)), config.DialTimeout)
+		if err != nil {
+			lastErr = fmt.Errorf("tcp dial failed (front=%s): %w", frontHost, err)
+			continue
 		}
 
-		if server.TLSDisableSNI {
-			tlsConfig.ServerName = ""
-		}
-
-		conn = tls.Client(tcpConn, tlsConfig)
-		if err := conn.(*tls.Conn).HandshakeContext(ctx); err != nil {
-			tcpConn.Close()
-			return nil, fmt.Errorf("tls handshake failed: %w", err)
-		}
-	}
-
-	// Wrap with meek
-	meekConn, err := DialMeek(serverURL, meekConfig)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("meek dial failed: %w", err)
-	}
-
-	// Perform SSH handshake over meek
-	sshConfig := &ssh.ClientConfig{
-		User: server.SSHUsername,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(server.SSHPassword),
-		},
-		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			expectedKey, err := base64.StdEncoding.DecodeString(server.SSHHostKey)
-			if err != nil {
-				return err
+		// Wrap with TLS if using meek_https
+		var conn net.Conn = tcpConn
+		if server.Protocol == ProtocolMeekHTTPS {
+			tlsConfig := config.TLSConfig.Clone()
+			if tlsConfig == nil {
+				tlsConfig = &tls.Config{}
 			}
-			if !strings.Contains(string(expectedKey), string(key.Marshal())) {
-				return fmt.Errorf("host key mismatch")
+
+			if server.TLSServerName != "" {
+				tlsConfig.ServerName = server.TLSServerName
+			} else if frontHost != "" {
+				tlsConfig.ServerName = frontHost
 			}
-			return nil
-		},
-		Timeout: config.HandshakeTimeout,
+
+			if server.TLSDisableSNI {
+				tlsConfig.ServerName = ""
+			}
+
+			conn = tls.Client(tcpConn, tlsConfig)
+			if err := conn.(*tls.Conn).HandshakeContext(ctx); err != nil {
+				tcpConn.Close()
+				lastErr = fmt.Errorf("tls handshake failed (front=%s): %w", frontHost, err)
+				continue
+			}
+		}
+
+		// Wrap with meek
+		meekConn, err := DialMeek(serverURL, meekConfig)
+		if err != nil {
+			conn.Close()
+			lastErr = fmt.Errorf("meek dial failed (front=%s): %w", frontHost, err)
+			continue
+		}
+
+		// Perform SSH handshake over meek
+		sshConfig := &ssh.ClientConfig{
+			User: server.SSHUsername,
+			Auth: []ssh.AuthMethod{
+				ssh.Password(server.SSHPassword),
+			},
+			HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+				expectedKey, decErr := base64.StdEncoding.DecodeString(server.SSHHostKey)
+				if decErr != nil {
+					return decErr
+				}
+				if !strings.Contains(string(expectedKey), string(key.Marshal())) {
+					return fmt.Errorf("host key mismatch")
+				}
+				return nil
+			},
+			Timeout: config.HandshakeTimeout,
+		}
+
+		sshConn, chans, reqs, err := ssh.NewClientConn(meekConn, serverURL, sshConfig)
+		if err != nil {
+			meekConn.Close()
+			lastErr = fmt.Errorf("ssh handshake failed (front=%s): %w", frontHost, err)
+			continue
+		}
+
+		client := ssh.NewClient(sshConn, chans, reqs)
+
+		p := &Psiphon{
+			config:   config,
+			server:   server,
+			protocol: server.Protocol,
+			conn:     meekConn,
+			sshConn:  client,
+			closeCh:  make(chan struct{}),
+		}
+
+		go p.keepaliveLoop()
+		return p, nil
 	}
 
-	sshConn, chans, reqs, err := ssh.NewClientConn(meekConn, serverURL, sshConfig)
-	if err != nil {
-		meekConn.Close()
-		return nil, fmt.Errorf("ssh handshake failed: %w", err)
-	}
-
-	client := ssh.NewClient(sshConn, chans, reqs)
-
-	p := &Psiphon{
-		config:   config,
-		server:   server,
-		protocol: server.Protocol,
-		conn:     meekConn,
-		sshConn:  client,
-		closeCh:  make(chan struct{}),
-	}
-
-	go p.keepaliveLoop()
-	return p, nil
+	return nil, fmt.Errorf("meek: all fronting hosts exhausted: %w", lastErr)
 }
 
 // connectTLS connects using TLS parrot

@@ -1,0 +1,47 @@
+# Example configuration for Xray-core compatibility mode
+# Use this ONLY when you need interoperability with Xray-core clients
+
+role: gateway
+
+gateway:
+  listen: ":8443"
+
+transport:
+  type: uqsp
+  
+  # Enable Xray-core compatibility adapter
+  compat_mode: xray
+  
+  # Xray-core adapter configuration
+  xray:
+    enabled: true
+    mode: xhttp  # SplitHTTP/XHTTP protocol
+  
+  # UQSP configuration for Mode 4a (XHTTP + Domain Fronting)
+  uqsp:
+    carrier:
+      type: xhttp
+    
+    # XHTTP configuration
+    xhttp:
+      mode: stream-up
+      path: /api/v1/data
+      max_connections: 8
+
+# Mux configuration
+mux:
+  max_streams_per_session: 100
+
+# Logging
+logging:
+  level: info
+  format: json
+
+# Security
+security:
+  replay_capacity: 1000000
+
+# Metrics
+metrics:
+  enabled: true
+  listen: ":9090"

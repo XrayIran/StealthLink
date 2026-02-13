@@ -36,6 +36,10 @@ type Config struct {
 	KeepAlivePeriod       time.Duration
 	MaxIncomingStreams    int64
 	MaxIncomingUniStreams int64
+
+	// Batch I/O configuration
+	BatchEnabled bool // Enable batch I/O (default: true on Linux)
+	BatchSize    int  // Max messages per batch (1-64, default: 32)
 }
 
 // ApplyDefaults fills missing QUIC values with throughput-safe defaults.

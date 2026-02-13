@@ -1,0 +1,43 @@
+role: gateway
+variant: "4d"
+
+gateway:
+  listen: "0.0.0.0:8443"
+
+transport:
+  type: uqsp
+  uqsp:
+    carrier:
+      type: quic
+    congestion:
+      algorithm: brutal
+      bandwidth_mbps: 200
+    capsules:
+      connect_ip: true
+
+security:
+  # IMPORTANT: Generate your own key via: stealthlink-ctl secret
+  # Both gateway and agent MUST use the same shared_key.
+  shared_key: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+
+services:
+  - name: "vpnlink"
+    protocol: "tun"
+    tun:
+      name: "sl0"
+      mode: "tun"
+      mtu: 1400
+
+vpn:
+  enabled: true
+  mode: "tun"
+  name: "sl0"
+  interface_ip: "10.77.0.1/30"
+  peer_ip: "10.77.0.2"
+  mtu: 1400
+  routes:
+    - destination: "10.88.0.0/16"
+      gateway: "10.77.0.2"
+
+metrics:
+  listen: "127.0.0.1:9091"

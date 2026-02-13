@@ -1,0 +1,11 @@
+# 2026/02/11 20:38:46.844904 [TestProperty25_URLDeduplication] [rapid] draw numUrls: 6
+# 2026/02/11 20:38:46.844910 [TestProperty25_URLDeduplication] [rapid] draw repeats: 2
+# 2026/02/11 20:38:46.844922 [TestProperty25_URLDeduplication] Expected first encounter of http://example.com/5 to be crawled
+# 
+v0.4.8#9411705234236260615
+0x0
+0x6b74f03291620
+0x5
+0x0
+0x0
+0x0

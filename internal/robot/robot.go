@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -291,10 +293,32 @@ func (r *Robot) triggerFailures(err error) {
 	}
 }
 
-// executeCommand executes a shell command.
+// executeCommand executes a recovery command with a 30-second timeout.
+// The command string is split on whitespace and executed directly (no shell).
+// Shell metacharacters are rejected to prevent command injection.
 func (r *Robot) executeCommand(cmd string) error {
-	return fmt.Errorf("command execution not implemented: %s", cmd)
-	// In production, use os/exec to run the command
+	// Reject shell metacharacters to prevent injection.
+	if strings.ContainsAny(cmd, "|;&$`\\\"'(){}[]<>!~*?#") {
+		return fmt.Errorf("command contains disallowed shell metacharacters: %s", cmd)
+	}
+
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return fmt.Errorf("empty command")
+	}
+
+	ctx, cancel := context.WithTimeout(r.ctx, 30*time.Second)
+	defer cancel()
+
+	execCmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
+	output, err := execCmd.CombinedOutput()
+	if len(output) > 0 {
+		log.Printf("[Robot] Command output: %s", strings.TrimSpace(string(output)))
+	}
+	if err != nil {
+		return fmt.Errorf("command %q failed: %w", parts[0], err)
+	}
+	return nil
 }
 
 // setStatus updates the robot status.

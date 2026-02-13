@@ -13,6 +13,7 @@ import (
 
 	"stealthlink/internal/tlsutil"
 	"stealthlink/internal/transport"
+	"stealthlink/internal/transport/xhttpmeta"
 
 	"github.com/xtaci/smux"
 	"golang.org/x/net/http2"
@@ -25,27 +26,30 @@ type Dialer struct {
 	Fingerprint string
 	ConnectAddr string
 	Headers     map[string]string
+	Cookies     []*http.Cookie
 	Guard       string
 	ProxyDial   func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 type Listener struct {
-	server   *http.Server
-	ln       net.Listener
-	path     string
-	smux     *smux.Config
-	guard    string
-	padMin   int
-	padMax   int
-	sessions chan transport.Session
-	once     sync.Once
+	server      *http.Server
+	ln          net.Listener
+	path        string
+	smux        *smux.Config
+	guard       string
+	padMin      int
+	padMax      int
+	metadataCfg xhttpmeta.MetadataConfig
+	sessions    chan transport.Session
+	done        chan struct{}
+	once        sync.Once
 }
 
 func NewDialer(url string, tlsCfg *tls.Config, smuxCfg *smux.Config, fingerprint, connectAddr, guard string) *Dialer {
 	return &Dialer{URL: url, TLSConfig: tlsCfg, Smux: smuxCfg, Fingerprint: fingerprint, ConnectAddr: connectAddr, Guard: guard}
 }
 
-func Listen(addr, path string, tlsCfg *tls.Config, smuxCfg *smux.Config, guard string, padMin, padMax int) (*Listener, error) {
+func Listen(addr, path string, tlsCfg *tls.Config, smuxCfg *smux.Config, guard string, padMin, padMax int, metaCfg xhttpmeta.MetadataConfig) (*Listener, error) {
 	if path == "" {
 		path = "/_sl"
 	}
@@ -57,13 +61,15 @@ func Listen(addr, path string, tlsCfg *tls.Config, smuxCfg *smux.Config, guard s
 		return nil, err
 	}
 	l := &Listener{
-		ln:       ln,
-		path:     path,
-		smux:     smuxCfg,
-		guard:    guard,
-		padMin:   padMin,
-		padMax:   padMax,
-		sessions: make(chan transport.Session, 16),
+		ln:          ln,
+		path:        path,
+		smux:        smuxCfg,
+		guard:       guard,
+		padMin:      padMin,
+		padMax:      padMax,
+		metadataCfg: metaCfg,
+		sessions:    make(chan transport.Session, 16),
+		done:        make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, l.handleH2)
@@ -109,6 +115,9 @@ func (d *Dialer) Dial(ctx context.Context, _ string) (transport.Session, error) 
 	for k, v := range d.Headers {
 		req.Header.Set(k, v)
 	}
+	for _, c := range d.Cookies {
+		req.AddCookie(c)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		_ = pr.Close()
@@ -134,21 +143,22 @@ func (d *Dialer) Dial(ctx context.Context, _ string) (transport.Session, error) 
 		_ = conn.Close()
 		return nil, err
 	}
-	return &session{conn: conn, sess: sess}, nil
+	return &session{conn: conn, sess: sess, closed: make(chan struct{})}, nil
 }
 
 func (l *Listener) Accept() (transport.Session, error) {
-	sess, ok := <-l.sessions
-	if !ok {
+	select {
+	case sess := <-l.sessions:
+		return sess, nil
+	case <-l.done:
 		return nil, fmt.Errorf("listener closed")
 	}
-	return sess, nil
 }
 
 func (l *Listener) Close() error {
 	var err error
 	l.once.Do(func() {
-		close(l.sessions)
+		close(l.done)
 		err = l.server.Close()
 	})
 	return err
@@ -161,6 +171,21 @@ func (l *Listener) handleH2(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Phase 2: Metadata Extraction
+	dec := xhttpmeta.NewPlacementDecoder(l.metadataCfg)
+	meta, err := dec.Decode(r)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// Requirement 11: Session ID length check
+	if len(meta.SessionID) > 128 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	fl, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
@@ -171,12 +196,22 @@ func (l *Listener) handleH2(w http.ResponseWriter, r *http.Request) {
 	if fl != nil {
 		fl.Flush()
 	}
+
+	// Use pipe to ensure we wait for all writes to finish before the handler returns
+	pr, pw := io.Pipe()
 	conn := &streamConn{
 		reader: r.Body,
-		writer: writeFlusher{w: w, fl: fl},
+		writer: pw,
 		local:  dummyAddr("h2-server"),
 		remote: dummyAddr(r.RemoteAddr),
 	}
+
+	writeDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(writeFlusher{w: w, fl: fl}, pr)
+		close(writeDone)
+	}()
+
 	if err := transport.RecvGuard(conn, l.guard); err != nil {
 		_ = conn.Close()
 		return
@@ -186,12 +221,22 @@ func (l *Listener) handleH2(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		return
 	}
+
+	s := &session{conn: conn, sess: sess, closed: make(chan struct{})}
 	select {
-	case l.sessions <- &session{conn: conn, sess: sess}:
+	case <-l.done:
+		_ = s.Close()
+	case l.sessions <- s:
+		// Wait for session to be closed by someone or client disconnect
+		select {
+		case <-s.closed:
+		case <-r.Context().Done():
+			_ = s.Close()
+		}
 	default:
-		_ = conn.Close()
+		_ = s.Close()
 	}
-	<-r.Context().Done()
+	<-writeDone
 }
 
 func hostFromURL(raw string) string {
@@ -203,19 +248,24 @@ func hostFromURL(raw string) string {
 }
 
 type session struct {
-	conn net.Conn
-	sess *smux.Session
+	conn   net.Conn
+	sess   *smux.Session
+	closed chan struct{}
+	once   sync.Once
 }
 
 func (s *session) OpenStream() (net.Conn, error)   { return s.sess.OpenStream() }
 func (s *session) AcceptStream() (net.Conn, error) { return s.sess.AcceptStream() }
 func (s *session) Close() error {
-	if s.sess != nil {
-		_ = s.sess.Close()
-	}
-	if s.conn != nil {
-		return s.conn.Close()
-	}
+	s.once.Do(func() {
+		if s.sess != nil {
+			_ = s.sess.Close()
+		}
+		if s.conn != nil {
+			_ = s.conn.Close()
+		}
+		close(s.closed)
+	})
 	return nil
 }
 func (s *session) LocalAddr() net.Addr  { return s.conn.LocalAddr() }
