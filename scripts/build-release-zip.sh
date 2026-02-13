@@ -50,7 +50,11 @@ BIN_EXT=""
 if [[ "${OS}" == "windows" ]]; then
     BIN_EXT=".exe"
 fi
-PKG_NAME="stealthlink-${OS}-${ARCH}-v${VERSION}"
+VER_TAG="${VERSION}"
+if [[ "${VER_TAG}" != v* ]]; then
+    VER_TAG="v${VER_TAG}"
+fi
+PKG_NAME="stealthlink-${OS}-${ARCH}-${VER_TAG}"
 DIST_DIR="${ROOT_DIR}/dist"
 STAGE_DIR="${DIST_DIR}/${PKG_NAME}"
 ZIP_PATH="${DIST_DIR}/${PKG_NAME}.zip"
