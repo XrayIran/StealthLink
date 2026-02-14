@@ -56,8 +56,13 @@ Save all outputs from `dist/live-validation/`:
 
 ## External Release Gate (Manual)
 
-1. Create tag:
-   - `git tag v2.0.0`
-   - `git push origin v2.0.0`
-2. Upload release ZIP(s) and `dist/grafana-dashboard.json`.
-3. Publish release notes and announce.
+1. Build release assets:
+   - `make release-assets VERSION=v2.0.0`
+2. Dry-run remote cleanup/publish:
+   - `./scripts/publish-v2.0.0.sh --repo XrayIran/StealthLink`
+3. Execute publish (remote-destructive for old releases/tags):
+   - `./scripts/publish-v2.0.0.sh --repo XrayIran/StealthLink --yes`
+4. Confirm GitHub release contains only:
+   - `stealthlink-<os>-<arch>-v2.0.0.zip`
+   - `stealthlink-ctl`
+   - `SHA256SUMS`

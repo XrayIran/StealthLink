@@ -36,6 +36,23 @@ cd /home/iman/StealthLink
 ```
 This creates `dist/stealthlink-<os>-<arch>-v<version>.zip`.
 
+Prepare publish-ready GitHub release assets (ZIP + helper script only):
+```bash
+cd /home/iman/StealthLink
+./scripts/build-release-assets.sh --version v2.0.0
+```
+This creates `dist/release-assets/{stealthlink-<os>-<arch>-v<version>.zip,stealthlink-ctl,SHA256SUMS}`.
+
+Dry-run the GitHub publish workflow that keeps only `v2.0.0`:
+```bash
+cd /home/iman/StealthLink
+./scripts/publish-v2.0.0.sh --repo XrayIran/StealthLink
+```
+Execute remote cleanup/publish (destructive on remote releases/tags):
+```bash
+./scripts/publish-v2.0.0.sh --repo XrayIran/StealthLink --yes
+```
+
 ## Install From ZIP (Offline-Friendly)
 ```bash
 unzip stealthlink-<os>-<arch>-v<version>.zip
@@ -45,6 +62,16 @@ sudo ./stealthlink-ctl install --local --role=gateway
 Or install directly from the ZIP path:
 ```bash
 sudo ./stealthlink-ctl install --bundle=./stealthlink-<os>-<arch>-v<version>.zip --role=agent
+```
+
+## One-line install (latest GitHub release)
+```bash
+curl -fsSL https://github.com/XrayIran/StealthLink/releases/latest/download/stealthlink-ctl -o /tmp/stealthlink-ctl && chmod +x /tmp/stealthlink-ctl && sudo /tmp/stealthlink-ctl install --latest --role both
+```
+
+For unattended provisioning, use non-interactive setup:
+```bash
+sudo ./stealthlink-ctl setup --latest --repo XrayIran/StealthLink --role both --non-interactive --variant 4d --tune-profile balanced --apply-firewall true --start-services true
 ```
 
 ## Run (example)

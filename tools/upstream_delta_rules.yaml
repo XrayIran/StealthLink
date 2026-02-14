@@ -1,152 +1,293 @@
-version: 1
-generated_on: "2026-02-12"
+version: 2
+generated_on: "2026-02-14"
 upstreams:
-  - name: tcpraw
-    mode_stack: 4b-raw
+  - name: 6TO4-GRE-IPIP-SIT
+    mode_stack: underlay-tunneling
+    status: verify_only
+    destinations:
+      - internal/tun
+
+  - name: Backhaul
+    mode_stack: pool-and-mux
     status: integrated
     destinations:
-      - internal/transport/rawtcp
-      - internal/transport/faketcp
-  - name: paqctl
-    mode_stack: 4b-raw
-    status: integrated
+      - internal/transport/pool
+
+  - name: EasyTier
+    mode_stack: l2-mesh
+    status: out_of_scope_l3
     destinations:
-      - internal/transport/rawtcp
-      - internal/transport/packet_guard.go
-  - name: Tunnel
+      - internal/transport/taptun
+
+  - name: FRP_Reverse_Loadbalance
     mode_stack: reverse-orchestration
+    status: verify_only
+    destinations:
+      - internal/transport/reverse
+
+  - name: Layer2_TapTunnel
+    mode_stack: l2-tap
+    status: out_of_scope_l3
+    destinations:
+      - internal/transport/taptun
+
+  - name: TrustTunnel
+    mode_stack: 4e-trusttunnel
+    status: integrated
+    destinations:
+      - internal/transport/trusttunnel
+
+  - name: Tunnel
+    mode_stack: reverse-init
     status: integrated
     destinations:
       - internal/transport/reverse
-      - internal/robot
-  - name: sing-box
-    mode_stack: 4c-4e-tls-lookalike
-    status: integrated
-    destinations:
-      - internal/transport/shadowtls
-      - internal/transport/anytls
-  - name: anytls-go
-    mode_stack: 4c-4e-tls-lookalike
-    status: integrated
-    destinations:
-      - internal/transport/anytls
-      - internal/transport/uqsp/carrier/anytls.go
-  - name: shadowsocks-rust
-    mode_stack: 4c-4e-tls-lookalike
+      - internal/transport/uqsp/reverse.go
+
+  - name: VPS-Optimizer
+    mode_stack: ops-tuning
     status: verify_only
     destinations:
-      - internal/dns/fakedns
-      - internal/security/bloom
-  - name: smux
-    mode_stack: mux-and-reliability
+      - scripts/stealthlink-ctl
+
+  - name: VornaTunnel
+    mode_stack: carrier-experiments
+    status: verify_only
+    destinations:
+      - internal/transport/carrier
+
+  - name: VortexL2
+    mode_stack: l2-mesh
+    status: out_of_scope_l3
+    destinations:
+      - internal/transport/taptun
+
+  - name: Vwarp
+    mode_stack: warp-underlay
     status: integrated
     destinations:
-      - internal/mux
-      - internal/transport/uqsp/carrier
+      - internal/transport/underlay/warp_dialer.go
+
+  - name: WaterWall
+    mode_stack: transport-graph
+    status: integrated
+    destinations:
+      - internal/transport/graph
+
+  - name: Xray-core
+    mode_stack: 4a-4c-xhttp-reality
+    status: integrated
+    destinations:
+      - internal/compat/xray
+      - internal/transport/xhttpmeta
+
+  - name: amnezia-client
+    mode_stack: awg-wireguard
+    status: integrated
+    destinations:
+      - internal/transport/wireguard
+      - internal/transport/uqsp/behavior/awg.go
+
+  - name: anytls-go
+    mode_stack: 4c-4e-anytls
+    status: integrated
+    destinations:
+      - internal/transport/anytls
+
+  - name: conjure
+    mode_stack: fronting-rendezvous
+    status: integrated
+    destinations:
+      - internal/transport/conjure
+
+  - name: dae
+    mode_stack: routing-policy
+    status: verify_only
+    destinations:
+      - internal/routing
+
+  - name: daggerConnect
+    mode_stack: anyconnect-variants
+    status: verify_only
+    destinations:
+      - internal/transport/anyconnect
+
+  - name: gfw_resist_HTTPS_proxy
+    mode_stack: gfw-resist
+    status: verify_only
+    destinations:
+      - internal/transport/stealth
+
+  - name: gfw_resist_tcp_proxy
+    mode_stack: gfw-resist
+    status: verify_only
+    destinations:
+      - internal/transport/rawtcp
+
+  - name: gfw_resist_tls_proxy
+    mode_stack: gfw-resist
+    status: verify_only
+    destinations:
+      - internal/tlsutil
+
+  - name: gost
+    mode_stack: proxy-suite
+    status: verify_only
+    destinations:
+      - internal/transport/underlay
+
+  - name: grasshopper
+    mode_stack: udp-obfs
+    status: verify_only
+    destinations:
+      - internal/transport/noize
+
+  - name: haproxy
+    mode_stack: fronting-lb
+    status: verify_only
+    destinations:
+      - internal/transport/tlsmux
+
+  - name: hysteria
+    mode_stack: 4d-quic
+    status: integrated
+    destinations:
+      - internal/transport/quicmux
+
+  - name: juicity
+    mode_stack: 4d-quic
+    status: verify_only
+    destinations:
+      - internal/transport/quicmux
+
   - name: kcp-go
     mode_stack: udp-reliability
     status: integrated
     destinations:
       - internal/transport/kcpbase
       - internal/transport/batch
+
   - name: kcptun
     mode_stack: udp-reliability
     status: integrated
     destinations:
       - internal/transport/kcpmux
-      - internal/transport/kcputil
-  - name: qtun
-    mode_stack: 4d-udp-quic
-    status: verify_only
-    destinations:
-      - internal/transport/quicmux
-      - internal/crypto/qpp
-  - name: juicity
-    mode_stack: 4d-udp-quic
-    status: verify_only
-    destinations:
-      - internal/transport/quicmux
-      - internal/transport/uqsp
-  - name: ocserv
-    mode_stack: 4e-cstp-dtls-http
-    status: integrated
-    destinations:
-      - internal/transport/uqsp/behavior/cstp.go
-      - internal/transport/anyconnect
-  - name: openconnect
-    mode_stack: 4e-cstp-dtls-http
-    status: integrated
-    destinations:
-      - internal/transport/uqsp/behavior/cstp.go
-      - internal/transport/dtls
-  - name: TrustTunnel
-    mode_stack: 4e-cstp-dtls-http
-    status: integrated
-    destinations:
-      - internal/transport/trusttunnel
-      - internal/transport/uqsp/carrier/trusttunnel.go
-  - name: amnezia-client
-    mode_stack: awg-faketcp
-    status: integrated
-    destinations:
-      - internal/transport/wireguard/junk.go
-      - internal/transport/uqsp/behavior/awg.go
-  - name: udp2raw
-    mode_stack: awg-faketcp
-    status: integrated
-    destinations:
-      - internal/transport/faketcp
-      - internal/transport/icmptun
-  - name: lyrebird
-    mode_stack: fronting-obfuscation-rendezvous
-    status: integrated
-    destinations:
-      - internal/transport/uqsp/behavior/obfs4.go
-      - internal/transport/psiphon/meek.go
-  - name: psiphon-tunnel-core
-    mode_stack: fronting-obfuscation-rendezvous
-    status: integrated
-    destinations:
-      - internal/transport/psiphon
-  - name: conjure
-    mode_stack: fronting-obfuscation-rendezvous
-    status: verify_only
-    destinations:
-      - internal/transport/uqsp/behavior/domainfront.go
-      - internal/transport/uqsp/reverse.go
-  - name: snowflake
-    mode_stack: fronting-obfuscation-rendezvous
-    status: verify_only
-    destinations:
-      - internal/transport/uqsp/reverse.go
-      - internal/transport/psiphon/meek.go
-  - name: haproxy
-    mode_stack: fronting-obfuscation-rendezvous
-    status: verify_only
-    destinations:
-      - internal/transport/uqsp/behavior/domainfront.go
-      - internal/transport/tlsmux
-  - name: dae
+
+  - name: leaf
     mode_stack: routing-policy
     status: verify_only
     destinations:
       - internal/routing
-      - internal/transport/underlay
+
+  - name: lyrebird
+    mode_stack: obfs4-fronting
+    status: integrated
+    destinations:
+      - internal/transport/obfs
+      - internal/transport/uqsp/behavior/obfs4.go
+
   - name: mihomo
     mode_stack: routing-policy
     status: verify_only
     destinations:
       - internal/routing
-      - internal/config
-  - name: EasyTier
-    mode_stack: topology-routing
-    status: out_of_scope_l3
+
+  - name: ocserv
+    mode_stack: 4e-cstp
+    status: integrated
+    destinations:
+      - internal/transport/anyconnect
+      - internal/transport/dtls
+
+  - name: openconnect
+    mode_stack: 4e-cstp
+    status: integrated
+    destinations:
+      - internal/transport/anyconnect
+      - internal/transport/dtls
+
+  - name: paqctl
+    mode_stack: raw-packet-control
+    status: integrated
+    destinations:
+      - internal/transport/rawtcp
+
+  - name: paqet
+    mode_stack: raw-packet
+    status: integrated
+    destinations:
+      - internal/transport/rawpacket
+      - internal/transport/rawtcp
+
+  - name: psiphon-tunnel-core
+    mode_stack: meek-fronting
+    status: integrated
+    destinations:
+      - internal/transport/psiphon
+
+  - name: qtun
+    mode_stack: 4d-quic
+    status: verify_only
+    destinations:
+      - internal/transport/quicmux
+
+  - name: rust-tun
+    mode_stack: tun-impl
+    status: verify_only
     destinations:
       - internal/tun
-      - internal/routing
-  - name: VortexL2
-    mode_stack: topology-routing
-    status: out_of_scope_l3
+
+  - name: shadowsocks-rust
+    mode_stack: proxy-suite
+    status: verify_only
     destinations:
-      - internal/tun
-      - internal/routing
+      - internal/dns
+
+  - name: sing-box
+    mode_stack: 4c-4e-tls-lookalike
+    status: integrated
+    destinations:
+      - internal/compat/singbox
+      - internal/transport/shadowtls
+
+  - name: smux
+    mode_stack: mux
+    status: integrated
+    destinations:
+      - internal/mux
+
+  - name: snowflake
+    mode_stack: rendezvous-fronting
+    status: integrated
+    destinations:
+      - internal/transport/snowflake
+
+  - name: tuic
+    mode_stack: 4d-quic
+    status: verify_only
+    destinations:
+      - internal/transport/quicmux
+
+  - name: tun2proxy
+    mode_stack: tun-routing
+    status: verify_only
+    destinations:
+      - internal/transport/udprelay
+
+  - name: udp_tun
+    mode_stack: udp-obfs
+    status: verify_only
+    destinations:
+      - internal/transport/faketcp
+
+  - name: v2ray-core
+    mode_stack: compat
+    status: verify_only
+    destinations:
+      - internal/compat/xray
+
+  - name: webtunnel
+    mode_stack: 4e-webtunnel
+    status: integrated
+    destinations:
+      - internal/transport/uqsp/carrier

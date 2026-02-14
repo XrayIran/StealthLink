@@ -3,7 +3,10 @@ package carrier
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
+	"net"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -11,6 +14,9 @@ import (
 func TestDialCarrierTLSWithFingerprint(t *testing.T) {
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", testTLSConfig(t))
 	if err != nil {
+		if isSocketPermissionError(err) {
+			t.Skipf("socket listen not permitted in this environment: %v", err)
+		}
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
@@ -75,6 +81,9 @@ func TestDialCarrierTLSWithFingerprint(t *testing.T) {
 func TestDialCarrierTLSWithoutFingerprint(t *testing.T) {
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", testTLSConfig(t))
 	if err != nil {
+		if isSocketPermissionError(err) {
+			t.Skipf("socket listen not permitted in this environment: %v", err)
+		}
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
@@ -132,4 +141,15 @@ func TestDialCarrierTLSWithoutFingerprint(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("server timed out")
 	}
+}
+
+func isSocketPermissionError(err error) bool {
+	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return errors.Is(opErr.Err, syscall.EPERM) || errors.Is(opErr.Err, syscall.EACCES)
+	}
+	return false
 }

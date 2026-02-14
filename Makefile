@@ -1,4 +1,4 @@
-.PHONY: build test property-test vet check rust-crypto dashboard-build pytools-check package \
+.PHONY: build test property-test vet check rust-crypto dashboard-build pytools-check package release-assets publish-v2 \
        clean install help cross-compile coverage benchmark-ci benchmark-live \
        upstream-audit coverage-touched stress-live soak-24h profile-live release-readiness \
        validate-live-ssh fuzz fuzz-ci
@@ -137,6 +137,12 @@ validate-live-ssh:
 package:
 	./scripts/build-release-zip.sh $(VERSION)
 
+release-assets:
+	./scripts/build-release-assets.sh --version $(VERSION)
+
+publish-v2:
+	./scripts/publish-v2.0.0.sh --repo "$${REPO:-XrayIran/StealthLink}"
+
 package-all: package-linux package-darwin package-windows
 
 package-linux:
@@ -209,6 +215,8 @@ help:
 	@echo "  profile-live     Capture live pprof validation artifacts"
 	@echo "  release-readiness Summarize live-validation gate status"
 	@echo "  package          Create release ZIP bundle"
+	@echo "  release-assets   Prepare publishable release assets (ZIP + helper script)"
+	@echo "  publish-v2       Dry-run v2.0.0-only GitHub publish workflow (set REPO=owner/name)"
 	@echo "  package-all      Create release ZIP bundles for all platforms"
 	@echo "  package-linux    Create Linux release ZIP bundles"
 	@echo "  package-darwin   Create macOS release ZIP bundles"

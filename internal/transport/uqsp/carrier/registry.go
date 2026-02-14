@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"crypto/tls"
 	"fmt"
 	"sync"
 
@@ -63,7 +64,7 @@ func (r *Registry) AvailableCarriers() []string {
 }
 
 // SelectCarrier selects the appropriate carrier based on configuration
-func SelectCarrier(cfg config.UQSPCarrierConfig, smuxCfg *smux.Config, authToken string) (Carrier, error) {
+func SelectCarrier(cfg config.UQSPCarrierConfig, tlsCfg *tls.Config, smuxCfg *smux.Config, authToken string) (Carrier, error) {
 	carrierType := cfg.Type
 	if carrierType == "" {
 		carrierType = "quic" // Default to native QUIC
@@ -82,6 +83,8 @@ func SelectCarrier(cfg config.UQSPCarrierConfig, smuxCfg *smux.Config, authToken
 
 	case "faketcp":
 		return NewFakeTCPCarrier(cfg.FakeTCP, smuxCfg, authToken), nil
+	case "kcp":
+		return NewKCPCarrier(cfg.KCP, smuxCfg), nil
 
 	case "icmptun":
 		return NewICMPCarrier(cfg.ICMPTun, smuxCfg, authToken), nil
@@ -161,6 +164,8 @@ func SelectCarrier(cfg config.UQSPCarrierConfig, smuxCfg *smux.Config, authToken
 			return nil, err
 		}
 		return c, nil
+	case "masque":
+		return NewMASQUECarrier(cfg.MASQUE, tlsCfg, smuxCfg, authToken), nil
 
 	default:
 		return nil, fmt.Errorf("unknown carrier type: %s", carrierType)
@@ -178,6 +183,8 @@ func IsCarrierAvailable(carrierType string) bool {
 		return IsRawTCPAvailable()
 	case "faketcp":
 		return true
+	case "kcp":
+		return true
 	case "icmptun":
 		return IsICMPTunAvailable()
 	case "webtunnel":
@@ -188,6 +195,8 @@ func IsCarrierAvailable(carrierType string) bool {
 		return true
 	case "anytls":
 		return true
+	case "masque":
+		return true
 	default:
 		return false
 	}
@@ -196,7 +205,7 @@ func IsCarrierAvailable(carrierType string) bool {
 // SupportsListen reports whether a carrier supports server/listener role.
 func SupportsListen(carrierType string) bool {
 	switch carrierType {
-	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "icmptun", "webtunnel":
+	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "kcp", "icmptun", "webtunnel", "masque":
 		return true
 	case "xhttp", "chisel":
 		return false
@@ -210,7 +219,7 @@ func SupportsListen(carrierType string) bool {
 // SupportsDial reports whether a carrier supports client/dialer role.
 func SupportsDial(carrierType string) bool {
 	switch carrierType {
-	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "icmptun", "webtunnel", "xhttp", "chisel", "anytls":
+	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "kcp", "icmptun", "webtunnel", "xhttp", "chisel", "anytls", "masque":
 		return true
 	default:
 		return false

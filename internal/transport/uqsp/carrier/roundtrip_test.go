@@ -21,6 +21,9 @@ func TestWebTunnelH1RoundTrip(t *testing.T) {
 	serverTLS := testTLSConfig(t)
 	ln, err := NewWebTunnelListener("127.0.0.1:0", serverTLS, "/tunnel")
 	if err != nil {
+		if isSocketPermissionError(err) {
+			t.Skipf("socket listen not permitted in this environment: %v", err)
+		}
 		t.Fatalf("NewWebTunnelListener failed: %v", err)
 	}
 	defer ln.Close()

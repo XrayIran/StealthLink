@@ -147,3 +147,53 @@ func TestValidateVariantTLSMirrorRequiresAnyTLSPassword(t *testing.T) {
 		t.Fatal("expected anytls password validation error")
 	}
 }
+
+func TestValidateVariant4aRejectsNonXHTTPCarrier(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = "4a"
+	cfg.Transport.UQSP.Carrier.Type = "quic"
+	cfg.Transport.UQSP.Behaviors.Vision.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.PublicName = "cloudflare-ech.com"
+	if err := cfg.ValidateVariant(); err == nil {
+		t.Fatal("expected 4a carrier validation error")
+	}
+}
+
+func TestValidateVariantPolicyReverseRequiresAuthToken(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = "4a"
+	cfg.Transport.UQSP.Carrier.Type = "xhttp"
+	cfg.Transport.UQSP.Behaviors.Vision.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.PublicName = "cloudflare-ech.com"
+	cfg.Transport.UQSP.VariantPolicy = map[string]UQSPVariantPolicy{
+		"4a": {ReverseEnabled: boolPtr(true)},
+	}
+	if err := cfg.ValidateVariant(); err == nil {
+		t.Fatal("expected reverse auth token validation error for variant policy")
+	}
+}
+
+func TestValidateVariantPolicyWarpDefaultsToFailClosed(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = "4a"
+	cfg.Transport.UQSP.Carrier.Type = "xhttp"
+	cfg.Transport.UQSP.Behaviors.Vision.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.PublicName = "cloudflare-ech.com"
+	cfg.Transport.UQSP.VariantPolicy = map[string]UQSPVariantPolicy{
+		"4a": {WARPEnabled: boolPtr(true)},
+	}
+	if err := cfg.ValidateVariant(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if !cfg.WARP.Required {
+		t.Fatal("expected variant-scoped warp to force fail-closed semantics")
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }

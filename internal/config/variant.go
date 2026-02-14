@@ -177,25 +177,80 @@ func (c *Config) ValidateVariant() error {
 	if !ok {
 		variant = c.GetVariant()
 	}
+	rawNorm := strings.ToLower(strings.TrimSpace(raw))
+	strict := rawNorm == "4a" || rawNorm == "4b" || rawNorm == "4c" || rawNorm == "4d" || rawNorm == "4e" ||
+		rawNorm == "xhttp-tls" || rawNorm == "xhttp_tls" || rawNorm == "raw-tcp" || rawNorm == "raw_tcp" ||
+		rawNorm == "tls-mirror" || rawNorm == "tls_mirror" || rawNorm == "udp" || rawNorm == "trust"
+	if err := c.validateVariantPolicyGuards(variant); err != nil {
+		return err
+	}
 
 	switch variant {
 	case 0:
-		return c.validateVariantXHTTPTLS()
+		return c.validateVariantXHTTPTLS(strict)
 	case 1:
 		return c.validateVariantRawTCP()
 	case 2:
-		return c.validateVariantTLSMirror()
+		return c.validateVariantTLSMirror(strict)
 	case 3:
-		return c.validateVariantUDP()
+		return c.validateVariantUDP(strict)
 	case 4:
-		return c.validateVariantTrust()
+		return c.validateVariantTrust(strict)
 	default:
 		return fmt.Errorf("unknown variant: %d", variant)
 	}
 }
 
-func (c *Config) validateVariantXHTTPTLS() error {
+func variantCodeFromIndex(variant int) string {
+	switch variant {
+	case 0:
+		return "4a"
+	case 1:
+		return "4b"
+	case 2:
+		return "4c"
+	case 3:
+		return "4d"
+	case 4:
+		return "4e"
+	default:
+		return ""
+	}
+}
+
+func (c *Config) validateVariantPolicyGuards(variant int) error {
+	code := variantCodeFromIndex(variant)
+	if code == "" {
+		return nil
+	}
+	if c.Transport.UQSP.ReverseEnabledForVariant(code) {
+		if strings.TrimSpace(c.Transport.UQSP.Reverse.AuthToken) == "" {
+			return fmt.Errorf("transport.uqsp.reverse.auth_token is required when reverse is enabled for variant %s", code)
+		}
+	}
+	if c.Transport.UQSP.WARPEnabledForVariant(code, c.WARP.Enabled) {
+		// Enforce fail-closed by default when WARP is variant-scoped.
+		if !c.WARP.Required && !c.Transport.WARPDialer.Required {
+			c.WARP.Required = true
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateVariantXHTTPTLS(strict bool) error {
 	behaviors := c.Transport.UQSP.Behaviors
+	carrierType := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
+	if carrierType != "" && carrierType != "xhttp" {
+		return fmt.Errorf("xhttp-tls variant requires carrier.type to be xhttp, got: %s", carrierType)
+	}
+	if strict {
+		if !behaviors.Vision.Enabled {
+			return fmt.Errorf("xhttp-tls variant requires vision.enabled=true")
+		}
+		if !behaviors.ECH.Enabled && !behaviors.DomainFront.Enabled {
+			return fmt.Errorf("xhttp-tls variant requires at least one of: ech.enabled or domainfront.enabled")
+		}
+	}
 
 	if behaviors.ECH.Enabled {
 		if behaviors.ECH.PublicName == "" {
@@ -236,8 +291,15 @@ func (c *Config) validateVariantRawTCP() error {
 	return nil
 }
 
-func (c *Config) validateVariantTLSMirror() error {
+func (c *Config) validateVariantTLSMirror(strict bool) error {
 	behaviors := c.Transport.UQSP.Behaviors
+	carrierType := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
+	if carrierType != "" && carrierType != "xhttp" && carrierType != "anytls" {
+		return fmt.Errorf("tls-mirror variant requires carrier.type to be xhttp or anytls, got: %s", carrierType)
+	}
+	if strict && !behaviors.Vision.Enabled {
+		return fmt.Errorf("tls-mirror variant requires vision.enabled=true")
+	}
 
 	tlsModes := 0
 	if behaviors.Reality.Enabled {
@@ -295,8 +357,15 @@ func decodeKey32(v string) ([]byte, error) {
 	return nil, fmt.Errorf("invalid key encoding")
 }
 
-func (c *Config) validateVariantUDP() error {
+func (c *Config) validateVariantUDP(strict bool) error {
 	obfs := c.Transport.UQSP.Obfuscation
+	carrierType := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
+	if carrierType != "" && carrierType != "quic" && carrierType != "kcp" && carrierType != "masque" {
+		return fmt.Errorf("udp variant requires carrier.type to be quic, kcp, or masque, got: %s", carrierType)
+	}
+	if strict && !c.Transport.UQSP.Behaviors.AWG.Enabled && !obfs.MorphingEnabled {
+		return fmt.Errorf("udp variant requires awg.enabled=true or obfuscation.morphing_enabled=true")
+	}
 
 	if obfs.Profile == "salamander" && obfs.SalamanderKey == "" {
 		return fmt.Errorf("obfuscation.salamander_key is required when profile=salamander")
@@ -310,10 +379,13 @@ func (c *Config) validateVariantUDP() error {
 	return nil
 }
 
-func (c *Config) validateVariantTrust() error {
+func (c *Config) validateVariantTrust(strict bool) error {
 	carrierType := c.Transport.UQSP.Carrier.Type
 	if carrierType != "webtunnel" && carrierType != "chisel" && carrierType != "trusttunnel" && carrierType != "" {
 		return fmt.Errorf("trust variant requires carrier.type to be webtunnel, chisel, or trusttunnel, got: %s", carrierType)
+	}
+	if strict && !c.Transport.UQSP.Behaviors.CSTP.Enabled {
+		return fmt.Errorf("trust variant requires cstp.enabled=true")
 	}
 
 	return nil

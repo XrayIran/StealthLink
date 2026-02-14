@@ -77,6 +77,36 @@ func PromHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE stealthlink_uqsp_reassembly_evictions_total counter\n")
 	fmt.Fprintf(w, "stealthlink_uqsp_reassembly_evictions_total %d\n", st.UQSPReassemblyEvicts)
 
+	// Underlay + WARP metrics (operator visibility)
+	fmt.Fprintf(w, "# HELP stealthlink_underlay_selected Currently selected underlay (1=selected)\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_underlay_selected gauge\n")
+	for _, t := range []string{"direct", "warp", "socks"} {
+		v := 0
+		if st.UnderlaySelected == t {
+			v = 1
+		}
+		fmt.Fprintf(w, "stealthlink_underlay_selected{type=%q} %d\n", t, v)
+	}
+
+	fmt.Fprintf(w, "# HELP stealthlink_warp_health Current WARP health (1=active)\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_warp_health gauge\n")
+	for _, s := range []string{"up", "down"} {
+		v := 0
+		if st.WARPHealth == s {
+			v = 1
+		}
+		fmt.Fprintf(w, "stealthlink_warp_health{status=%q} %d\n", s, v)
+	}
+
+	// Reverse mode metrics
+	fmt.Fprintf(w, "# HELP stealthlink_reverse_reconnect_attempts_total Total reverse reconnect attempts\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_reverse_reconnect_attempts_total counter\n")
+	fmt.Fprintf(w, "stealthlink_reverse_reconnect_attempts_total %d\n", st.ReverseReconnectAttemptsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_reverse_connections_active Current active reverse connections\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_reverse_connections_active gauge\n")
+	fmt.Fprintf(w, "stealthlink_reverse_connections_active %d\n", st.ReverseConnectionsActive)
+
 	for name, n := range st.TransportSessions {
 		fmt.Fprintf(w, "stealthlink_transport_sessions_active{transport=%q} %d\n", name, n)
 	}

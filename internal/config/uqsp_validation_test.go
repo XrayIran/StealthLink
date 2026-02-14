@@ -217,3 +217,47 @@ func TestValidateUQSPRejectsAnyTLSWithoutPassword(t *testing.T) {
 		t.Fatal("expected anytls password validation error")
 	}
 }
+
+func TestValidateUQSPAcceptsMASQUECarrier(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.ApplyUQSPDefaults()
+	cfg.Transport.UQSP.Carrier.Type = "masque"
+	cfg.Transport.UQSP.Carrier.MASQUE.TunnelType = "udp"
+	if err := cfg.ValidateUQSP(); err != nil {
+		t.Fatalf("expected valid masque carrier config, got: %v", err)
+	}
+}
+
+func TestValidateUQSPRejectsMASQUEBadTunnelType(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.ApplyUQSPDefaults()
+	cfg.Transport.UQSP.Carrier.Type = "masque"
+	cfg.Transport.UQSP.Carrier.MASQUE.TunnelType = "nope"
+	if err := cfg.ValidateUQSP(); err == nil {
+		t.Fatal("expected masque tunnel_type validation error")
+	}
+}
+
+func TestValidateUQSPAcceptsKCPCarrier(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.ApplyUQSPDefaults()
+	cfg.Transport.UQSP.Carrier.Type = "kcp"
+	cfg.Transport.UQSP.Carrier.KCP.Mode = "standard"
+	if err := cfg.ValidateUQSP(); err != nil {
+		t.Fatalf("expected valid kcp carrier config, got: %v", err)
+	}
+}
+
+func TestValidateUQSPRejectsKCPBadBatchSize(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.ApplyUQSPDefaults()
+	cfg.Transport.UQSP.Carrier.Type = "kcp"
+	cfg.Transport.UQSP.Carrier.KCP.BatchSize = 0
+	if err := cfg.ValidateUQSP(); err == nil {
+		t.Fatal("expected kcp batch_size validation error")
+	}
+}

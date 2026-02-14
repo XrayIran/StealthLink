@@ -3,6 +3,32 @@
 Date: 2026-02-10 (Updated from 2026-02-06 audit)
 Scope: `sources/*` listed by project owner, focused on Linux server-to-server high-performance tunneling.
 
+## 2026-02-14 Closure Addendum (Authoritative)
+
+This addendum supersedes older narrative sections in this file.
+
+- Upstream repositories analyzed: `47/47` from `sources/` using `tools/upstream_delta_scan.py --strict`.
+- Deterministic matrix status:
+  - `integrated`: 22
+  - `verify_only`: 22
+  - `out_of_scope_l3`: 3
+- Matrix artifacts:
+  - `docs/upstream-delta-matrix.md`
+  - `docs/upstream-delta-matrix.json`
+  - `tools/upstream_delta_rules.yaml`
+
+Helper script (`scripts/stealthlink-ctl`) analysis and closure:
+- Default release repository aligned to `XrayIran/StealthLink`.
+- `install --latest` path resolves release ZIP by OS/arch and supports non-interactive setup.
+- Release policy aligned: publish only `ZIP + stealthlink-ctl + SHA256SUMS`.
+
+Release operations closure:
+- Build assets command: `make release-assets VERSION=v2.0.0`
+- Remote publish automation added: `scripts/publish-v2.0.0.sh`
+  - dry-run by default
+  - `--yes` required for destructive remote cleanup/publish
+  - pinned to `v2.0.0` and uploads only the allowed assets
+
 ## Executive Summary
 
 **StealthLink has completed its upstream integration consolidation.** As of 2026-02-10, all 5 modes (4a-4e) are fully implemented with in-core protocol variants:

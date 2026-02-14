@@ -14,12 +14,12 @@ import (
 
 	"stealthlink/internal/config"
 	"stealthlink/internal/crypto/pqsig"
+	"stealthlink/internal/transport/kcpbase"
 	"stealthlink/internal/transport/noize"
 	"stealthlink/internal/transport/obfs"
 	"stealthlink/internal/transport/underlay"
 	"stealthlink/internal/transport/uqsp/behavior"
 	"stealthlink/internal/transport/uqsp/carrier"
-	"stealthlink/internal/transport/kcpbase"
 	"stealthlink/internal/warp"
 
 	"github.com/xtaci/smux"
@@ -83,7 +83,7 @@ func (b *VariantBuilder) BuildVariantXHTTPTLS() (*UnifiedProtocol, error) {
 		carrierCfg.Type = carrierType
 	}
 
-	c, err := carrier.SelectCarrier(carrierCfg, b.smuxCfg, b.authToken)
+	c, err := carrier.SelectCarrier(carrierCfg, b.tlsCfg, b.smuxCfg, b.authToken)
 	if err != nil {
 		if carrierType == "quic" || carrierType == "" {
 			variantCfg.Carrier = buildVariantQUICCarrier(b.tlsCfg)
@@ -186,7 +186,7 @@ func (b *VariantBuilder) BuildVariantRawTCP() (*UnifiedProtocol, error) {
 	if carrierCfg.Type == "" {
 		carrierCfg.Type = carrierType
 	}
-	c, err := carrier.SelectCarrier(carrierCfg, b.smuxCfg, b.authToken)
+	c, err := carrier.SelectCarrier(carrierCfg, b.tlsCfg, b.smuxCfg, b.authToken)
 	if err != nil {
 		return nil, fmt.Errorf("select carrier: %w", err)
 	}
@@ -253,7 +253,7 @@ func (b *VariantBuilder) BuildVariantTLSMirror() (*UnifiedProtocol, error) {
 	if carrierCfg.Type == "" {
 		carrierCfg.Type = carrierType
 	}
-	c, err := carrier.SelectCarrier(carrierCfg, b.smuxCfg, b.authToken)
+	c, err := carrier.SelectCarrier(carrierCfg, b.tlsCfg, b.smuxCfg, b.authToken)
 	if err != nil {
 		if carrierType == "quic" || carrierType == "" {
 			variantCfg.Carrier = buildVariantQUICCarrier(b.tlsCfg)
@@ -344,7 +344,7 @@ func (b *VariantBuilder) BuildVariantUDP() (*UnifiedProtocol, error) {
 	if carrierCfg.Type == "" {
 		carrierCfg.Type = carrierType
 	}
-	c, err := carrier.SelectCarrier(carrierCfg, b.smuxCfg, b.authToken)
+	c, err := carrier.SelectCarrier(carrierCfg, b.tlsCfg, b.smuxCfg, b.authToken)
 	if err != nil {
 		if carrierType == "quic" || carrierType == "" {
 			variantCfg.Carrier = buildVariantQUICCarrier(b.tlsCfg)
@@ -413,7 +413,7 @@ func (b *VariantBuilder) BuildVariantTrust() (*UnifiedProtocol, error) {
 	if carrierCfg.Type == "" {
 		carrierCfg.Type = carrierType
 	}
-	c, err := carrier.SelectCarrier(carrierCfg, b.smuxCfg, b.authToken)
+	c, err := carrier.SelectCarrier(carrierCfg, b.tlsCfg, b.smuxCfg, b.authToken)
 	if err != nil {
 		return nil, fmt.Errorf("select carrier: %w", err)
 	}
@@ -493,7 +493,7 @@ func (b *VariantBuilder) buildReverseMode(variant ProtocolVariant) *ReverseMode 
 	}
 	rev := b.cfg.Transport.UQSP.Reverse
 	mode := &ReverseMode{
-		Enabled:           rev.Enabled,
+		Enabled:           true,
 		Role:              b.cfg.GetReverseRole(),
 		ClientAddress:     rev.ClientAddress,
 		ServerAddress:     rev.ServerAddress,

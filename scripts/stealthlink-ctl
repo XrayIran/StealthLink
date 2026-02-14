@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.1.0"
+SCRIPT_VERSION="5.2.0"
 
 BIN_DIR="${STEALTHLINK_BIN_DIR:-/usr/local/bin}"
 ETC_DIR="${STEALTHLINK_ETC_DIR:-/etc/stealthlink}"
@@ -28,6 +28,7 @@ BUNDLE_ROOT=""
 os_id="unknown"
 os_family="unknown"
 pkg_mgr="unknown"
+DEFAULT_RELEASE_REPO="${STEALTHLINK_RELEASE_REPO:-XrayIran/StealthLink}"
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'; C_BLUE=$'\033[0;34m'; C_CYAN=$'\033[0;36m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -165,6 +166,64 @@ detect_os(){
   else pkg_mgr="unknown"; fi
 }
 
+detect_target_os(){
+  case "$(uname -s 2>/dev/null || echo Linux)" in
+    Linux) echo "linux" ;;
+    Darwin) echo "darwin" ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) echo "windows" ;;
+    *) echo "linux" ;;
+  esac
+}
+
+detect_target_arch(){
+  case "$(uname -m 2>/dev/null || echo x86_64)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) echo "amd64" ;;
+  esac
+}
+
+parse_bool(){
+  local v="${1:-}"
+  case "${v,,}" in
+    1|true|yes|y|on) echo "true" ;;
+    0|false|no|n|off) echo "false" ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_latest_bundle_url(){
+  local repo="${1:?repo required}" os="${2:?os required}" arch="${3:?arch required}"
+  local api="https://api.github.com/repos/${repo}/releases/latest" json
+  local -a hdr=(-H "Accept: application/vnd.github+json")
+  [[ -n "${GITHUB_TOKEN:-}" ]] && hdr+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  json="$(curl -fsSL "${hdr[@]}" "${api}")" || return 1
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to resolve --latest from GitHub; install python3 or use --bundle"
+  python3 - "${repo}" "${os}" "${arch}" <<'PY' <<<"${json}"
+import json,re,sys
+repo,os_name,arch=sys.argv[1:4]
+doc=json.load(sys.stdin)
+assets=doc.get("assets") or []
+compiled=[
+    re.compile(rf"^stealthlink-{re.escape(os_name)}-{re.escape(arch)}-v[^/]+\.zip$"),
+    re.compile(rf"^stealthlink-{re.escape(os_name)}-{re.escape(arch)}[^/]*\.zip$"),
+]
+for pat in compiled:
+    for a in assets:
+        name=(a.get("name") or "").strip()
+        if pat.match(name):
+            print(a.get("browser_download_url") or "")
+            raise SystemExit(0)
+for a in assets:
+    name=(a.get("name") or "").strip()
+    if name.endswith(".zip") and f"-{os_name}-" in name and f"-{arch}" in name and name.startswith("stealthlink-"):
+        print(a.get("browser_download_url") or "")
+        raise SystemExit(0)
+raise SystemExit(2)
+PY
+}
+
 map_pkg(){
   local base="$1"
   case "${pkg_mgr}" in
@@ -264,6 +323,13 @@ bundle_resolve(){
     if bundle_validate "${script_dir}/.."; then BUNDLE_ROOT="${script_dir}/.."; return 0; fi
     for z in ./stealthlink-*.zip ./dist/stealthlink-*.zip "${script_dir}/.."/*.zip; do [[ -f "${z}" ]] || continue; bundle_path="${z}"; break; done
     [[ -z "${bundle_path}" ]] && die "Could not auto-detect bundle. Use: --bundle <path>"
+  fi
+  if [[ -n "${bundle_path}" && "${bundle_path}" =~ ^https?:// ]]; then
+    TMP_DIR="$(mktemp -d)"
+    local dl="${TMP_DIR}/bundle.zip"
+    log_i "Downloading bundle: ${bundle_path}"
+    curl -fL --retry 3 --connect-timeout 15 --max-time 300 -o "${dl}" "${bundle_path}" || die "Failed to download bundle URL: ${bundle_path}"
+    bundle_path="${dl}"
   fi
   if [[ -d "${bundle_path}" ]]; then
     if bundle_validate "${bundle_path}"; then BUNDLE_ROOT="${bundle_path}"; return 0; fi
@@ -404,6 +470,64 @@ wizard_overlays(){
 
 generate_behavior_yaml(){ local overlays="$1" yaml=""; local o; for o in ${overlays}; do yaml+="      ${o}:\n        enabled: true\n"; done; printf "%s" "${yaml}"; }
 
+default_carrier_for_variant(){
+  case "${1:-4d}" in
+    4a) echo "xhttp" ;;
+    4b) echo "rawtcp" ;;
+    4c) echo "xhttp" ;;
+    4d) echo "quic" ;;
+    4e) echo "trusttunnel" ;;
+    *) echo "quic" ;;
+  esac
+}
+
+wizard_pair_auto(){
+  local mode="${1:-pair}" variant="${2:-4d}" carrier="${3:-}" connectivity="${4:-normal}" shared_key="${5:-}"
+  local gw_listen="${6:-0.0.0.0:8443}" gw_addr="${7:-127.0.0.1:8443}" agent_id="${8:-agent-1}" iface="${9:-sl0}" mtu="${10:-1400}"
+  local gw_vip="${11:-10.77.0.1/30}" agent_vip="${12:-10.77.0.2/30}" warp_enabled="${13:-false}" warp_required="${14:-true}" overlays="${15:-}"
+  ensure_dirs
+  [[ -z "${carrier}" ]] && carrier="$(default_carrier_for_variant "${variant}")"
+  [[ -z "${shared_key}" ]] && shared_key="$(gen_secret)"
+  local behavior_yaml="" reverse_enabled="false" reverse_auth="" dialer_yaml="" warp_yaml=""
+  local gw_peer="${agent_vip%%/*}" agent_peer="${gw_vip%%/*}"
+  if [[ "${connectivity}" == "reverse" ]]; then
+    reverse_enabled="true"
+    reverse_auth="$(gen_token)"
+  fi
+  [[ -n "${overlays}" ]] && behavior_yaml="$(generate_behavior_yaml "${overlays}")"
+  local transport_yaml="transport:\n  type: uqsp\n  uqsp:\n    carrier:\n      type: ${carrier}\n"
+  [[ -n "${behavior_yaml}" ]] && transport_yaml+="    behaviors:\n${behavior_yaml}"
+  [[ "${reverse_enabled}" == "true" ]] && transport_yaml+="    reverse:\n      enabled: true\n      auth_token: \"${reverse_auth}\"\n"
+  if [[ "${warp_enabled}" == "true" ]]; then
+    dialer_yaml="transport:\n  dialer: warp\n  warp_dialer:\n    mode: consumer\n    engine: builtin\n    required: ${warp_required}\n    failure_policy: $([[ "${warp_required}" == "true" ]] && echo fail-closed || echo fail-open)\n"
+    warp_yaml="warp:\n  enabled: true\n  required: ${warp_required}\n  mode: builtin\n  endpoint: \"engage.cloudflareclient.com:2408\"\n  routing_mode: vpn_only\n  keepalive: 25s\n"
+  fi
+  local gw_cfg="# StealthLink Gateway\nrole: gateway\nvariant: \"${variant}\"\ngateway:\n  listen: \"${gw_listen}\"\n${transport_yaml}${dialer_yaml}security:\n  shared_key: \"${shared_key}\"\nvpn:\n  enabled: true\n  mode: tun\n  name: \"${iface}\"\n  interface_ip: \"${gw_vip}\"\n  peer_ip: \"${gw_peer}\"\n  mtu: ${mtu}\nmetrics:\n  listen: \"127.0.0.1:9091\"\n${warp_yaml}"
+  local agent_cfg="# StealthLink Agent\nrole: agent\nvariant: \"${variant}\"\nagent:\n  id: \"${agent_id}\"\n  gateway_addr: \"${gw_addr}\"\n  reconnect_backoff: \"3s\"\n${transport_yaml}${dialer_yaml}security:\n  shared_key: \"${shared_key}\"\nvpn:\n  enabled: true\n  mode: tun\n  name: \"${iface}\"\n  interface_ip: \"${agent_vip}\"\n  peer_ip: \"${agent_peer}\"\n  mtu: ${mtu}\nmetrics:\n  listen: \"127.0.0.1:9092\"\n${warp_yaml}"
+  case "${mode}" in
+    gateway) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; log_ok "Wrote ${GATEWAY_CFG}" ;;
+    agent) write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${AGENT_CFG}" ;;
+    *) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${GATEWAY_CFG} and ${AGENT_CFG}" ;;
+  esac
+  local key_hash; key_hash="$(sha256_text "${shared_key}")"
+  cat >"${LIB_DIR}/pairing.txt" <<TXT
+StealthLink Pairing Information
+Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+Variant: ${variant}
+Carrier: ${carrier}
+Connectivity: ${connectivity}
+Shared Key SHA256: ${key_hash}
+Gateway Listen: ${gw_listen}
+Gateway Virtual IP: ${gw_vip}
+Agent Address: ${gw_addr}
+Agent Virtual IP: ${agent_vip}
+WARP: ${warp_enabled} (required: ${warp_required})
+TXT
+  chmod 0600 "${LIB_DIR}/pairing.txt" 2>/dev/null || true
+  log_ok "Pairing note: ${LIB_DIR}/pairing.txt"
+}
+
 wizard_pair(){
   local mode="${1:-pair}"
   ensure_dirs
@@ -519,6 +643,18 @@ SYS
   else
     log_i "Skipped. Guidance: set ip_forward=1 and rp_filter=2 for asymmetric routing."
   fi
+}
+
+network_setup_auto(){
+  ensure_dirs
+  cat >/etc/sysctl.d/99-stealthlink-network.conf <<'SYS'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+SYS
+  sysctl --system >/dev/null 2>&1 || true
+  log_ok "Applied /etc/sysctl.d/99-stealthlink-network.conf"
 }
 
 apply_sysctl_fallback(){
@@ -817,7 +953,7 @@ main_menu(){
   while true; do
     print_banner
     echo -e "${C_BOLD}Main Menu${C_RESET}"
-    echo "  1) Install / Upgrade (local ZIP or directory)"
+    echo "  1) Install / Upgrade (local ZIP/dir or latest GitHub release)"
     echo "  2) Configure Wizard (Gateway / Agent / Generate both)"
     echo "  3) Network & VPN Setup"
     echo "  4) Firewall"
@@ -830,8 +966,20 @@ main_menu(){
     sel=$(read_input "Select" "1")
     case "${sel}" in
       1)
-        local bundle role offline
-        bundle=$(read_input "Bundle path (ZIP or directory)" "")
+        local bundle role offline src repo os arch
+        src=$(select_menu "Install source" "local" "Local ZIP/directory" "latest" "Latest GitHub Release")
+        bundle=""
+        repo="${DEFAULT_RELEASE_REPO}"
+        os="$(detect_target_os)"
+        arch="$(detect_target_arch)"
+        if [[ "${src}" == "latest" ]]; then
+          repo=$(read_input "GitHub repo (owner/name)" "${repo}")
+          os=$(read_input "Target OS" "${os}")
+          arch=$(read_input "Target arch" "${arch}")
+          bundle="$(resolve_latest_bundle_url "${repo}" "${os}" "${arch}")" || die "Failed to resolve latest release for ${repo} (${os}/${arch})"
+        else
+          bundle=$(read_input "Bundle path (ZIP or directory)" "")
+        fi
         role=$(select_menu "Role" "gateway" "Gateway" "agent" "Agent" "both" "Both")
         offline=0; read_yesno "Offline mode?" "n" && offline=1
         install_binaries "${bundle}" "${role}" "${offline}"; press_enter ;;
@@ -892,8 +1040,9 @@ stealthlink-ctl v${SCRIPT_VERSION}
 Usage:
   stealthlink-ctl
   stealthlink-ctl setup
-  stealthlink-ctl install [--bundle PATH] [--role gateway|agent|both] [--offline]
-  stealthlink-ctl wizard gateway|agent|pair
+  stealthlink-ctl install [--bundle PATH_OR_URL] [--role gateway|agent|both] [--offline]
+  stealthlink-ctl install --latest [--repo owner/repo] [--os linux] [--arch amd64] [--role gateway|agent|both] [--offline]
+  stealthlink-ctl wizard gateway|agent|pair [--non-interactive --variant 4a|4b|4c|4d|4e ...]
   stealthlink-ctl deps install|check [--offline]
   stealthlink-ctl tuning apply [balanced|latency|throughput]
   stealthlink-ctl tuning rollback
@@ -923,20 +1072,66 @@ main(){
     install)
       shift
       require_root install
-      local bundle="" role="both" offline=0
+      local bundle="" role="both" offline=0 latest=0 repo="${DEFAULT_RELEASE_REPO}" target_os="" target_arch=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --bundle) bundle="${2:-}"; shift 2 ;;
           --role) role="${2:-both}"; shift 2 ;;
           --offline) offline=1; shift ;;
+          --latest) latest=1; shift ;;
+          --repo) repo="${2:-}"; shift 2 ;;
+          --os) target_os="${2:-}"; shift 2 ;;
+          --arch) target_arch="${2:-}"; shift 2 ;;
           *) shift ;;
         esac
       done
+      if [[ "${latest}" == "1" ]]; then
+        [[ -n "${bundle}" ]] && die "Use either --bundle or --latest, not both"
+        [[ -z "${repo}" ]] && die "--repo is required with --latest (or set STEALTHLINK_RELEASE_REPO)"
+        [[ -z "${target_os}" ]] && target_os="$(detect_target_os)"
+        [[ -z "${target_arch}" ]] && target_arch="$(detect_target_arch)"
+        bundle="$(resolve_latest_bundle_url "${repo}" "${target_os}" "${target_arch}")" || die "Failed to resolve latest release ZIP for ${repo} (${target_os}/${target_arch})"
+        log_i "Resolved latest bundle URL: ${bundle}"
+      fi
       install_binaries "${bundle}" "${role}" "${offline}" ;;
     wizard)
       shift
       require_root wizard
-      wizard_pair "${1:-pair}" ;;
+      local mode="${1:-pair}" non_interactive=0 variant="" carrier="" connectivity="normal" shared_key=""
+      local gw_listen="0.0.0.0:8443" gw_addr="127.0.0.1:8443" agent_id="agent-1" iface="sl0" mtu="1400" gw_vip="10.77.0.1/30" agent_vip="10.77.0.2/30"
+      local warp_enabled="false" warp_required="true" overlays=""
+      if [[ "${mode}" != "gateway" && "${mode}" != "agent" && "${mode}" != "pair" ]]; then
+        mode="pair"
+      else
+        shift
+      fi
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --non-interactive) non_interactive=1; shift ;;
+          --variant) variant="${2:-}"; shift 2 ;;
+          --carrier) carrier="${2:-}"; shift 2 ;;
+          --connectivity) connectivity="${2:-normal}"; shift 2 ;;
+          --shared-key) shared_key="${2:-}"; shift 2 ;;
+          --gateway-listen) gw_listen="${2:-${gw_listen}}"; shift 2 ;;
+          --gateway-addr) gw_addr="${2:-${gw_addr}}"; shift 2 ;;
+          --agent-id) agent_id="${2:-${agent_id}}"; shift 2 ;;
+          --iface) iface="${2:-${iface}}"; shift 2 ;;
+          --mtu) mtu="${2:-${mtu}}"; shift 2 ;;
+          --gateway-vip) gw_vip="${2:-${gw_vip}}"; shift 2 ;;
+          --agent-vip) agent_vip="${2:-${agent_vip}}"; shift 2 ;;
+          --warp-enabled) warp_enabled="$(parse_bool "${2:-}")" || die "--warp-enabled expects true/false"; shift 2 ;;
+          --warp-required) warp_required="$(parse_bool "${2:-}")" || die "--warp-required expects true/false"; shift 2 ;;
+          --overlays) overlays="${2:-}"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      if [[ "${non_interactive}" == "1" ]]; then
+        [[ -z "${variant}" ]] && variant="4d"
+        overlays="${overlays//,/ }"
+        wizard_pair_auto "${mode}" "${variant}" "${carrier}" "${connectivity}" "${shared_key}" "${gw_listen}" "${gw_addr}" "${agent_id}" "${iface}" "${mtu}" "${gw_vip}" "${agent_vip}" "${warp_enabled}" "${warp_required}" "${overlays}"
+      else
+        wizard_pair "${mode}"
+      fi ;;
     deps)
       shift
       require_root deps
@@ -1007,61 +1202,131 @@ main(){
     setup)
       shift
       require_root setup
-      ui_section "One-shot Guided Setup"
-      ui_print "This flow installs from your local bundle, configures tunnel, and starts services."
-      local bundle="" role="both" offline=0 wizard_target="pair" tune_profile="balanced"
-      bundle=$(read_input "Bundle path (ZIP or directory)" "")
-      role=$(select_menu "This host role" "gateway" "Gateway host" "agent" "Agent host" "both" "Generate both roles")
-      read_yesno "Offline mode (skip package install)?" "n" && offline=1
-
-      ui_section "Step 1/6: Install / Upgrade"
-      install_binaries "${bundle}" "${role}" "${offline}"
-
-      ui_section "Step 2/6: Configure Wizard"
-      case "${role}" in
-        gateway) wizard_target="gateway" ;;
-        agent) wizard_target="agent" ;;
-        both) wizard_target="pair" ;;
-      esac
-      if [[ "${role}" != "both" ]] && read_yesno "Also generate both configs on this host?" "n"; then wizard_target="pair"; fi
-      wizard_pair "${wizard_target}"
-
-      ui_section "Step 3/6: Network & VPN Setup"
-      network_setup
-
-      ui_section "Step 4/6: Host Tuning"
-      tune_profile=$(select_menu "Tuning profile" \
-        "balanced" "Balanced (recommended)" \
-        "latency" "Lower latency" \
-        "throughput" "Higher throughput" \
-        "skip" "Skip tuning")
-      [[ "${tune_profile}" != "skip" ]] && apply_tuning "${tune_profile}"
-
-      ui_section "Step 5/6: Firewall"
-      if read_yesno "Apply firewall rules now?" "y"; then
-        [[ "${role}" == "gateway" || "${role}" == "both" ]] && apply_firewall_role gateway auto
-        [[ "${role}" == "agent" || "${role}" == "both" ]] && apply_firewall_role agent auto
+      local bundle="" role="both" offline=0 wizard_target="pair" tune_profile="balanced" non_interactive=0 latest=0 repo="${DEFAULT_RELEASE_REPO}" target_os="" target_arch=""
+      local variant="" carrier="" connectivity="normal" shared_key="" gw_listen="0.0.0.0:8443" gw_addr="127.0.0.1:8443" agent_id="agent-1" iface="sl0" mtu="1400" gw_vip="10.77.0.1/30" agent_vip="10.77.0.2/30"
+      local warp_enabled="false" warp_required="true" overlays="" apply_firewall="true" start_services="true"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --bundle) bundle="${2:-}"; shift 2 ;;
+          --role) role="${2:-both}"; shift 2 ;;
+          --offline) offline=1; shift ;;
+          --latest) latest=1; shift ;;
+          --repo) repo="${2:-}"; shift 2 ;;
+          --os) target_os="${2:-}"; shift 2 ;;
+          --arch) target_arch="${2:-}"; shift 2 ;;
+          --non-interactive) non_interactive=1; shift ;;
+          --wizard-target) wizard_target="${2:-pair}"; shift 2 ;;
+          --tune-profile) tune_profile="${2:-balanced}"; shift 2 ;;
+          --variant) variant="${2:-}"; shift 2 ;;
+          --carrier) carrier="${2:-}"; shift 2 ;;
+          --connectivity) connectivity="${2:-normal}"; shift 2 ;;
+          --shared-key) shared_key="${2:-}"; shift 2 ;;
+          --gateway-listen) gw_listen="${2:-${gw_listen}}"; shift 2 ;;
+          --gateway-addr) gw_addr="${2:-${gw_addr}}"; shift 2 ;;
+          --agent-id) agent_id="${2:-${agent_id}}"; shift 2 ;;
+          --iface) iface="${2:-${iface}}"; shift 2 ;;
+          --mtu) mtu="${2:-${mtu}}"; shift 2 ;;
+          --gateway-vip) gw_vip="${2:-${gw_vip}}"; shift 2 ;;
+          --agent-vip) agent_vip="${2:-${agent_vip}}"; shift 2 ;;
+          --warp-enabled) warp_enabled="$(parse_bool "${2:-}")" || die "--warp-enabled expects true/false"; shift 2 ;;
+          --warp-required) warp_required="$(parse_bool "${2:-}")" || die "--warp-required expects true/false"; shift 2 ;;
+          --overlays) overlays="${2:-}"; shift 2 ;;
+          --apply-firewall) apply_firewall="$(parse_bool "${2:-}")" || die "--apply-firewall expects true/false"; shift 2 ;;
+          --start-services) start_services="$(parse_bool "${2:-}")" || die "--start-services expects true/false"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      if [[ "${latest}" == "1" ]]; then
+        [[ -n "${bundle}" ]] && die "Use either --bundle or --latest, not both"
+        [[ -z "${repo}" ]] && die "--repo is required with --latest (or set STEALTHLINK_RELEASE_REPO)"
+        [[ -z "${target_os}" ]] && target_os="$(detect_target_os)"
+        [[ -z "${target_arch}" ]] && target_arch="$(detect_target_arch)"
+        bundle="$(resolve_latest_bundle_url "${repo}" "${target_os}" "${target_arch}")" || die "Failed to resolve latest release ZIP for ${repo} (${target_os}/${target_arch})"
       fi
-
-      ui_section "Step 6/6: Enable + Start Services"
-      if [[ "${role}" == "gateway" || "${role}" == "both" ]]; then
-        if read_yesno "Enable/start gateway service?" "y"; then
-          service_op gateway enable || true
-          service_op gateway restart || service_op gateway start || true
+      if [[ "${non_interactive}" == "1" ]]; then
+        [[ -z "${bundle}" ]] && die "--bundle or --latest is required in --non-interactive mode"
+        [[ -z "${variant}" ]] && variant="4d"
+        case "${role}" in
+          gateway) [[ "${wizard_target}" == "pair" ]] || wizard_target="gateway" ;;
+          agent) [[ "${wizard_target}" == "pair" ]] || wizard_target="agent" ;;
+          both) wizard_target="pair" ;;
+        esac
+        overlays="${overlays//,/ }"
+        install_binaries "${bundle}" "${role}" "${offline}"
+        wizard_pair_auto "${wizard_target}" "${variant}" "${carrier}" "${connectivity}" "${shared_key}" "${gw_listen}" "${gw_addr}" "${agent_id}" "${iface}" "${mtu}" "${gw_vip}" "${agent_vip}" "${warp_enabled}" "${warp_required}" "${overlays}"
+        network_setup_auto
+        [[ "${tune_profile}" != "skip" ]] && apply_tuning "${tune_profile}"
+        if [[ "${apply_firewall}" == "true" ]]; then
+          [[ "${role}" == "gateway" || "${role}" == "both" ]] && apply_firewall_role gateway auto
+          [[ "${role}" == "agent" || "${role}" == "both" ]] && apply_firewall_role agent auto
         fi
-      fi
-      if [[ "${role}" == "agent" || "${role}" == "both" ]]; then
-        if read_yesno "Enable/start agent service?" "y"; then
-          service_op agent enable || true
-          service_op agent restart || service_op agent start || true
+        if [[ "${start_services}" == "true" ]]; then
+          if [[ "${role}" == "gateway" || "${role}" == "both" ]]; then
+            service_op gateway enable || true
+            service_op gateway restart || service_op gateway start || true
+          fi
+          if [[ "${role}" == "agent" || "${role}" == "both" ]]; then
+            service_op agent enable || true
+            service_op agent restart || service_op agent start || true
+          fi
         fi
-      fi
+        log_ok "One-shot non-interactive setup completed"
+      else
+        ui_section "One-shot Guided Setup"
+        ui_print "This flow installs from your local bundle, configures tunnel, and starts services."
+        bundle=$(read_input "Bundle path (ZIP or directory)" "${bundle}")
+        role=$(select_menu "This host role" "gateway" "Gateway host" "agent" "Agent host" "both" "Generate both roles")
+        read_yesno "Offline mode (skip package install)?" "n" && offline=1
 
-      ui_section "Setup Complete"
-      ui_print "Configs: ${GATEWAY_CFG} ${AGENT_CFG}"
-      ui_print "Pairing note: ${LIB_DIR}/pairing.txt"
-      ui_print "Check services: stealthlink-ctl service gateway status | stealthlink-ctl service agent status"
-      log_ok "One-shot setup completed" ;;
+        ui_section "Step 1/6: Install / Upgrade"
+        install_binaries "${bundle}" "${role}" "${offline}"
+
+        ui_section "Step 2/6: Configure Wizard"
+        case "${role}" in
+          gateway) wizard_target="gateway" ;;
+          agent) wizard_target="agent" ;;
+          both) wizard_target="pair" ;;
+        esac
+        if [[ "${role}" != "both" ]] && read_yesno "Also generate both configs on this host?" "n"; then wizard_target="pair"; fi
+        wizard_pair "${wizard_target}"
+
+        ui_section "Step 3/6: Network & VPN Setup"
+        network_setup
+
+        ui_section "Step 4/6: Host Tuning"
+        tune_profile=$(select_menu "Tuning profile" \
+          "balanced" "Balanced (recommended)" \
+          "latency" "Lower latency" \
+          "throughput" "Higher throughput" \
+          "skip" "Skip tuning")
+        [[ "${tune_profile}" != "skip" ]] && apply_tuning "${tune_profile}"
+
+        ui_section "Step 5/6: Firewall"
+        if read_yesno "Apply firewall rules now?" "y"; then
+          [[ "${role}" == "gateway" || "${role}" == "both" ]] && apply_firewall_role gateway auto
+          [[ "${role}" == "agent" || "${role}" == "both" ]] && apply_firewall_role agent auto
+        fi
+
+        ui_section "Step 6/6: Enable + Start Services"
+        if [[ "${role}" == "gateway" || "${role}" == "both" ]]; then
+          if read_yesno "Enable/start gateway service?" "y"; then
+            service_op gateway enable || true
+            service_op gateway restart || service_op gateway start || true
+          fi
+        fi
+        if [[ "${role}" == "agent" || "${role}" == "both" ]]; then
+          if read_yesno "Enable/start agent service?" "y"; then
+            service_op agent enable || true
+            service_op agent restart || service_op agent start || true
+          fi
+        fi
+
+        ui_section "Setup Complete"
+        ui_print "Configs: ${GATEWAY_CFG} ${AGENT_CFG}"
+        ui_print "Pairing note: ${LIB_DIR}/pairing.txt"
+        ui_print "Check services: stealthlink-ctl service gateway status | stealthlink-ctl service agent status"
+        log_ok "One-shot setup completed"
+      fi ;;
     secret) gen_secret ;;
     *) usage; die "Unknown command: ${cmd}" ;;
   esac

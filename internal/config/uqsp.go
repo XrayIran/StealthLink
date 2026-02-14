@@ -315,6 +315,36 @@ func (c *Config) ApplyUQSPDefaults() {
 		u.Carrier.AnyTLS.IdleSessionTimeout = 300
 	}
 
+	// MASQUE defaults
+	if strings.TrimSpace(u.Carrier.MASQUE.TunnelType) == "" {
+		u.Carrier.MASQUE.TunnelType = "udp"
+	}
+
+	// KCP defaults (standalone carrier)
+	if strings.TrimSpace(u.Carrier.KCP.Mode) == "" {
+		u.Carrier.KCP.Mode = "standard"
+	}
+	if strings.TrimSpace(u.Carrier.KCP.Block) == "" {
+		u.Carrier.KCP.Block = "none"
+	}
+	if u.Carrier.KCP.DataShards == 0 {
+		u.Carrier.KCP.DataShards = 10
+	}
+	if u.Carrier.KCP.ParityShards == 0 {
+		u.Carrier.KCP.ParityShards = 3
+	}
+	if u.Carrier.KCP.AutoTuneFEC == nil {
+		v := true
+		u.Carrier.KCP.AutoTuneFEC = &v
+	}
+	if u.Carrier.KCP.BatchEnabled == nil {
+		v := true
+		u.Carrier.KCP.BatchEnabled = &v
+	}
+	if u.Carrier.KCP.BatchSize == 0 {
+		u.Carrier.KCP.BatchSize = 32
+	}
+
 	// Reality defaults
 	if u.Behaviors.Reality.SpiderConcurrency == 0 {
 		u.Behaviors.Reality.SpiderConcurrency = 4
@@ -445,7 +475,7 @@ func (c *Config) ValidateUQSP() error {
 	// Validate carrier type
 	carrierType := strings.ToLower(strings.TrimSpace(u.Carrier.Type))
 	switch carrierType {
-	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "icmptun", "webtunnel", "chisel", "xhttp", "anytls":
+	case "", "quic", "trusttunnel", "rawtcp", "faketcp", "kcp", "icmptun", "webtunnel", "chisel", "xhttp", "anytls", "masque":
 	default:
 		return fmt.Errorf("transport.uqsp.carrier.type has unsupported value %q", u.Carrier.Type)
 	}
@@ -485,6 +515,29 @@ func (c *Config) ValidateUQSP() error {
 			return fmt.Errorf("transport.uqsp.carrier.faketcp.crypto_key is required when aead_mode is enabled")
 		}
 	}
+	if carrierType == "masque" {
+		switch strings.ToLower(strings.TrimSpace(u.Carrier.MASQUE.TunnelType)) {
+		case "", "udp", "tcp", "ip":
+		default:
+			return fmt.Errorf("transport.uqsp.carrier.masque.tunnel_type must be one of: udp, tcp, ip")
+		}
+	}
+	if carrierType == "kcp" {
+		switch strings.ToLower(strings.TrimSpace(u.Carrier.KCP.Mode)) {
+		case "", "standard", "brutal", "awg", "dtls":
+		default:
+			return fmt.Errorf("transport.uqsp.carrier.kcp.mode must be one of: standard, brutal, awg, dtls")
+		}
+		if u.Carrier.KCP.DataShards < 1 || u.Carrier.KCP.DataShards > 255 {
+			return fmt.Errorf("transport.uqsp.carrier.kcp.data_shards must be between 1 and 255")
+		}
+		if u.Carrier.KCP.ParityShards < 0 || u.Carrier.KCP.ParityShards > 255 {
+			return fmt.Errorf("transport.uqsp.carrier.kcp.parity_shards must be between 0 and 255")
+		}
+		if u.Carrier.KCP.BatchSize < 1 || u.Carrier.KCP.BatchSize > 64 {
+			return fmt.Errorf("transport.uqsp.carrier.kcp.batch_size must be between 1 and 64")
+		}
+	}
 
 	// Validate carrier fingerprints and key options
 	if strings.TrimSpace(u.Carrier.WebTunnel.TLSFingerprint) == "" {
@@ -521,9 +574,11 @@ func (c *Config) ValidateUQSP() error {
 	// Validate reverse mode fields
 	if u.Reverse.Enabled {
 		switch strings.ToLower(strings.TrimSpace(u.Reverse.Role)) {
-		case "", "client", "server", "rendezvous":
+		// "dialer"/"listener" are legacy-but-supported roles used by older configs
+		// and by internal defaults (see Config.GetReverseRole and uqsp.ReverseDialer).
+		case "", "client", "server", "rendezvous", "dialer", "listener":
 		default:
-			return fmt.Errorf("transport.uqsp.reverse.role must be one of: client, server, rendezvous")
+			return fmt.Errorf("transport.uqsp.reverse.role must be one of: client, server, rendezvous (or legacy: dialer, listener)")
 		}
 		if strings.TrimSpace(u.Reverse.AuthToken) == "" {
 			return fmt.Errorf("transport.uqsp.reverse.auth_token is required when reverse mode is enabled")
@@ -615,11 +670,54 @@ type UQSPCarrierConfig struct {
 	TrustTunnel TrustTunnelCarrierConfig `yaml:"trusttunnel"`
 	RawTCP      RawTCPCarrierConfig      `yaml:"rawtcp"`
 	FakeTCP     FakeTCPCarrierConfig     `yaml:"faketcp"`
+	KCP         KCPBaseCarrierConfig     `yaml:"kcp"`
 	ICMPTun     ICMPTunCarrierConfig     `yaml:"icmptun"`
 	WebTunnel   WebTunnelCarrierConfig   `yaml:"webtunnel"`
 	Chisel      ChiselCarrierConfig      `yaml:"chisel"`
 	XHTTP       XHTTPCarrierConfig       `yaml:"xhttp"`
 	AnyTLS      AnyTLSCarrierConfig      `yaml:"anytls"`
+	MASQUE      MASQUECarrierConfig      `yaml:"masque"`
+}
+
+// KCPBaseCarrierConfig configures the standalone KCP carrier for mode 4d.
+// It maps onto internal/transport/kcpbase.Config.
+type KCPBaseCarrierConfig struct {
+	Mode         string `yaml:"mode"`  // standard, brutal, awg, dtls
+	Block        string `yaml:"block"` // none, aes, aes-128, salsa20, ...
+	Key          string `yaml:"key"`
+	DataShards   int    `yaml:"data_shards"`
+	ParityShards int    `yaml:"parity_shards"`
+	AutoTuneFEC  *bool  `yaml:"auto_tune_fec"`
+	DSCP         int    `yaml:"dscp"`
+	BatchEnabled *bool  `yaml:"batch_enabled"`
+	BatchSize    int    `yaml:"batch_size"`
+	Brutal       struct {
+		BandwidthMbps int    `yaml:"bandwidth_mbps"`
+		PacingMode    string `yaml:"pacing_mode"`
+	} `yaml:"brutal"`
+	AWG struct {
+		JunkEnabled     *bool         `yaml:"junk_enabled"`
+		JunkInterval    time.Duration `yaml:"junk_interval"`
+		JunkMinSize     int           `yaml:"junk_min_size"`
+		JunkMaxSize     int           `yaml:"junk_max_size"`
+		PacketObfuscate *bool         `yaml:"packet_obfuscate"`
+	} `yaml:"awg"`
+	DTLS struct {
+		MTU              int           `yaml:"mtu"`
+		HandshakeTimeout time.Duration `yaml:"handshake_timeout"`
+		FlightInterval   time.Duration `yaml:"flight_interval"`
+	} `yaml:"dtls"`
+}
+
+// MASQUECarrierConfig configures MASQUE-over-QUIC as a carrier.
+// It reuses the transport/masque QUIC profile and guard tagging to blend with
+// HTTP/3 CONNECT-{UDP,IP}-like flows.
+type MASQUECarrierConfig struct {
+	ServerAddr string            `yaml:"server_addr"`
+	Target     string            `yaml:"target"`
+	TunnelType string            `yaml:"tunnel_type"` // udp, tcp, ip
+	AuthToken  string            `yaml:"auth_token"`
+	Headers    map[string]string `yaml:"headers"`
 }
 
 // TrustTunnelCarrierConfig configures TrustTunnel as a carrier.

@@ -127,7 +127,7 @@ See `examples/uqsp-mode-4a.yaml` through `examples/uqsp-mode-4e.yaml` for comple
 
 ### From Release ZIP
 ```bash
-wget https://github.com/your-org/stealthlink/releases/download/v2.0.0/stealthlink-linux-amd64-v2.0.0.zip
+wget https://github.com/XrayIran/StealthLink/releases/download/v2.0.0/stealthlink-linux-amd64-v2.0.0.zip
 unzip stealthlink-linux-amd64-v2.0.0.zip
 cd stealthlink-linux-amd64-v2.0.0
 sudo ./stealthlink-ctl install --local --role=gateway
@@ -164,8 +164,11 @@ See `docs/MIGRATION_GUIDE.md` for detailed instructions.
 - `stealthlink_pool_*` - Connection pool metrics
 - `stealthlink_xmux_*` - Xmux lifecycle metrics
 
-### Grafana Dashboard
-Import `dist/grafana-dashboard.json` for pre-built dashboards.
+### Release Assets Policy
+The published GitHub release must contain only:
+- `stealthlink-<os>-<arch>-v2.0.0.zip`
+- `stealthlink-ctl`
+- `SHA256SUMS`
 
 ## Known Issues
 
@@ -199,10 +202,10 @@ This release consolidates techniques from upstream projects:
 
 ## Support
 
-- GitHub Issues: https://github.com/your-org/stealthlink/issues
+- GitHub Issues: https://github.com/XrayIran/StealthLink/issues
 - Documentation: https://docs.stealthlink.io
 - Community: https://discord.gg/stealthlink
 
 ---
 
-**Full Changelog**: https://github.com/your-org/stealthlink/compare/v1.x...v2.0.0
+**Full Changelog**: https://github.com/XrayIran/StealthLink/compare/v1.x...v2.0.0

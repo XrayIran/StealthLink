@@ -174,6 +174,11 @@ type WARPDialer struct {
 	// should set true when WARP is used as an anti-blocking measure (to avoid silent IP leak).
 	Required bool `yaml:"required"`
 
+	// FailurePolicy is a human-readable alias for Required:
+	// - fail-open   => required=false
+	// - fail-closed => required=true
+	FailurePolicy string `yaml:"failure_policy"`
+
 	DeviceID string `yaml:"device_id"` // WARP device registration ID
 }
 
@@ -607,6 +612,27 @@ func (c *Config) applyDefaults() {
 	if c.Transport.Type == "" {
 		c.Transport.Type = "uqsp"
 	}
+	if c.Transport.Dialer == "" {
+		c.Transport.Dialer = "direct"
+	}
+	if c.Transport.WARPDialer.Mode == "" {
+		c.Transport.WARPDialer.Mode = "consumer"
+	}
+	if c.Transport.WARPDialer.Engine == "" {
+		c.Transport.WARPDialer.Engine = "builtin"
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Transport.WARPDialer.FailurePolicy)) {
+	case "":
+		if c.Transport.WARPDialer.Required {
+			c.Transport.WARPDialer.FailurePolicy = "fail-closed"
+		} else {
+			c.Transport.WARPDialer.FailurePolicy = "fail-open"
+		}
+	case "fail-open":
+		c.Transport.WARPDialer.Required = false
+	case "fail-closed":
+		c.Transport.WARPDialer.Required = true
+	}
 
 	// Apply UQSP defaults if using UQSP transport
 	if c.UQSPEnabled() {
@@ -692,6 +718,9 @@ func (c *Config) validate() error {
 
 	// Validate compatibility mode configuration
 	if err := c.ValidateCompatMode(); err != nil {
+		return err
+	}
+	if err := c.validateUnderlayDialer(); err != nil {
 		return err
 	}
 
@@ -807,6 +836,41 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+func (c *Config) validateUnderlayDialer() error {
+	dialer := strings.ToLower(strings.TrimSpace(c.Transport.Dialer))
+	switch dialer {
+	case "", "direct":
+		return nil
+	case "warp":
+		engine := strings.ToLower(strings.TrimSpace(c.Transport.WARPDialer.Engine))
+		switch engine {
+		case "", "builtin", "wgquick":
+		default:
+			return fmt.Errorf("transport.warp_dialer.engine must be one of: builtin, wgquick")
+		}
+		policy := strings.ToLower(strings.TrimSpace(c.Transport.WARPDialer.FailurePolicy))
+		switch policy {
+		case "", "fail-open", "fail-closed":
+		default:
+			return fmt.Errorf("transport.warp_dialer.failure_policy must be one of: fail-open, fail-closed")
+		}
+		if policy == "fail-open" && c.Transport.WARPDialer.Required {
+			return fmt.Errorf("transport.warp_dialer.failure_policy=fail-open conflicts with required=true")
+		}
+		if policy == "fail-closed" && !c.Transport.WARPDialer.Required {
+			return fmt.Errorf("transport.warp_dialer.failure_policy=fail-closed requires required=true")
+		}
+		return nil
+	case "socks":
+		if strings.TrimSpace(c.Transport.SOCKSDialer.Address) == "" {
+			return fmt.Errorf("transport.socks_dialer.address is required when transport.dialer=socks")
+		}
+		return nil
+	default:
+		return fmt.Errorf("transport.dialer must be one of: direct, warp, socks")
+	}
 }
 
 func validateRemovedTransportBlocks(data []byte) error {

@@ -10,14 +10,109 @@ import pathlib
 import sys
 from typing import Any
 
-import yaml
-
 ALLOWED_STATUSES = {"integrated", "needs_patch", "out_of_scope_l3", "verify_only"}
 
 
+def _unquote_scalar(raw: str) -> str:
+    raw = raw.strip()
+    if len(raw) >= 2 and ((raw[0] == raw[-1] == '"') or (raw[0] == raw[-1] == "'")):
+        return raw[1:-1]
+    return raw
+
+
+def _load_rules_minimal_yaml(text: str) -> dict[str, Any]:
+    """
+    Minimal YAML parser for tools/upstream_delta_rules.yaml.
+
+    We avoid a hard dependency on PyYAML so `make upstream-audit` works on
+    clean hosts where only stdlib Python is available.
+    """
+
+    out: dict[str, Any] = {}
+    upstreams: list[dict[str, Any]] | None = None
+    current: dict[str, Any] | None = None
+    current_destinations: list[str] | None = None
+
+    for raw in text.splitlines():
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(line) - len(line.lstrip(" "))
+
+        # Top-level key/value (e.g. "version: 1")
+        if indent == 0 and ":" in stripped:
+            key, val = stripped.split(":", 1)
+            key = key.strip()
+            val = val.strip()
+            current = None
+            current_destinations = None
+            if val == "":
+                if key == "upstreams":
+                    upstreams = []
+                    out[key] = upstreams
+                else:
+                    out[key] = None
+            else:
+                out[key] = _unquote_scalar(val)
+            continue
+
+        # New upstream entry (e.g. "  - name: tcpraw")
+        if indent == 2 and stripped.startswith("- "):
+            if upstreams is None:
+                raise ValueError("encountered list item before 'upstreams:'")
+            current = {}
+            upstreams.append(current)
+            current_destinations = None
+            rest = stripped[2:].strip()
+            if ":" in rest:
+                k, v = rest.split(":", 1)
+                current[k.strip()] = _unquote_scalar(v.strip())
+            else:
+                raise ValueError(f"unsupported list item: {stripped!r}")
+            continue
+
+        # Upstream fields (e.g. "    status: integrated")
+        if indent == 4 and current is not None and ":" in stripped:
+            key, val = stripped.split(":", 1)
+            key = key.strip()
+            val = val.strip()
+            current_destinations = None
+            if val == "":
+                if key == "destinations":
+                    current_destinations = []
+                    current[key] = current_destinations
+                else:
+                    current[key] = None
+            else:
+                current[key] = _unquote_scalar(val)
+            continue
+
+        # Destinations list items (e.g. "      - internal/transport/rawtcp")
+        if indent == 6 and stripped.startswith("- ") and current is not None:
+            # destinations must have been initialized already
+            dests = current.get("destinations")
+            if not isinstance(dests, list):
+                # tolerate weird ordering by initializing on first item
+                dests = []
+                current["destinations"] = dests
+            dests.append(_unquote_scalar(stripped[2:].strip()))
+            continue
+
+        raise ValueError(f"unsupported YAML line: {raw!r}")
+
+    return out
+
+
 def load_rules(path: pathlib.Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        obj = yaml.safe_load(f)
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore
+
+        obj = yaml.safe_load(text)
+    except ModuleNotFoundError:
+        obj = _load_rules_minimal_yaml(text)
     if not isinstance(obj, dict):
         raise ValueError("rules file must decode to a mapping")
     return obj
@@ -146,7 +241,15 @@ def main() -> int:
                 print(f"  - {item}", file=sys.stderr)
             return 2
 
-    print(f"wrote {json_out.relative_to(root)} and {md_out.relative_to(root)}")
+    try:
+        json_label = str(json_out.relative_to(root))
+    except ValueError:
+        json_label = str(json_out)
+    try:
+        md_label = str(md_out.relative_to(root))
+    except ValueError:
+        md_label = str(md_out)
+    print(f"wrote {json_label} and {md_label}")
     return 0
 
 
