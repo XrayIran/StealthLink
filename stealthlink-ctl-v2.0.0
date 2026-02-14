@@ -1,0 +1,3529 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#==============================================================================
+# StealthLink Unified Control Script (stealthlink-ctl)
+# Manages install, configure, monitor, and control of StealthLink services
+#==============================================================================
+
+readonly SCRIPT_VERSION="2.0.0"
+readonly CONFIG_DIR="${STEALTHLINK_CONFIG_DIR:-/opt/stealthlink}"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+readonly BACKUP_DIR="${CONFIG_DIR}/backups"
+readonly BIN_DIR="${STEALTHLINK_BIN_DIR:-/usr/local/bin}"
+readonly BINARY_PATH="${BIN_DIR}/stealthlink-gateway"
+readonly SERVICE_NAME="stealthlink"
+readonly GITHUB_REPO="stealthlink/stealthlink"
+readonly LOG_DIR="${STEALTHLINK_LOG_DIR:-/var/log/stealthlink}"
+readonly SYSTEMD_DIR="${STEALTHLINK_SYSTEMD_DIR:-/etc/systemd/system}"
+readonly LOGROTATE_DIR="${STEALTHLINK_LOGROTATE_DIR:-/etc/logrotate.d}"
+readonly TELEGRAM_CONFIG="${CONFIG_DIR}/telegram.conf"
+
+INSTALL_ROLE="gateway"
+STEALTHLINK_VERSION=""
+INSTALL_BUNDLE_PATH=""
+INSTALL_LOCAL_MODE="auto"
+INSTALL_ASSET_ROOT=""
+INSTALL_TMP_DIR=""
+INSTALL_OFFLINE_MODE="auto"
+
+#==============================================================================
+# Colors and Logging
+#==============================================================================
+
+if [[ -t 1 ]]; then
+    readonly COLOR_RESET='\033[0m'
+    readonly COLOR_RED='\033[0;31m'
+    readonly COLOR_GREEN='\033[0;32m'
+    readonly COLOR_YELLOW='\033[0;33m'
+    readonly COLOR_BLUE='\033[0;34m'
+    readonly COLOR_CYAN='\033[0;36m'
+    readonly COLOR_MAGENTA='\033[0;35m'
+    readonly COLOR_BOLD='\033[1m'
+    readonly COLOR_DIM='\033[2m'
+else
+    readonly COLOR_RESET=''
+    readonly COLOR_RED=''
+    readonly COLOR_GREEN=''
+    readonly COLOR_YELLOW=''
+    readonly COLOR_BLUE=''
+    readonly COLOR_CYAN=''
+    readonly COLOR_MAGENTA=''
+    readonly COLOR_BOLD=''
+    readonly COLOR_DIM=''
+fi
+
+log_info()    { echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*"; }
+log_success() { echo -e "${COLOR_GREEN}[SUCCESS]${COLOR_RESET} $*"; }
+log_warn()    { echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"; }
+log_error()   { echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2; }
+log_step()    { echo -e "${COLOR_MAGENTA}[===>]${COLOR_RESET} ${COLOR_BOLD}$*${COLOR_RESET}"; }
+
+#==============================================================================
+# Utility Functions
+#==============================================================================
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This command requires root privileges"
+        exit 1
+    fi
+}
+
+check_command() {
+    command -v "$1" &>/dev/null
+}
+
+get_service_manager() {
+    if check_command systemctl; then
+        echo "systemd"
+    elif check_command service; then
+        echo "sysvinit"
+    else
+        echo "unknown"
+    fi
+}
+
+is_service_active() {
+    local manager
+    manager=$(get_service_manager)
+    case "$manager" in
+        systemd)  systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null ;;
+        sysvinit) service "$SERVICE_NAME" status &>/dev/null ;;
+        *)        return 1 ;;
+    esac
+}
+
+get_service_pid() {
+    if is_service_active; then
+        pgrep -f "stealthlink-gateway" | head -n1
+    fi
+}
+
+cleanup_install_tmp() {
+    if [[ -n "${INSTALL_TMP_DIR}" && -d "${INSTALL_TMP_DIR}" ]]; then
+        rm -rf "${INSTALL_TMP_DIR}" || true
+        INSTALL_TMP_DIR=""
+    fi
+}
+
+find_bundle_binary() {
+    local root="$1"
+    local name="$2"
+    local candidates=(
+        "${root}/${name}"
+        "${root}/bin/${name}"
+        "${root}/dist/${name}"
+    )
+    local p
+    for p in "${candidates[@]}"; do
+        if [[ -f "${p}" ]]; then
+            echo "${p}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_valid_bundle_root() {
+    local root="$1"
+    find_bundle_binary "${root}" "stealthlink-gateway" >/dev/null 2>&1 || return 1
+    find_bundle_binary "${root}" "stealthlink-agent" >/dev/null 2>&1 || return 1
+    find_bundle_binary "${root}" "stealthlink-tools" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+auto_detect_bundle_root() {
+    local script_dir cwd
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    cwd="$(pwd)"
+    local candidates=(
+        "${script_dir}"
+        "${script_dir}/.."
+        "${cwd}"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        if is_valid_bundle_root "${c}"; then
+            echo "${c}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+extract_bundle_zip() {
+    local zip_path="$1"
+    local out_dir="$2"
+
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "${zip_path}" -d "${out_dir}"
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "${zip_path}" "${out_dir}" <<'PYEOF'
+import pathlib
+import sys
+import zipfile
+
+zip_path = pathlib.Path(sys.argv[1])
+out_dir = pathlib.Path(sys.argv[2])
+with zipfile.ZipFile(zip_path, "r") as zf:
+    zf.extractall(out_dir)
+PYEOF
+        return 0
+    fi
+
+    return 1
+}
+
+resolve_install_asset_root() {
+    local root=""
+
+    if [[ -n "${INSTALL_BUNDLE_PATH}" ]]; then
+        if [[ -d "${INSTALL_BUNDLE_PATH}" ]]; then
+            if is_valid_bundle_root "${INSTALL_BUNDLE_PATH}"; then
+                root="${INSTALL_BUNDLE_PATH}"
+            fi
+        elif [[ -f "${INSTALL_BUNDLE_PATH}" ]]; then
+            INSTALL_TMP_DIR="$(mktemp -d)"
+            if ! extract_bundle_zip "${INSTALL_BUNDLE_PATH}" "${INSTALL_TMP_DIR}"; then
+                log_error "Failed to extract bundle ZIP: ${INSTALL_BUNDLE_PATH}"
+                exit 1
+            fi
+            if is_valid_bundle_root "${INSTALL_TMP_DIR}"; then
+                root="${INSTALL_TMP_DIR}"
+            else
+                local candidate=""
+                while IFS= read -r candidate; do
+                    if [[ -n "${candidate}" ]] && is_valid_bundle_root "${candidate}"; then
+                        root="${candidate}"
+                        break
+                    fi
+                done < <(find "${INSTALL_TMP_DIR}" -mindepth 1 -maxdepth 2 -type d)
+            fi
+        fi
+
+        if [[ -z "${root}" ]]; then
+            log_error "Invalid bundle path: ${INSTALL_BUNDLE_PATH}"
+            log_error "Expected ZIP or directory containing stealthlink-gateway/agent/tools binaries"
+            exit 1
+        fi
+
+        echo "${root}"
+        return 0
+    fi
+
+    if [[ "${INSTALL_LOCAL_MODE}" == "true" || "${INSTALL_LOCAL_MODE}" == "auto" ]]; then
+        if root="$(auto_detect_bundle_root)"; then
+            echo "${root}"
+            return 0
+        fi
+    fi
+
+    echo ""
+}
+
+install_binaries_from_root() {
+    local root="$1"
+    local bins=(stealthlink-gateway stealthlink-agent stealthlink-tools)
+    local bin src
+
+    log_step "Installing binaries from local bundle: ${root}"
+    mkdir -p "${CONFIG_DIR}"
+
+    for bin in "${bins[@]}"; do
+        src="$(find_bundle_binary "${root}" "${bin}" || true)"
+        if [[ -z "${src}" ]]; then
+            log_error "Missing required binary in bundle: ${bin}"
+            exit 1
+        fi
+        install -m 0755 "${src}" "${CONFIG_DIR}/${bin}"
+        mkdir -p "${BIN_DIR}"
+        ln -sf "${CONFIG_DIR}/${bin}" "${BIN_DIR}/${bin}"
+        log_success "Installed: ${bin}"
+    done
+
+    src="$(find_bundle_binary "${root}" "stealthlink-ctl" || true)"
+    if [[ -n "${src}" ]]; then
+        install -m 0755 "${src}" "${CONFIG_DIR}/stealthlink-ctl"
+    else
+        install -m 0755 "${BASH_SOURCE[0]}" "${CONFIG_DIR}/stealthlink-ctl"
+    fi
+    mkdir -p "${BIN_DIR}"
+    ln -sf "${CONFIG_DIR}/stealthlink-ctl" "${BIN_DIR}/stealthlink-ctl"
+    log_success "Installed: stealthlink-ctl"
+}
+
+#==============================================================================
+# Network Detection
+#==============================================================================
+
+detect_network() {
+    local default_iface default_ip gateway_ip
+    if check_command ip; then
+        default_iface=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
+        default_ip=$(ip addr show "$default_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+        gateway_ip=$(ip route | grep '^default' | awk '{print $3}' | head -n1)
+    elif check_command ifconfig; then
+        default_iface=$(route -n | grep '^0.0.0.0' | awk '{print $8}' | head -n1)
+        default_ip=$(ifconfig "$default_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}')
+        gateway_ip=$(route -n | grep '^0.0.0.0' | awk '{print $2}' | head -n1)
+    fi
+    echo "Interface: ${default_iface:-unknown}"
+    echo "Local IP: ${default_ip:-unknown}"
+    echo "Gateway: ${gateway_ip:-unknown}"
+}
+
+#==============================================================================
+# OS / Architecture Detection (from installer)
+#==============================================================================
+
+detect_os() {
+    log_step "Detecting operating system"
+    OS="unknown"; OS_VERSION="unknown"; OS_FAMILY="unknown"
+    HAS_SYSTEMD=false; PKG_MANAGER="unknown"
+
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS="${ID}"; OS_VERSION="${VERSION_ID:-unknown}"
+    elif [ -f /etc/redhat-release ]; then OS="rhel"
+    elif [ -f /etc/debian_version ]; then OS="debian"
+    elif [ -f /etc/alpine-release ]; then OS="alpine"
+    elif [ -f /etc/arch-release ]; then OS="arch"
+    elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then OS="opensuse"
+    else OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    fi
+
+    case "${OS}" in
+        ubuntu|debian|linuxmint|pop|elementary|zorin|kali|raspbian) OS_FAMILY="debian"; PKG_MANAGER="apt" ;;
+        rhel|centos|fedora|rocky|almalinux|oracle|amazon|amzn)
+            OS_FAMILY="rhel"
+            if command -v dnf &>/dev/null; then PKG_MANAGER="dnf"; else PKG_MANAGER="yum"; fi ;;
+        arch|manjaro|endeavouros|garuda) OS_FAMILY="arch"; PKG_MANAGER="pacman" ;;
+        opensuse|opensuse-leap|opensuse-tumbleweed|sles) OS_FAMILY="suse"; PKG_MANAGER="zypper" ;;
+        alpine) OS_FAMILY="alpine"; PKG_MANAGER="apk" ;;
+        *) log_error "Unsupported OS: ${OS}"; exit 1 ;;
+    esac
+
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        HAS_SYSTEMD=true
+    fi
+    log_success "Detected: ${OS} ${OS_VERSION} (${OS_FAMILY} family)"
+}
+
+detect_arch() {
+    log_step "Detecting system architecture"
+    local machine_arch; machine_arch=$(uname -m)
+    case "${machine_arch}" in
+        x86_64|amd64)   ARCH="amd64" ;;
+        aarch64|arm64)   ARCH="arm64" ;;
+        armv7l|armv7)    ARCH="arm32" ;;
+        *) log_error "Unsupported architecture: ${machine_arch}"; exit 1 ;;
+    esac
+    log_success "Architecture: ${machine_arch} -> ${ARCH}"
+}
+
+#==============================================================================
+# Configuration Parsing
+#==============================================================================
+
+show_connection_info() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_warn "Config file not found: $CONFIG_FILE"
+        return 1
+    fi
+    echo -e "${COLOR_BOLD}Configuration:${COLOR_RESET}"
+    local role; role=$(grep -E '^\s*role:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+    echo "  Role: $role"
+    local listen_addr; listen_addr=$(grep -E '^\s*listen:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+    echo "  Listen: $listen_addr"
+    local transport; transport=$(grep -E '^\s*carrier:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+    echo "  Carrier: $transport"
+    local behaviors; behaviors=$(grep -A5 '^\s*behaviors:' "$CONFIG_FILE" | grep -E '^\s*-\s*' | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+    if [[ -n "$behaviors" ]]; then echo "  Behaviors: $behaviors"; fi
+}
+
+
+#==============================================================================
+# Firewall Functions (from stealthlink-iptables.sh)
+#==============================================================================
+
+fw_is_firewalld_active() {
+    command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null
+}
+
+fw_has_iptables() { command -v iptables &>/dev/null; }
+fw_has_ip6tables() { command -v ip6tables &>/dev/null; }
+
+fw_ipt_add() {
+    local table="$1"; shift
+    if ! iptables -t "${table}" -C "$@" 2>/dev/null; then
+        iptables -t "${table}" -A "$@"
+    fi
+}
+
+fw_ipt_del() {
+    local table="$1"; shift
+    if iptables -t "${table}" -C "$@" 2>/dev/null; then
+        iptables -t "${table}" -D "$@"
+    fi
+}
+
+fw_ip6t_add() {
+    local table="$1"; shift
+    if fw_has_ip6tables; then
+        if ! ip6tables -t "${table}" -C "$@" 2>/dev/null; then
+            ip6tables -t "${table}" -A "$@"
+        fi
+    fi
+}
+
+fw_ip6t_del() {
+    local table="$1"; shift
+    if fw_has_ip6tables; then
+        if ip6tables -t "${table}" -C "$@" 2>/dev/null; then
+            ip6tables -t "${table}" -D "$@"
+        fi
+    fi
+}
+
+fw_fwd_apply() {
+    local port="$1"
+    firewall-cmd --direct --add-rule ipv4 raw PREROUTING 0 -p tcp --dport "${port}" -j NOTRACK 2>/dev/null || true
+    firewall-cmd --direct --add-rule ipv4 raw OUTPUT 0 -p tcp --sport "${port}" -j NOTRACK 2>/dev/null || true
+    firewall-cmd --direct --add-rule ipv4 mangle OUTPUT 0 -p tcp --sport "${port}" --tcp-flags RST RST -j DROP 2>/dev/null || true
+    firewall-cmd --direct --add-rule ipv6 raw PREROUTING 0 -p tcp --dport "${port}" -j NOTRACK 2>/dev/null || true
+    firewall-cmd --direct --add-rule ipv6 raw OUTPUT 0 -p tcp --sport "${port}" -j NOTRACK 2>/dev/null || true
+    firewall-cmd --direct --add-rule ipv6 mangle OUTPUT 0 -p tcp --sport "${port}" --tcp-flags RST RST -j DROP 2>/dev/null || true
+}
+
+fw_fwd_remove() {
+    local port="$1"
+    firewall-cmd --direct --remove-rule ipv4 mangle OUTPUT 0 -p tcp --sport "${port}" --tcp-flags RST RST -j DROP 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv4 raw OUTPUT 0 -p tcp --sport "${port}" -j NOTRACK 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv4 raw PREROUTING 0 -p tcp --dport "${port}" -j NOTRACK 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv6 mangle OUTPUT 0 -p tcp --sport "${port}" --tcp-flags RST RST -j DROP 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv6 raw OUTPUT 0 -p tcp --sport "${port}" -j NOTRACK 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv6 raw PREROUTING 0 -p tcp --dport "${port}" -j NOTRACK 2>/dev/null || true
+}
+
+fw_persist_rules() {
+    if fw_is_firewalld_active; then
+        firewall-cmd --runtime-to-permanent 2>/dev/null && echo "firewalld rules persisted" && return
+    fi
+    if [[ -d /etc/iptables ]]; then
+        iptables-save > /etc/iptables/rules.v4
+        fw_has_ip6tables && ip6tables-save > /etc/iptables/rules.v6
+        echo "iptables rules saved to /etc/iptables/rules.v{4,6}"; return
+    fi
+    if command -v service &>/dev/null && [[ -f /etc/sysconfig/iptables ]]; then
+        service iptables save 2>/dev/null || iptables-save > /etc/sysconfig/iptables
+        fw_has_ip6tables && (service ip6tables save 2>/dev/null || ip6tables-save > /etc/sysconfig/ip6tables)
+        echo "iptables rules saved"; return
+    fi
+    if command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        fw_has_ip6tables && ip6tables-save > /etc/iptables/rules.v6
+        echo "iptables rules saved to /etc/iptables/rules.v{4,6}"; return
+    fi
+    echo "warning: could not persist rules, no persistence mechanism found" >&2
+}
+
+fw_show_status() {
+    local port="$1"
+    echo "=== StealthLink Firewall Rules (port ${port}) ==="
+    echo
+    if fw_is_firewalld_active; then
+        echo "Backend: firewalld"; echo
+        echo "Direct rules:"
+        firewall-cmd --direct --get-all-rules 2>/dev/null | grep -E "${port}" || echo "  (none matching)"
+    elif fw_has_iptables; then
+        echo "Backend: iptables"; echo
+        echo "IPv4 raw table:"
+        iptables -t raw -L -n 2>/dev/null | grep -E "${port}" || echo "  (none matching)"
+        echo; echo "IPv4 mangle table:"
+        iptables -t mangle -L -n 2>/dev/null | grep -E "${port}" || echo "  (none matching)"
+        if fw_has_ip6tables; then
+            echo; echo "IPv6 raw table:"
+            ip6tables -t raw -L -n 2>/dev/null | grep -E "${port}" || echo "  (none matching)"
+            echo; echo "IPv6 mangle table:"
+            ip6tables -t mangle -L -n 2>/dev/null | grep -E "${port}" || echo "  (none matching)"
+        fi
+    else
+        echo "No firewall backend found"
+    fi
+}
+
+fw_apply() {
+    local port="$1"
+    if fw_is_firewalld_active; then
+        echo "Using firewalld backend"
+        fw_fwd_apply "${port}"
+    elif fw_has_iptables; then
+        echo "Using iptables backend"
+        fw_ipt_add raw PREROUTING -p tcp --dport "${port}" -j NOTRACK
+        fw_ipt_add raw OUTPUT -p tcp --sport "${port}" -j NOTRACK
+        fw_ipt_add mangle OUTPUT -p tcp --sport "${port}" --tcp-flags RST RST -j DROP
+        fw_ip6t_add raw PREROUTING -p tcp --dport "${port}" -j NOTRACK
+        fw_ip6t_add raw OUTPUT -p tcp --sport "${port}" -j NOTRACK
+        fw_ip6t_add mangle OUTPUT -p tcp --sport "${port}" --tcp-flags RST RST -j DROP
+    else
+        echo "error: no firewall backend (iptables or firewalld) found" >&2; exit 1
+    fi
+    echo "Rules applied for port ${port}"
+}
+
+fw_remove() {
+    local port="$1"
+    if fw_is_firewalld_active; then
+        fw_fwd_remove "${port}"
+    elif fw_has_iptables; then
+        fw_ipt_del mangle OUTPUT -p tcp --sport "${port}" --tcp-flags RST RST -j DROP
+        fw_ipt_del raw OUTPUT -p tcp --sport "${port}" -j NOTRACK
+        fw_ipt_del raw PREROUTING -p tcp --dport "${port}" -j NOTRACK
+        fw_ip6t_del mangle OUTPUT -p tcp --sport "${port}" --tcp-flags RST RST -j DROP
+        fw_ip6t_del raw OUTPUT -p tcp --sport "${port}" -j NOTRACK
+        fw_ip6t_del raw PREROUTING -p tcp --dport "${port}" -j NOTRACK
+    fi
+    echo "Rules removed for port ${port}"
+}
+
+cmd_firewall() {
+    local action="${1:-}"
+    local port="${2:-}"
+
+    if [[ -z "$action" ]]; then
+        echo "Usage: stealthlink-ctl firewall <apply|remove|persist|status> [port]"; exit 1
+    fi
+
+    if [[ "$action" != "persist" && -z "$port" ]]; then
+        # Try to auto-detect port from config
+        if [[ -f "$CONFIG_FILE" ]]; then
+            port=$(grep -E '^\s*listen:' "$CONFIG_FILE" | head -1 | grep -oE '[0-9]+$' || true)
+        fi
+        if [[ -z "$port" && "$action" != "persist" ]]; then
+            log_error "Port required. Usage: stealthlink-ctl firewall $action <port>"
+            exit 1
+        fi
+    fi
+
+    if [[ -n "${port:-}" ]] && ! [[ "${port}" =~ ^[0-9]+$ ]]; then
+        log_error "Port must be a number"; exit 1
+    fi
+
+    case "$action" in
+        apply)   fw_apply "$port" ;;
+        remove)  fw_remove "$port" ;;
+        persist) fw_persist_rules ;;
+        status)  fw_show_status "$port" ;;
+        *)       log_error "Unknown firewall action: $action"; exit 1 ;;
+    esac
+}
+
+#==============================================================================
+# Firewall Systemd Helper (from stealthlink-systemd-iptables.sh)
+#==============================================================================
+
+cmd_firewall_systemd() {
+    local config_path=""
+    local action=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--config) config_path="$2"; shift 2 ;;
+            apply|remove) action="$1"; shift ;;
+            *) log_error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$config_path" && -n "${STEALTHLINK_CONFIG:-}" ]]; then
+        config_path="$STEALTHLINK_CONFIG"
+    fi
+    if [[ -z "$config_path" ]]; then config_path="$CONFIG_FILE"; fi
+    if [[ -z "$action" ]]; then log_error "Action required (apply or remove)"; exit 1; fi
+    if [[ ! -f "$config_path" ]]; then log_error "Config file not found: $config_path"; exit 1; fi
+
+    # Extract transport type and port
+    local transport_type rawtcp_port listen_addr rawtcp_addr
+    transport_type=$(grep -E '^\s*type:\s*' "$config_path" | head -1 | sed 's/.*:\s*//;s/["'"'"' ]//g')
+
+    if [[ "$transport_type" != "rawtcp" ]]; then
+        echo "Transport type is '$transport_type', not rawtcp - no iptables rules needed"
+        exit 0
+    fi
+
+    listen_addr=$(grep -E '^\s*listen:\s*' "$config_path" | head -1 | sed 's/.*:\s*//;s/["'"'"' ]//g')
+    if [[ "$listen_addr" =~ :([0-9]+)$ ]]; then
+        rawtcp_port="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "${rawtcp_port:-}" ]]; then
+        rawtcp_addr=$(grep -A5 'rawtcp:' "$config_path" | grep -E 'addr:' | head -1 | sed 's/.*:\s*//;s/["'"'"' ]//g')
+        if [[ "$rawtcp_addr" =~ :([0-9]+)$ ]]; then
+            rawtcp_port="${BASH_REMATCH[1]}"
+        fi
+    fi
+    if [[ -z "${rawtcp_port:-}" ]]; then
+        log_error "Could not determine rawtcp port from config"; exit 1
+    fi
+
+    echo "RawTCP transport detected on port $rawtcp_port"
+    case "$action" in
+        apply)  fw_apply "$rawtcp_port" ;;
+        remove) fw_remove "$rawtcp_port" ;;
+    esac
+}
+
+
+
+#==============================================================================
+# Service Control Commands
+#==============================================================================
+
+cmd_status() {
+    local manager pid cpu mem uptime state
+    manager=$(get_service_manager)
+    echo -e "${COLOR_BOLD}StealthLink Service Status${COLOR_RESET}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    case "$manager" in
+        systemd)
+            state=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "inactive")
+            echo -e "Service: ${COLOR_CYAN}$state${COLOR_RESET}" ;;
+        sysvinit)
+            if service "$SERVICE_NAME" status &>/dev/null; then
+                echo -e "Service: ${COLOR_GREEN}active${COLOR_RESET}"
+            else echo -e "Service: ${COLOR_RED}inactive${COLOR_RESET}"; fi ;;
+    esac
+    pid=$(get_service_pid)
+    if [[ -n "$pid" ]]; then
+        echo "PID: $pid"
+        if check_command ps; then
+            cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | xargs)
+            mem=$(ps -p "$pid" -o %mem= 2>/dev/null | xargs)
+            uptime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs)
+            echo "CPU: ${cpu}%"; echo "Memory: ${mem}%"; echo "Uptime: $uptime"
+        fi
+    else echo "PID: not running"; fi
+    if [[ -x "$BINARY_PATH" ]]; then
+        local version; version=$("$BINARY_PATH" version 2>/dev/null || echo "unknown")
+        echo "Version: $version"
+    fi
+    echo ""; show_connection_info
+    echo ""; echo -e "${COLOR_BOLD}Network:${COLOR_RESET}"; detect_network
+    if check_command curl; then
+        local metrics_port; metrics_port=$(grep -E '^\s*metrics_port:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' || echo "9090")
+        if curl -s --max-time 2 "http://localhost:${metrics_port}/metrics" &>/dev/null; then
+            echo ""; echo -e "${COLOR_GREEN}Metrics endpoint available at :${metrics_port}${COLOR_RESET}"
+        fi
+    fi
+}
+
+cmd_start() {
+    require_root
+    local manager; manager=$(get_service_manager)
+    log_info "Starting StealthLink service..."
+    case "$manager" in
+        systemd)  systemctl start "$SERVICE_NAME" ;;
+        sysvinit) service "$SERVICE_NAME" start ;;
+        *)        log_error "Unknown service manager"; exit 1 ;;
+    esac
+    sleep 1
+    if is_service_active; then log_success "Service started successfully"
+    else log_error "Failed to start service"; exit 1; fi
+}
+
+cmd_stop() {
+    require_root
+    local manager; manager=$(get_service_manager)
+    log_info "Stopping StealthLink service..."
+    case "$manager" in
+        systemd)  systemctl stop "$SERVICE_NAME" ;;
+        sysvinit) service "$SERVICE_NAME" stop ;;
+        *)        log_error "Unknown service manager"; exit 1 ;;
+    esac
+    sleep 1
+    if ! is_service_active; then log_success "Service stopped successfully"
+    else log_error "Failed to stop service"; exit 1; fi
+}
+
+cmd_restart() {
+    require_root
+    log_info "Restarting StealthLink service..."
+    cmd_stop; cmd_start
+}
+
+cmd_logs() {
+    local follow=false mode_filter=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow) follow=true ;;
+            --mode=*)    mode_filter="${1#*=}" ;;
+            *) ;;
+        esac; shift
+    done
+    local manager; manager=$(get_service_manager)
+    case "$manager" in
+        systemd)
+            if check_command journalctl; then
+                local args=(-u "$SERVICE_NAME")
+                if [[ "$follow" == true ]]; then args+=(-f); else args+=(-n 200); fi
+                if [[ -n "$mode_filter" ]]; then journalctl "${args[@]}" | grep -i "$mode_filter"
+                else journalctl "${args[@]}"; fi
+            else log_error "journalctl not available"; exit 1; fi ;;
+        *)
+            local log_file="${LOG_DIR}/stealthlink.log"
+            if [[ -f "$log_file" ]]; then
+                if [[ "$follow" == true ]]; then
+                    if [[ -n "$mode_filter" ]]; then tail -f "$log_file" | grep -i "$mode_filter"
+                    else tail -f "$log_file"; fi
+                else
+                    if [[ -n "$mode_filter" ]]; then tail -n 200 "$log_file" | grep -i "$mode_filter"
+                    else tail -n 200 "$log_file"; fi
+                fi
+            else log_error "Log file not found: $log_file"; exit 1; fi ;;
+    esac
+}
+
+cmd_health() {
+    local exit_code=0
+    echo -e "${COLOR_BOLD}StealthLink Health Check${COLOR_RESET}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [[ -f "$BINARY_PATH" ]]; then echo -e "${COLOR_GREEN}✓${COLOR_RESET} Binary exists: $BINARY_PATH"
+    else echo -e "${COLOR_RED}✗${COLOR_RESET} Binary not found: $BINARY_PATH"; exit_code=1; fi
+    if [[ -x "$BINARY_PATH" ]]; then echo -e "${COLOR_GREEN}✓${COLOR_RESET} Binary is executable"
+    else echo -e "${COLOR_RED}✗${COLOR_RESET} Binary is not executable"; exit_code=1; fi
+    if [[ -f "$CONFIG_FILE" ]]; then echo -e "${COLOR_GREEN}✓${COLOR_RESET} Config exists: $CONFIG_FILE"
+    else echo -e "${COLOR_RED}✗${COLOR_RESET} Config not found: $CONFIG_FILE"; exit_code=1; fi
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if grep -q 'role:' "$CONFIG_FILE" && grep -q 'listen:' "$CONFIG_FILE"; then
+            echo -e "${COLOR_GREEN}✓${COLOR_RESET} Config appears valid"
+        else echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} Config may be incomplete"; fi
+    fi
+    if is_service_active; then echo -e "${COLOR_GREEN}✓${COLOR_RESET} Service is running"
+    else echo -e "${COLOR_RED}✗${COLOR_RESET} Service is not running"; exit_code=1; fi
+    local manager; manager=$(get_service_manager)
+    if [[ "$manager" != "unknown" ]]; then echo -e "${COLOR_GREEN}✓${COLOR_RESET} Service manager: $manager"
+    else echo -e "${COLOR_RED}✗${COLOR_RESET} No service manager detected"; exit_code=1; fi
+    if check_command curl; then
+        local metrics_port; metrics_port=$(grep -E '^\s*metrics_port:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' || echo "9090")
+        if curl -s --max-time 2 "http://localhost:${metrics_port}/metrics" &>/dev/null; then
+            echo -e "${COLOR_GREEN}✓${COLOR_RESET} Metrics endpoint responding"
+        else echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} Metrics endpoint not responding"; fi
+    fi
+    if check_command iptables && [[ $EUID -eq 0 ]]; then
+        local listen_port; listen_port=$(grep -E '^\s*listen:' "$CONFIG_FILE" | awk '{print $2}' | cut -d: -f2 || echo "")
+        if [[ -n "$listen_port" ]]; then
+            if iptables -L INPUT -n | grep -q "$listen_port"; then
+                echo -e "${COLOR_GREEN}✓${COLOR_RESET} Firewall rules detected for port $listen_port"
+            else echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} No firewall rules found for port $listen_port"; fi
+        fi
+    fi
+    echo ""
+    if [[ $exit_code -eq 0 ]]; then log_success "All health checks passed"
+    else log_error "Some health checks failed"; fi
+    return $exit_code
+}
+
+cmd_benchmark() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then
+        target="$(grep -E 'gateway_addr:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '\"' || true)"
+    fi
+    if [[ -z "$target" ]]; then log_error "Usage: stealthlink-ctl benchmark <target>"; exit 1; fi
+    log_info "Running benchmark against $target"
+    if check_command python3 && [[ -f "${CONFIG_DIR}/tools/benchmark_runner.py" ]]; then
+        python3 "${CONFIG_DIR}/tools/benchmark_runner.py" "$target"
+    elif check_command iperf3; then iperf3 -c "$target" -t 10 || true
+    else log_warn "No benchmark runner available (python tool or iperf3 missing)"; fi
+}
+
+find_live_validation_runner() {
+    local candidates=(
+        "${CONFIG_DIR}/tools/live_validation_runner.py"
+        "${CONFIG_DIR}/tools/benchmark_runner.py"
+        "${BASH_SOURCE[0]%/*}/../tools/live_validation_runner.py"
+        "$(pwd)/tools/live_validation_runner.py"
+    )
+    local p
+    for p in "${candidates[@]}"; do
+        if [[ -f "$p" ]]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+cmd_validate_live() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then
+        log_error "Usage: stealthlink-ctl validate-live <target>"
+        exit 1
+    fi
+    if ! check_command python3; then
+        log_error "python3 is required"
+        exit 1
+    fi
+    local runner
+    runner="$(find_live_validation_runner || true)"
+    if [[ -z "$runner" ]]; then
+        log_error "live_validation_runner.py not found"
+        exit 1
+    fi
+    python3 "$runner" validate-live --target "$target"
+}
+
+cmd_stress() {
+    if ! check_command python3; then
+        log_error "python3 is required"
+        exit 1
+    fi
+    local runner
+    runner="$(find_live_validation_runner || true)"
+    if [[ -z "$runner" ]]; then
+        log_error "live_validation_runner.py not found"
+        exit 1
+    fi
+    python3 "$runner" stress
+}
+
+cmd_soak() {
+    local duration="${1:-86400}"
+    if ! check_command python3; then
+        log_error "python3 is required"
+        exit 1
+    fi
+    local runner
+    runner="$(find_live_validation_runner || true)"
+    if [[ -z "$runner" ]]; then
+        log_error "live_validation_runner.py not found"
+        exit 1
+    fi
+    python3 "$runner" soak --duration-seconds "$duration"
+}
+
+cmd_profile() {
+    local url="${1:-http://127.0.0.1:9090}"
+    if ! check_command python3; then
+        log_error "python3 is required"
+        exit 1
+    fi
+    local runner
+    runner="$(find_live_validation_runner || true)"
+    if [[ -z "$runner" ]]; then
+        log_error "live_validation_runner.py not found"
+        exit 1
+    fi
+    python3 "$runner" profile --pprof-url "$url"
+}
+
+#==============================================================================
+# Monitor Command - Real-time Metrics Dashboard
+#==============================================================================
+cmd_monitor() {
+    local mode="${1:-dashboard}"
+    local interval="${2:-2}"
+    
+    case "$mode" in
+        dashboard)
+            cmd_monitor_dashboard "$interval"
+            ;;
+        metrics)
+            cmd_monitor_metrics
+            ;;
+        json)
+            cmd_monitor_json
+            ;;
+        *)
+            echo "Usage: stealthlink-ctl monitor [dashboard|metrics|json] [interval]"
+            echo ""
+            echo "Modes:"
+            echo "  dashboard  - Real-time dashboard (default, refresh every ${interval}s)"
+            echo "  metrics    - Raw Prometheus metrics"
+            echo "  json       - JSON formatted metrics"
+            echo ""
+            echo "Examples:"
+            echo "  stealthlink-ctl monitor"
+            echo "  stealthlink-ctl monitor dashboard 5"
+            echo "  stealthlink-ctl monitor metrics"
+            return 1
+            ;;
+    esac
+}
+
+cmd_monitor_dashboard() {
+    local interval="${1:-2}"
+    
+    if ! check_command curl; then
+        log_error "curl is required for monitoring"
+        exit 1
+    fi
+    
+    if ! check_command jq; then
+        log_warn "jq not found, falling back to basic display"
+    fi
+    
+    # Get metrics port from config
+    local metrics_port
+    metrics_port=$(grep -E '^\s*listen:' "$CONFIG_FILE" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || echo "9090")
+    
+    # Check if metrics endpoint is available
+    if ! curl -s --max-time 2 "http://localhost:${metrics_port}/metrics" &>/dev/null; then
+        log_error "Metrics endpoint not available at localhost:${metrics_port}"
+        log_info "Ensure StealthLink is running and metrics are enabled in config"
+        exit 1
+    fi
+    
+    log_info "Starting real-time metrics dashboard (refresh: ${interval}s)"
+    log_info "Press Ctrl+C to exit"
+    echo ""
+    
+    # Clear screen and hide cursor
+    clear
+    tput civis
+    
+    # Trap to restore cursor on exit
+    trap 'tput cnorm; exit' INT TERM
+    
+    while true; do
+        # Move cursor to top
+        tput cup 0 0
+        
+        # Fetch metrics
+        local metrics
+        metrics=$(curl -s "http://localhost:${metrics_port}/metrics" 2>/dev/null || echo "")
+        
+        if [[ -z "$metrics" ]]; then
+            echo -e "${COLOR_RED}Failed to fetch metrics${COLOR_RESET}"
+            sleep "$interval"
+            continue
+        fi
+        
+        # Parse and display metrics
+        echo -e "${COLOR_BOLD}${COLOR_CYAN}╔════════════════════════════════════════════════════════════════╗${COLOR_RESET}"
+        echo -e "${COLOR_BOLD}${COLOR_CYAN}║          StealthLink Real-Time Metrics Dashboard               ║${COLOR_RESET}"
+        echo -e "${COLOR_BOLD}${COLOR_CYAN}╚════════════════════════════════════════════════════════════════╝${COLOR_RESET}"
+        echo ""
+        echo -e "${COLOR_BOLD}Timestamp:${COLOR_RESET} $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+        
+        # Service Status
+        echo -e "${COLOR_BOLD}Service Status:${COLOR_RESET}"
+        if is_service_active; then
+            echo -e "  Status: ${COLOR_GREEN}●${COLOR_RESET} Running"
+            local pid
+            pid=$(get_service_pid)
+            if [[ -n "$pid" ]]; then
+                echo "  PID: $pid"
+                if check_command ps; then
+                    local cpu mem uptime
+                    cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | xargs || echo "N/A")
+                    mem=$(ps -p "$pid" -o %mem= 2>/dev/null | xargs || echo "N/A")
+                    uptime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs || echo "N/A")
+                    echo "  CPU: ${cpu}%  Memory: ${mem}%  Uptime: $uptime"
+                fi
+            fi
+        else
+            echo -e "  Status: ${COLOR_RED}●${COLOR_RESET} Stopped"
+        fi
+        echo ""
+        
+        # Connection Metrics
+        echo -e "${COLOR_BOLD}Connections:${COLOR_RESET}"
+        local active_conns total_conns failed_conns
+        active_conns=$(echo "$metrics" | grep -oP 'stealthlink_active_connections \K[0-9.]+' | head -1 || echo "0")
+        total_conns=$(echo "$metrics" | grep -oP 'stealthlink_total_connections \K[0-9.]+' | head -1 || echo "0")
+        failed_conns=$(echo "$metrics" | grep -oP 'stealthlink_failed_connections \K[0-9.]+' | head -1 || echo "0")
+        echo "  Active: $active_conns  Total: $total_conns  Failed: $failed_conns"
+        echo ""
+        
+        # Traffic Metrics
+        echo -e "${COLOR_BOLD}Traffic:${COLOR_RESET}"
+        local bytes_sent bytes_recv packets_sent packets_recv
+        bytes_sent=$(echo "$metrics" | grep -oP 'stealthlink_bytes_sent_total \K[0-9.]+' | head -1 || echo "0")
+        bytes_recv=$(echo "$metrics" | grep -oP 'stealthlink_bytes_received_total \K[0-9.]+' | head -1 || echo "0")
+        packets_sent=$(echo "$metrics" | grep -oP 'stealthlink_packets_sent_total \K[0-9.]+' | head -1 || echo "0")
+        packets_recv=$(echo "$metrics" | grep -oP 'stealthlink_packets_received_total \K[0-9.]+' | head -1 || echo "0")
+        
+        # Convert bytes to human readable
+        local bytes_sent_hr bytes_recv_hr
+        bytes_sent_hr=$(numfmt --to=iec-i --suffix=B "$bytes_sent" 2>/dev/null || echo "${bytes_sent}B")
+        bytes_recv_hr=$(numfmt --to=iec-i --suffix=B "$bytes_recv" 2>/dev/null || echo "${bytes_recv}B")
+        
+        echo "  Sent: $bytes_sent_hr ($packets_sent packets)"
+        echo "  Recv: $bytes_recv_hr ($packets_recv packets)"
+        echo ""
+        
+        # Latency Metrics
+        echo -e "${COLOR_BOLD}Latency:${COLOR_RESET}"
+        local latency_p50 latency_p95 latency_p99
+        latency_p50=$(echo "$metrics" | grep -oP 'stealthlink_latency_seconds{quantile="0.5"} \K[0-9.]+' | head -1 || echo "0")
+        latency_p95=$(echo "$metrics" | grep -oP 'stealthlink_latency_seconds{quantile="0.95"} \K[0-9.]+' | head -1 || echo "0")
+        latency_p99=$(echo "$metrics" | grep -oP 'stealthlink_latency_seconds{quantile="0.99"} \K[0-9.]+' | head -1 || echo "0")
+        
+        # Convert to milliseconds
+        latency_p50_ms=$(echo "$latency_p50 * 1000" | bc -l 2>/dev/null | cut -d. -f1 || echo "0")
+        latency_p95_ms=$(echo "$latency_p95 * 1000" | bc -l 2>/dev/null | cut -d. -f1 || echo "0")
+        latency_p99_ms=$(echo "$latency_p99 * 1000" | bc -l 2>/dev/null | cut -d. -f1 || echo "0")
+        
+        echo "  P50: ${latency_p50_ms}ms  P95: ${latency_p95_ms}ms  P99: ${latency_p99_ms}ms"
+        echo ""
+        
+        # Error Metrics
+        echo -e "${COLOR_BOLD}Errors:${COLOR_RESET}"
+        local conn_errors timeout_errors auth_errors
+        conn_errors=$(echo "$metrics" | grep -oP 'stealthlink_connection_errors_total \K[0-9.]+' | head -1 || echo "0")
+        timeout_errors=$(echo "$metrics" | grep -oP 'stealthlink_timeout_errors_total \K[0-9.]+' | head -1 || echo "0")
+        auth_errors=$(echo "$metrics" | grep -oP 'stealthlink_auth_errors_total \K[0-9.]+' | head -1 || echo "0")
+        echo "  Connection: $conn_errors  Timeout: $timeout_errors  Auth: $auth_errors"
+        echo ""
+        
+        # Transport-specific metrics
+        echo -e "${COLOR_BOLD}Transport:${COLOR_RESET}"
+        local carrier_type
+        carrier_type=$(grep -E '^\s*type:' "$CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"' || echo "unknown")
+        echo "  Carrier: $carrier_type"
+        
+        # Mode-specific metrics
+        case "$carrier_type" in
+            quic)
+                local quic_streams quic_datagrams
+                quic_streams=$(echo "$metrics" | grep -oP 'stealthlink_quic_streams_active \K[0-9.]+' | head -1 || echo "0")
+                quic_datagrams=$(echo "$metrics" | grep -oP 'stealthlink_quic_datagrams_total \K[0-9.]+' | head -1 || echo "0")
+                echo "  Active Streams: $quic_streams  Datagrams: $quic_datagrams"
+                ;;
+            rawtcp)
+                local raw_packets_sent raw_packets_recv
+                raw_packets_sent=$(echo "$metrics" | grep -oP 'stealthlink_raw_packets_sent_total \K[0-9.]+' | head -1 || echo "0")
+                raw_packets_recv=$(echo "$metrics" | grep -oP 'stealthlink_raw_packets_received_total \K[0-9.]+' | head -1 || echo "0")
+                echo "  Raw Packets Sent: $raw_packets_sent  Recv: $raw_packets_recv"
+                ;;
+        esac
+        echo ""
+        
+        # System Resources
+        echo -e "${COLOR_BOLD}System Resources:${COLOR_RESET}"
+        if check_command free; then
+            local mem_total mem_used mem_percent
+            mem_total=$(free -m | awk '/^Mem:/{print $2}')
+            mem_used=$(free -m | awk '/^Mem:/{print $3}')
+            mem_percent=$(echo "scale=1; $mem_used * 100 / $mem_total" | bc -l 2>/dev/null || echo "0")
+            echo "  Memory: ${mem_used}MB / ${mem_total}MB (${mem_percent}%)"
+        fi
+        
+        if check_command df; then
+            local disk_usage
+            disk_usage=$(df -h / | awk 'NR==2{print $5}')
+            echo "  Disk: $disk_usage used"
+        fi
+        echo ""
+        
+        echo -e "${COLOR_DIM}Refreshing in ${interval}s... (Press Ctrl+C to exit)${COLOR_RESET}"
+        
+        # Clear rest of screen
+        tput ed
+        
+        sleep "$interval"
+    done
+}
+
+cmd_monitor_metrics() {
+    local metrics_port
+    metrics_port=$(grep -E '^\s*listen:' "$CONFIG_FILE" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || echo "9090")
+    
+    if ! curl -s --max-time 2 "http://localhost:${metrics_port}/metrics" &>/dev/null; then
+        log_error "Metrics endpoint not available at localhost:${metrics_port}"
+        exit 1
+    fi
+    
+    curl -s "http://localhost:${metrics_port}/metrics"
+}
+
+cmd_monitor_json() {
+    if ! check_command jq; then
+        log_error "jq is required for JSON output"
+        exit 1
+    fi
+    
+    local metrics_port
+    metrics_port=$(grep -E '^\s*listen:' "$CONFIG_FILE" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || echo "9090")
+    
+    if ! curl -s --max-time 2 "http://localhost:${metrics_port}/metrics" &>/dev/null; then
+        log_error "Metrics endpoint not available at localhost:${metrics_port}"
+        exit 1
+    fi
+    
+    local metrics
+    metrics=$(curl -s "http://localhost:${metrics_port}/metrics")
+    
+    # Convert Prometheus metrics to JSON
+    echo "{"
+    echo "  \"timestamp\": \"$(date -Iseconds)\","
+    echo "  \"service_status\": \"$(is_service_active && echo 'running' || echo 'stopped')\","
+    echo "  \"connections\": {"
+    echo "    \"active\": $(echo "$metrics" | grep -oP 'stealthlink_active_connections \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"total\": $(echo "$metrics" | grep -oP 'stealthlink_total_connections \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"failed\": $(echo "$metrics" | grep -oP 'stealthlink_failed_connections \K[0-9.]+' | head -1 || echo "0")"
+    echo "  },"
+    echo "  \"traffic\": {"
+    echo "    \"bytes_sent\": $(echo "$metrics" | grep -oP 'stealthlink_bytes_sent_total \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"bytes_received\": $(echo "$metrics" | grep -oP 'stealthlink_bytes_received_total \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"packets_sent\": $(echo "$metrics" | grep -oP 'stealthlink_packets_sent_total \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"packets_received\": $(echo "$metrics" | grep -oP 'stealthlink_packets_received_total \K[0-9.]+' | head -1 || echo "0")"
+    echo "  },"
+    echo "  \"latency\": {"
+    echo "    \"p50_seconds\": $(echo "$metrics" | grep -oP 'stealthlink_latency_seconds{quantile="0.5"} \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"p95_seconds\": $(echo "$metrics" | grep -oP 'stealthlink_latency_seconds{quantile="0.95"} \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"p99_seconds\": $(echo "$metrics" | grep -oP 'stealthlink_latency_seconds{quantile="0.99"} \K[0-9.]+' | head -1 || echo "0")"
+    echo "  },"
+    echo "  \"errors\": {"
+    echo "    \"connection\": $(echo "$metrics" | grep -oP 'stealthlink_connection_errors_total \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"timeout\": $(echo "$metrics" | grep -oP 'stealthlink_timeout_errors_total \K[0-9.]+' | head -1 || echo "0"),"
+    echo "    \"auth\": $(echo "$metrics" | grep -oP 'stealthlink_auth_errors_total \K[0-9.]+' | head -1 || echo "0")"
+    echo "  }"
+    echo "}"
+}
+
+
+#==============================================================================
+# Config Management Commands
+#==============================================================================
+
+cmd_config() {
+    local editor="${EDITOR:-nano}"
+    if [[ ! -f "$CONFIG_FILE" ]]; then log_error "Config file not found: $CONFIG_FILE"; exit 1; fi
+    "$editor" "$CONFIG_FILE"
+}
+
+cmd_backup() {
+    require_root
+    mkdir -p "$BACKUP_DIR"
+    local timestamp; timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/config-backup-${timestamp}.tar.gz"
+    log_info "Creating config backup..."
+    tar -czf "$backup_file" -C "$CONFIG_DIR" config.yaml 2>/dev/null || { log_error "Backup failed"; exit 1; }
+    log_success "Backup created: $backup_file"
+}
+
+cmd_restore() {
+    require_root
+    if [[ ! -d "$BACKUP_DIR" ]]; then log_error "No backup directory found: $BACKUP_DIR"; exit 1; fi
+    local backups; mapfile -t backups < <(ls -1t "$BACKUP_DIR"/config-backup-*.tar.gz 2>/dev/null || true)
+    if [[ ${#backups[@]} -eq 0 ]]; then log_error "No config backups found"; exit 1; fi
+    echo -e "${COLOR_BOLD}Available Backups:${COLOR_RESET}"
+    local i=1
+    for backup in "${backups[@]}"; do
+        local backup_name; backup_name=$(basename "$backup")
+        local backup_date; backup_date=$(stat -c %y "$backup" 2>/dev/null | cut -d. -f1 || echo "unknown")
+        echo "  $i) $backup_name ($backup_date)"; i=$((i + 1))
+    done
+    read -p "Select backup to restore [1-${#backups[@]}]: " selection
+    if [[ ! "$selection" =~ ^[0-9]+$ ]] || [[ $selection -lt 1 ]] || [[ $selection -gt ${#backups[@]} ]]; then
+        log_error "Invalid selection"; exit 1
+    fi
+    local selected_backup="${backups[$((selection - 1))]}"
+    log_info "Restoring: $(basename "$selected_backup")"
+    tar -xzf "$selected_backup" -C "$CONFIG_DIR" || { log_error "Restore failed"; exit 1; }
+    log_success "Config restored"
+    read -p "Restart service now? [Y/n] " -n 1 -r; echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then cmd_restart; fi
+}
+
+cmd_rotate_keys() {
+    require_root
+    if [[ ! -f "$CONFIG_FILE" ]]; then log_error "Config file not found: $CONFIG_FILE"; exit 1; fi
+    local new_key
+    if check_command stealthlink-tools; then new_key="$(stealthlink-tools secret)"
+    else new_key="$(openssl rand -hex 32)"; fi
+    cmd_backup >/dev/null 2>&1 || true
+    if grep -q 'shared_key:' "$CONFIG_FILE"; then
+        sed -i -E "s|(^[[:space:]]*shared_key:[[:space:]]*).*$|\\1\"${new_key}\"|g" "$CONFIG_FILE"
+    else printf "\nsecurity:\n  shared_key: \"%s\"\n" "$new_key" >> "$CONFIG_FILE"; fi
+    log_success "Shared key rotated in config"
+    log_info "Restart service to apply: stealthlink-ctl restart"
+}
+
+cmd_switch_mode() {
+    require_root
+    local mode="${1:-}"
+    if [[ -z "$mode" ]]; then
+        echo -e "${COLOR_BOLD}Usage:${COLOR_RESET} stealthlink-ctl switch-mode <4a|4b|4c|4d|4e>"
+        echo ""
+        echo -e "${COLOR_BOLD}Available Variants:${COLOR_RESET}"
+        echo "  4a  XHTTP/TLS    CDN-friendly, ECH+TLS-frag+Vision overlays, BBR congestion"
+        echo "  4b  RawTCP       obfs4+noize+AWG overlays, adaptive morphing, GFW-resistant TCP"
+        echo "  4c  TLS-Mirror   Reality/ShadowTLS/TLSMirror lookalike, optional PQ signatures"
+        echo "  4d  UDP/QUIC     Native datagrams, connect-udp/ip capsules, brutal CC"
+        echo "  4e  Trust        TrustTunnel H2/H3, CSTP keepalive, TLS-frag, reverse+WARP ready"
+        exit 1
+    fi
+    if [[ ! -f "$CONFIG_FILE" ]]; then log_error "Config file not found: $CONFIG_FILE"; exit 1; fi
+    local carrier="" variant_value="" desc=""
+    case "$mode" in
+        4a) carrier="xhttp";       variant_value="4a"; desc="XHTTP/TLS (CDN, ECH, TLS-frag)" ;;
+        4b) carrier="rawtcp";      variant_value="4b"; desc="RawTCP (obfs4, noize, AWG)" ;;
+        4c) carrier="xhttp";       variant_value="4c"; desc="TLS-Mirror (Reality, ShadowTLS)" ;;
+        4d) carrier="quic";        variant_value="4d"; desc="UDP/QUIC (datagrams, brutal CC)" ;;
+        4e) carrier="trusttunnel"; variant_value="4e"; desc="Trust (TrustTunnel, CSTP, reverse)" ;;
+        *) log_error "Invalid mode: $mode (expected 4a..4e)"; exit 1 ;;
+    esac
+    cmd_backup >/dev/null 2>&1 || true
+
+    # Update carrier type
+    if grep -q 'carrier:' "$CONFIG_FILE"; then
+        awk -v c="$carrier" '
+            BEGIN{in_carrier=0}
+            /^[[:space:]]*carrier:[[:space:]]*$/ {in_carrier=1; print; next}
+            in_carrier==1 && /^[[:space:]]*type:[[:space:]]*/ {
+                sub(/type:[[:space:]]*.*/, "type: " c); print; in_carrier=0; next
+            }
+            in_carrier==1 && /^[[:space:]]*[a-zA-Z_]+:/ {in_carrier=0}
+            {print}
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    fi
+
+    # Update variant selector (4a..4e).
+    if grep -q 'variant:' "$CONFIG_FILE"; then
+        sed -i -E "s|(^[[:space:]]*variant:[[:space:]]*).*$|\\1\"${variant_value}\"|g" "$CONFIG_FILE"
+    else
+        printf "\nvariant: \"%s\"\n" "$variant_value" >> "$CONFIG_FILE"
+    fi
+
+    log_success "Switched to mode $mode — $desc"
+    log_info "Default profile overlays will be auto-applied at startup"
+    log_info "Restart service to apply: stealthlink-ctl restart"
+}
+
+cmd_secret() {
+    if check_command stealthlink-tools; then stealthlink-tools secret
+    else log_error "stealthlink-tools not found in PATH"; exit 1; fi
+}
+
+#==============================================================================
+# Test Command - Quick Connectivity Test
+#==============================================================================
+cmd_test() {
+    local variant="${1:-}"
+    local target="${2:-}"
+    
+    if [[ -z "$variant" ]]; then
+        echo -e "${COLOR_BOLD}StealthLink Connectivity Test${COLOR_RESET}"
+        echo ""
+        echo "Usage: stealthlink-ctl test <variant> [target]"
+        echo ""
+        echo "Variants:"
+        echo "  4a    XHTTP + TLS (CDN-friendly, anti-DPI)"
+        echo "  4b    RawTCP (obfs4, noize, AWG)"
+        echo "  4c    TLS Mirror (REALITY, ShadowTLS)"
+        echo "  4d    UDP/QUIC (Hysteria2, native UDP)"
+        echo "  4e    Trust (TrustTunnel, CSTP)"
+        echo "  tun   Test TUN interface connectivity"
+        echo ""
+        echo "Examples:"
+        echo "  stealthlink-ctl test 4a gateway.example.com:443"
+        echo "  stealthlink-ctl test 4d"
+        echo "  stealthlink-ctl test tun"
+        return 0
+    fi
+    
+    # Special case: TUN interface test
+    if [[ "$variant" == "tun" ]]; then
+        cmd_test_tun
+        return $?
+    fi
+    
+    log_info "Running connectivity test for variant $variant..."
+    
+    # Basic connectivity test without stealthlink-tools
+    if [[ -n "$target" ]]; then
+        local host port
+        host=$(echo "$target" | cut -d: -f1)
+        port=$(echo "$target" | cut -d: -f2)
+        
+        echo -e "${COLOR_BOLD}Testing connectivity to $target...${COLOR_RESET}"
+        echo ""
+        
+        # DNS resolution
+        echo -n "DNS resolution: "
+        if host "$host" &>/dev/null; then
+            echo -e "${COLOR_GREEN}✓${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}✗${COLOR_RESET}"
+            log_error "DNS resolution failed for $host"
+            return 1
+        fi
+        
+        # TCP connectivity
+        echo -n "TCP connectivity: "
+        if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$host/$port" 2>/dev/null; then
+            echo -e "${COLOR_GREEN}✓${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}✗${COLOR_RESET}"
+            log_error "TCP connection failed to $host:$port"
+            return 1
+        fi
+        
+        # Ping test
+        echo -n "ICMP ping: "
+        if ping -c 3 -W 2 "$host" &>/dev/null; then
+            local avg_rtt
+            avg_rtt=$(ping -c 3 -W 2 "$host" 2>/dev/null | tail -1 | awk -F '/' '{print $5}')
+            echo -e "${COLOR_GREEN}✓${COLOR_RESET} (avg: ${avg_rtt}ms)"
+        else
+            echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} (ICMP may be blocked)"
+        fi
+        
+        echo ""
+        log_success "Basic connectivity test passed"
+    fi
+    
+    # If stealthlink-tools is available, use it for advanced tests
+    if check_command stealthlink-tools; then
+        local test_args=("test" "--variant=$variant")
+        if [[ -n "$target" ]]; then
+            test_args+=("--target=$target")
+        fi
+        
+        if [[ -f "$CONFIG_FILE" ]]; then
+            test_args+=("--config=$CONFIG_FILE")
+        fi
+        
+        stealthlink-tools "${test_args[@]}"
+    fi
+}
+
+cmd_test_tun() {
+    echo -e "${COLOR_BOLD}StealthLink TUN Interface Test${COLOR_RESET}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    # Find TUN interface
+    local tun_iface tun_ip peer_ip
+    tun_iface=$(ip link show | grep -oP 'sl\d+|tun\d+' | head -n1)
+    
+    if [[ -z "$tun_iface" ]]; then
+        log_error "No TUN interface found (sl0, tun0, etc.)"
+        echo ""
+        echo "Available interfaces:"
+        ip link show | grep -E '^[0-9]+:' | awk '{print "  " $2}' | tr -d ':'
+        return 1
+    fi
+    
+    log_info "Found TUN interface: $tun_iface"
+    
+    # Get interface details
+    tun_ip=$(ip addr show "$tun_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+    
+    if [[ -z "$tun_ip" ]]; then
+        log_error "TUN interface $tun_iface has no IP address"
+        return 1
+    fi
+    
+    echo "  Local IP: $tun_ip"
+    
+    # Try to determine peer IP from config
+    if [[ -f "$CONFIG_FILE" ]]; then
+        peer_ip=$(grep -A5 'vpn:' "$CONFIG_FILE" | grep 'peer_ip:' | awk '{print $2}' | tr -d '"')
+    fi
+    
+    if [[ -z "$peer_ip" ]]; then
+        # Try to guess peer IP (common patterns)
+        if [[ "$tun_ip" == "10.77.0.1" ]]; then
+            peer_ip="10.77.0.2"
+        elif [[ "$tun_ip" == "10.77.0.2" ]]; then
+            peer_ip="10.77.0.1"
+        else
+            log_warn "Could not determine peer IP from config"
+            read -p "Enter peer IP address to test: " peer_ip
+        fi
+    fi
+    
+    echo "  Peer IP: $peer_ip"
+    echo ""
+    
+    # Interface status
+    echo -n "Interface status: "
+    if ip link show "$tun_iface" | grep -q "state UP"; then
+        echo -e "${COLOR_GREEN}UP${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}DOWN${COLOR_RESET}"
+        log_error "TUN interface is down"
+        return 1
+    fi
+    
+    # MTU check
+    local mtu
+    mtu=$(ip link show "$tun_iface" | grep -oP 'mtu \K\d+')
+    echo "  MTU: $mtu bytes"
+    
+    # Ping test
+    echo ""
+    echo -e "${COLOR_BOLD}Connectivity Tests:${COLOR_RESET}"
+    echo ""
+    
+    echo -n "Ping peer ($peer_ip): "
+    if ping -c 3 -W 2 -I "$tun_iface" "$peer_ip" &>/dev/null; then
+        local avg_rtt
+        avg_rtt=$(ping -c 3 -W 2 -I "$tun_iface" "$peer_ip" 2>/dev/null | tail -1 | awk -F '/' '{print $5}')
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} (avg: ${avg_rtt}ms)"
+        
+        # Show detailed ping stats
+        echo ""
+        echo "Detailed ping statistics:"
+        ping -c 5 -W 2 -I "$tun_iface" "$peer_ip" 2>/dev/null | tail -2
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET}"
+        log_error "Cannot ping peer through TUN interface"
+        return 1
+    fi
+    
+    # Throughput test (if iperf3 available)
+    echo ""
+    if check_command iperf3; then
+        echo -n "Throughput test: "
+        read -p "Run iperf3 test? (requires iperf3 server on peer) [y/N]: " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Running iperf3 test to $peer_ip..."
+            iperf3 -c "$peer_ip" -t 10 -B "$tun_ip" || log_warn "iperf3 test failed"
+        fi
+    fi
+    
+    # Route check
+    echo ""
+    echo -e "${COLOR_BOLD}Routing Table:${COLOR_RESET}"
+    ip route show dev "$tun_iface"
+    
+    echo ""
+    log_success "TUN interface test complete"
+}
+
+#==============================================================================
+# Overlay Commands - Runtime Overlay Management
+#==============================================================================
+cmd_overlay() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+    
+    case "$subcmd" in
+        list)
+            echo -e "${COLOR_BOLD}Configured Behavior Overlays${COLOR_RESET}"
+            echo ""
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+                echo "No configuration file found. Run 'stealthlink-ctl wizard' first."
+                return 1
+            fi
+            echo "Overlays from: $CONFIG_FILE"
+            echo ""
+            grep -A5 "behaviors:" "$CONFIG_FILE" 2>/dev/null | grep -E "^\s+[a-z]+:" | while read -r line; do
+                local name enabled
+                name=$(echo "$line" | cut -d: -f1 | tr -d ' ')
+                enabled=$(echo "$line" | cut -d: -f2 | tr -d ' ' | head -1)
+                if [[ "$enabled" == "true" ]]; then
+                    echo "  ✓ $name (enabled)"
+                else
+                    echo "  ○ $name (disabled)"
+                fi
+            done
+            echo ""
+            echo "Use 'stealthlink-ctl overlay enable <name>' to enable an overlay."
+            echo "Use 'stealthlink-ctl overlay disable <name>' to disable an overlay."
+            ;;
+        enable)
+            local overlay_name="${1:-}"
+            if [[ -z "$overlay_name" ]]; then
+                log_error "Usage: stealthlink-ctl overlay enable <name>"
+                echo "Available overlays: ech, vision, tlsfrag, domainfront, reality, shadowtls, obfs4, awg, qpp, violated_tcp, cstp"
+                return 1
+            fi
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+                log_error "No configuration file found"
+                return 1
+            fi
+            log_info "Enabling overlay: $overlay_name"
+            if grep -q "^\s*${overlay_name}:" "$CONFIG_FILE"; then
+                sed -i "s/^\(\s*${overlay_name}:\s*\)enabled:\s*false/\1enabled: true/" "$CONFIG_FILE" 2>/dev/null || \
+                sed -i "s/^\(\s*${overlay_name}:\s*\)/\1\n    enabled: true/" "$CONFIG_FILE"
+                log_success "Overlay '$overlay_name' enabled. Restart service to apply."
+            else
+                log_error "Overlay '$overlay_name' not found in configuration"
+            fi
+            ;;
+        disable)
+            local overlay_name="${1:-}"
+            if [[ -z "$overlay_name" ]]; then
+                log_error "Usage: stealthlink-ctl overlay disable <name>"
+                return 1
+            fi
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+                log_error "No configuration file found"
+                return 1
+            fi
+            log_info "Disabling overlay: $overlay_name"
+            sed -i "s/^\(\s*${overlay_name}:\s*\)enabled:\s*true/\1enabled: false/" "$CONFIG_FILE" 2>/dev/null
+            log_success "Overlay '$overlay_name' disabled. Restart service to apply."
+            ;;
+        *)
+            echo -e "${COLOR_BOLD}Overlay Management${COLOR_RESET}"
+            echo ""
+            echo "Usage: stealthlink-ctl overlay <command>"
+            echo ""
+            echo "Commands:"
+            echo "  list              List configured overlays and their status"
+            echo "  enable <name>     Enable an overlay"
+            echo "  disable <name>    Disable an overlay"
+            ;;
+    esac
+}
+
+#==============================================================================
+# WARP Commands - Cloudflare WARP Management
+#==============================================================================
+cmd_warp() {
+    local subcmd="${1:-status}"
+    shift 2>/dev/null || true
+    
+    case "$subcmd" in
+        status)
+            echo -e "${COLOR_BOLD}Cloudflare WARP Status${COLOR_RESET}"
+            echo ""
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+                echo "No configuration file found."
+                return 1
+            fi
+            if grep -q "^\s*enabled:\s*true" "$CONFIG_FILE" 2>/dev/null | head -1; then
+                echo "WARP Status: Enabled"
+                echo ""
+                # Check if WARP interface exists
+                if ip link show CloudflareWARP &>/dev/null; then
+                    echo "Interface: CloudflareWARP (active)"
+                    local warp_ip
+                    warp_ip=$(ip addr show CloudflareWARP 2>/dev/null | grep -oP 'inet \K[\d.]+')
+                    if [[ -n "$warp_ip" ]]; then
+                        echo "WARP IP: $warp_ip"
+                    fi
+                else
+                    echo "Interface: Not connected"
+                fi
+            else
+                echo "WARP Status: Disabled"
+            fi
+            echo ""
+            echo "Configuration:"
+            grep -A10 "^\s*warp:" "$CONFIG_FILE" 2>/dev/null | head -15
+            ;;
+        register)
+            require_root
+            log_info "Registering with Cloudflare WARP..."
+            if ! check_command stealthlink-tools; then
+                log_error "stealthlink-tools not found in PATH"
+                exit 1
+            fi
+            stealthlink-tools warp register --config="$CONFIG_FILE"
+            if [[ $? -eq 0 ]]; then
+                log_success "WARP registration successful"
+            else
+                log_error "WARP registration failed"
+                exit 1
+            fi
+            ;;
+        enable)
+            require_root
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+                log_error "No configuration file found. Run 'stealthlink-ctl wizard' first."
+                exit 1
+            fi
+            log_info "Enabling WARP in configuration..."
+            if grep -q "^\s*warp:" "$CONFIG_FILE"; then
+                sed -i '/^\s*warp:/,/^[^ ]/ s/enabled:\s*false/enabled: true/' "$CONFIG_FILE"
+            else
+                echo -e "\nwarp:\n  enabled: true" >> "$CONFIG_FILE"
+            fi
+            log_success "WARP enabled. Run 'stealthlink-ctl warp register' to register device."
+            ;;
+        disable)
+            require_root
+            log_info "Disabling WARP..."
+            if [[ -f "$CONFIG_FILE" ]]; then
+                sed -i '/^\s*warp:/,/^[^ ]/ s/enabled:\s*true/enabled: false/' "$CONFIG_FILE"
+            fi
+            log_success "WARP disabled. Restart service to apply."
+            ;;
+        *)
+            echo -e "${COLOR_BOLD}Cloudflare WARP Management${COLOR_RESET}"
+            echo ""
+            echo "Usage: stealthlink-ctl warp <command>"
+            echo ""
+            echo "Commands:"
+            echo "  status      Show WARP status and configuration"
+            echo "  register    Register device with Cloudflare WARP"
+            echo "  enable      Enable WARP in configuration"
+            echo "  disable     Disable WARP in configuration"
+            ;;
+    esac
+}
+
+cmd_version() {
+    echo -e "${COLOR_BOLD}StealthLink Version Information${COLOR_RESET}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [[ -x "$BINARY_PATH" ]]; then echo -n "Gateway: "; "$BINARY_PATH" version 2>/dev/null || echo "unknown"
+    else echo "Gateway: not installed"; fi
+    if check_command stealthlink-tools; then echo -n "Tools: "; stealthlink-tools version 2>/dev/null || echo "unknown"
+    else echo "Tools: not installed"; fi
+    echo "Control Script: $SCRIPT_VERSION"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local role; role=$(grep -E '^\s*role:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' || echo "unknown")
+        echo "Config Role: $role"
+    fi
+}
+
+
+#==============================================================================
+# Update / Rollback Commands
+#==============================================================================
+
+cmd_update() {
+    require_root
+    local force=false
+    if [[ "${1:-}" == "--force" ]]; then force=true; fi
+
+    log_info "Checking for updates from GitHub..."
+    if ! check_command curl; then log_error "curl is required for updates"; exit 1; fi
+
+    local latest_release
+    latest_release=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest")
+    if [[ -z "$latest_release" ]] || echo "$latest_release" | grep -q "Not Found"; then
+        log_error "Failed to fetch release information"; exit 1
+    fi
+
+    local latest_version
+    latest_version=$(echo "$latest_release" | grep '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/' | head -n1)
+    if [[ -z "$latest_version" ]]; then log_error "Failed to parse latest version"; exit 1; fi
+
+    local current_version
+    if [[ -x "$BINARY_PATH" ]]; then
+        current_version=$("$BINARY_PATH" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
+    else current_version="0.0.0"; fi
+
+    log_info "Current version: $current_version"
+    log_info "Latest version: $latest_version"
+
+    if [[ "$current_version" == "$latest_version" ]] && [[ "$force" != true ]]; then
+        log_success "Already on latest version"; return 0
+    fi
+
+    local download_url
+    download_url=$(echo "$latest_release" | grep '"browser_download_url"' | grep 'stealthlink-gateway' | grep 'linux' | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)
+    if [[ -z "$download_url" ]]; then log_error "Failed to find download URL"; exit 1; fi
+
+    log_info "Downloading from: $download_url"
+    local temp_file="/tmp/stealthlink-gateway.new"
+    local retry_count=3 retry=0
+    while [[ $retry -lt $retry_count ]]; do
+        if curl -L -f -o "$temp_file" "$download_url"; then break; fi
+        retry=$((retry + 1))
+        log_warn "Download failed, retrying ($retry/$retry_count)..."
+        sleep 2
+    done
+    if [[ ! -f "$temp_file" ]]; then log_error "Download failed after $retry_count attempts"; exit 1; fi
+
+    chmod +x "$temp_file"
+    mkdir -p "$BACKUP_DIR"
+    local timestamp; timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/stealthlink-gateway.${timestamp}"
+    if [[ -f "$BINARY_PATH" ]]; then
+        log_info "Backing up current binary to: $backup_file"
+        cp "$BINARY_PATH" "$backup_file"
+    fi
+    log_info "Installing new binary..."
+    mv "$temp_file" "$BINARY_PATH"
+    chmod +x "$BINARY_PATH"
+    log_success "Update complete: $current_version -> $latest_version"
+    read -p "Restart service now? [Y/n] " -n 1 -r; echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then cmd_restart; fi
+}
+
+cmd_rollback() {
+    require_root
+    if [[ ! -d "$BACKUP_DIR" ]]; then log_error "No backup directory found: $BACKUP_DIR"; exit 1; fi
+    local backups; mapfile -t backups < <(ls -1t "$BACKUP_DIR"/stealthlink-gateway.* 2>/dev/null || true)
+    if [[ ${#backups[@]} -eq 0 ]]; then log_error "No backup binaries found"; exit 1; fi
+    echo -e "${COLOR_BOLD}Available Backups:${COLOR_RESET}"
+    local i=1
+    for backup in "${backups[@]}"; do
+        local backup_name; backup_name=$(basename "$backup")
+        local backup_date; backup_date=$(stat -c %y "$backup" 2>/dev/null | cut -d. -f1 || echo "unknown")
+        echo "  $i) $backup_name ($backup_date)"; i=$((i + 1))
+    done
+    read -p "Select backup to restore [1-${#backups[@]}]: " selection
+    if [[ ! "$selection" =~ ^[0-9]+$ ]] || [[ $selection -lt 1 ]] || [[ $selection -gt ${#backups[@]} ]]; then
+        log_error "Invalid selection"; exit 1
+    fi
+    local selected_backup="${backups[$((selection - 1))]}"
+    log_info "Restoring: $(basename "$selected_backup")"
+    cp "$selected_backup" "$BINARY_PATH"
+    chmod +x "$BINARY_PATH"
+    log_success "Rollback complete"
+    read -p "Restart service now? [Y/n] " -n 1 -r; echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then cmd_restart; fi
+}
+
+cmd_uninstall() {
+    require_root
+    log_warn "This will remove StealthLink from your system"
+    read -p "Are you sure? Type 'yes' to confirm: " -r; echo
+    if [[ ! "${REPLY}" =~ ^[Yy][Ee][Ss]$ ]]; then log_info "Uninstall cancelled"; exit 0; fi
+
+    if is_service_active; then log_info "Stopping service..."; cmd_stop; fi
+
+    local manager; manager=$(get_service_manager)
+    if [[ "$manager" == "systemd" ]]; then
+        systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+        rm -f "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+        rm -f "${SYSTEMD_DIR}/stealthlink-telegram.service"
+        systemctl daemon-reload 2>/dev/null || true
+    elif [[ -f "/etc/init.d/${SERVICE_NAME}" ]]; then
+        service "${SERVICE_NAME}" stop 2>/dev/null || true
+        if command -v update-rc.d &>/dev/null; then update-rc.d -f "${SERVICE_NAME}" remove 2>/dev/null || true
+        elif command -v chkconfig &>/dev/null; then chkconfig --del "${SERVICE_NAME}" 2>/dev/null || true; fi
+        rm -f "/etc/init.d/${SERVICE_NAME}"
+    fi
+
+    log_info "Removing binaries..."
+    rm -rf "${CONFIG_DIR}"
+    log_info "Removing symlinks..."
+    rm -f "${BIN_DIR}/stealthlink-gateway"
+    rm -f "${BIN_DIR}/stealthlink-agent"
+    rm -f "${BIN_DIR}/stealthlink-tools"
+    rm -f "${BIN_DIR}/stealthlink-ctl"
+    log_info "Removing logs..."
+    rm -rf "${LOG_DIR}"
+    log_info "Removing logrotate config..."
+    rm -f "${LOGROTATE_DIR}/stealthlink"
+    log_success "StealthLink uninstalled successfully"
+}
+
+
+#==============================================================================
+# Install Command (from stealthlink-install.sh)
+#==============================================================================
+
+install_package() {
+    local package="$1"
+    local package_alt="${2:-}"
+    log_info "Installing ${package}..."
+    case "${PKG_MANAGER}" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq 2>/dev/null || log_warn "apt-get update failed, continuing..."
+            if apt-get install -y -qq "${package}" 2>/dev/null; then log_success "${package} installed"; return 0
+            elif [ -n "${package_alt}" ] && apt-get install -y -qq "${package_alt}" 2>/dev/null; then
+                log_success "${package_alt} installed (alternative)"; return 0
+            else return 1; fi ;;
+        dnf)
+            if dnf install -y -q "${package}" 2>/dev/null; then log_success "${package} installed"; return 0
+            elif [ -n "${package_alt}" ] && dnf install -y -q "${package_alt}" 2>/dev/null; then
+                log_success "${package_alt} installed (alternative)"; return 0
+            else return 1; fi ;;
+        yum)
+            if yum install -y -q "${package}" 2>/dev/null; then log_success "${package} installed"; return 0
+            elif [ -n "${package_alt}" ] && yum install -y -q "${package_alt}" 2>/dev/null; then
+                log_success "${package_alt} installed (alternative)"; return 0
+            else return 1; fi ;;
+        pacman)
+            if pacman -Sy --noconfirm --needed "${package}" 2>/dev/null; then log_success "${package} installed"; return 0
+            elif [ -n "${package_alt}" ] && pacman -Sy --noconfirm --needed "${package_alt}" 2>/dev/null; then
+                log_success "${package_alt} installed (alternative)"; return 0
+            else return 1; fi ;;
+        zypper)
+            if zypper install -y -n "${package}" 2>/dev/null; then log_success "${package} installed"; return 0
+            elif [ -n "${package_alt}" ] && zypper install -y -n "${package_alt}" 2>/dev/null; then
+                log_success "${package_alt} installed (alternative)"; return 0
+            else return 1; fi ;;
+        apk)
+            if apk add --no-cache "${package}" 2>/dev/null; then log_success "${package} installed"; return 0
+            elif [ -n "${package_alt}" ] && apk add --no-cache "${package_alt}" 2>/dev/null; then
+                log_success "${package_alt} installed (alternative)"; return 0
+            else return 1; fi ;;
+        *) log_error "Unknown package manager: ${PKG_MANAGER}"; return 1 ;;
+    esac
+}
+
+install_deps() {
+    log_step "Installing dependencies"
+    local base_packages=() libpcap_package=""
+    case "${OS_FAMILY}" in
+        debian) base_packages=(bash curl tar ca-certificates iproute2 iptables); libpcap_package="libpcap-dev" ;;
+        rhel)   base_packages=(bash curl tar ca-certificates iproute iptables); libpcap_package="libpcap-devel" ;;
+        arch)   base_packages=(bash curl tar ca-certificates iproute2 iptables); libpcap_package="libpcap" ;;
+        suse)   base_packages=(bash curl tar ca-certificates iproute2 iptables); libpcap_package="libpcap-devel" ;;
+        alpine) base_packages=(bash curl tar ca-certificates iproute2 iptables); libpcap_package="libpcap" ;;
+    esac
+    for pkg in "${base_packages[@]}"; do
+        if ! command -v "${pkg}" &>/dev/null; then
+            install_package "${pkg}" || log_warn "Failed to install ${pkg}, continuing..."
+        else log_info "${pkg} already installed"; fi
+    done
+    if ! install_package "${libpcap_package}"; then
+        log_warn "Failed to install ${libpcap_package} - raw socket carriers may not work"
+    fi
+    install_package python3 || true
+    install_package python3-pip pip || true
+    install_package cargo rust || true
+    install_package npm nodejs || true
+    log_success "Dependencies installed"
+}
+
+install_phase5_tooling() {
+    log_step "Installing Phase 5 tooling dependencies"
+    if command -v python3 >/dev/null 2>&1 && [ -f "${CONFIG_DIR}/tools/requirements.txt" ]; then
+        if command -v pip3 >/dev/null 2>&1; then
+            pip3 install -r "${CONFIG_DIR}/tools/requirements.txt" >/dev/null 2>&1 || log_warn "Python dependencies install failed"
+        fi
+    fi
+    if command -v cargo >/dev/null 2>&1 && [ -d "${CONFIG_DIR}/rust/stealthlink-crypto" ]; then
+        (cd "${CONFIG_DIR}/rust/stealthlink-crypto" && cargo build --release) || log_warn "Rust crypto build failed"
+    else log_warn "cargo not found; skipping Rust crypto build"; fi
+    if command -v npm >/dev/null 2>&1 && [ -f "${CONFIG_DIR}/dashboard/package.json" ]; then
+        (cd "${CONFIG_DIR}/dashboard" && npm install && npm run build) || log_warn "Dashboard build failed"
+    else log_warn "npm not found; skipping dashboard build"; fi
+}
+
+install_detect_network() {
+    log_step "Detecting network configuration"
+    DEFAULT_INTERFACE="" DEFAULT_IP="" DEFAULT_GATEWAY="" DEFAULT_ROUTER_MAC=""
+    if command -v ip &>/dev/null; then
+        DEFAULT_INTERFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+        if [ -n "${DEFAULT_INTERFACE}" ]; then
+            DEFAULT_IP=$(ip -4 addr show "${DEFAULT_INTERFACE}" | awk '/inet / {print $2; exit}' | cut -d/ -f1)
+            DEFAULT_GATEWAY=$(ip route show default | awk '/default/ {print $3; exit}')
+            if [ -n "${DEFAULT_GATEWAY}" ]; then
+                DEFAULT_ROUTER_MAC=$(ip neigh show "${DEFAULT_GATEWAY}" | awk '{print $5; exit}')
+                if [ -z "${DEFAULT_ROUTER_MAC}" ] || [ "${DEFAULT_ROUTER_MAC}" == "FAILED" ]; then
+                    ping -c 1 -W 1 "${DEFAULT_GATEWAY}" &>/dev/null || true; sleep 1
+                    DEFAULT_ROUTER_MAC=$(ip neigh show "${DEFAULT_GATEWAY}" | awk '{print $5; exit}')
+                fi
+            fi
+        fi
+    fi
+    log_info "Default interface: ${DEFAULT_INTERFACE:-not detected}"
+    log_info "Local IP: ${DEFAULT_IP:-not detected}"
+    log_info "Gateway: ${DEFAULT_GATEWAY:-not detected}"
+    log_info "Router MAC: ${DEFAULT_ROUTER_MAC:-not detected}"
+}
+
+install_download_binary() {
+    local bundle_root=""
+    bundle_root="$(resolve_install_asset_root)"
+    if [[ -n "${bundle_root}" ]]; then
+        INSTALL_ASSET_ROOT="${bundle_root}"
+        install_binaries_from_root "${bundle_root}"
+        return 0
+    fi
+
+    local install_version="${STEALTHLINK_VERSION:-1.0.0}"
+    log_step "Downloading StealthLink v${install_version}"
+    local download_url="https://github.com/${GITHUB_REPO}/releases/download/v${install_version}/stealthlink-linux-${ARCH}-v${install_version}.tar.gz"
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    INSTALL_TMP_DIR="${tmp_dir}"
+    log_info "Download URL: ${download_url}"
+    local attempt=1 download_retries=3 download_timeout=300
+    while [ ${attempt} -le ${download_retries} ]; do
+        log_info "Download attempt ${attempt}/${download_retries}..."
+        if curl -fsSL --max-time "${download_timeout}" --retry 2 --retry-delay 5 \
+            -o "${tmp_dir}/stealthlink.tar.gz" "${download_url}"; then
+            log_success "Download completed"; break
+        else
+            if [ ${attempt} -eq ${download_retries} ]; then
+                log_error "Failed to download after ${download_retries} attempts"; exit 1
+            fi
+            log_warn "Download failed, retrying..."; attempt=$((attempt + 1)); sleep 3
+        fi
+    done
+    log_info "Extracting archive..."
+    tar -xzf "${tmp_dir}/stealthlink.tar.gz" -C "${tmp_dir}" || { log_error "Failed to extract archive"; exit 1; }
+    INSTALL_ASSET_ROOT="${tmp_dir}"
+    install_binaries_from_root "${tmp_dir}"
+}
+
+install_sync_local_assets() {
+    log_step "Syncing local Phase 5 assets"
+    local script_root asset_root
+    script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    asset_root="${INSTALL_ASSET_ROOT:-${script_root}}"
+
+    if [ -d "${asset_root}/dashboard" ]; then
+        rm -rf "${CONFIG_DIR}/dashboard"; cp -r "${asset_root}/dashboard" "${CONFIG_DIR}/dashboard"
+        log_success "Copied dashboard sources"
+    elif [ -d "${script_root}/dashboard" ]; then
+        rm -rf "${CONFIG_DIR}/dashboard"; cp -r "${script_root}/dashboard" "${CONFIG_DIR}/dashboard"
+        log_success "Copied dashboard sources"
+    fi
+
+    if [ -d "${asset_root}/rust/stealthlink-crypto" ]; then
+        mkdir -p "${CONFIG_DIR}/rust"; rm -rf "${CONFIG_DIR}/rust/stealthlink-crypto"
+        cp -r "${asset_root}/rust/stealthlink-crypto" "${CONFIG_DIR}/rust/stealthlink-crypto"
+        log_success "Copied Rust crypto sources"
+    elif [ -d "${script_root}/rust/stealthlink-crypto" ]; then
+        mkdir -p "${CONFIG_DIR}/rust"; rm -rf "${CONFIG_DIR}/rust/stealthlink-crypto"
+        cp -r "${script_root}/rust/stealthlink-crypto" "${CONFIG_DIR}/rust/stealthlink-crypto"
+        log_success "Copied Rust crypto sources"
+    fi
+
+    if [ -d "${asset_root}/tools" ]; then
+        rm -rf "${CONFIG_DIR}/tools"; cp -r "${asset_root}/tools" "${CONFIG_DIR}/tools"
+        log_success "Copied Python tools"
+    elif [ -d "${script_root}/tools" ]; then
+        rm -rf "${CONFIG_DIR}/tools"; cp -r "${script_root}/tools" "${CONFIG_DIR}/tools"
+        log_success "Copied Python tools"
+    fi
+}
+
+install_setup_config() {
+    log_step "Setting up configuration"
+    mkdir -p "${CONFIG_DIR}" "${LOG_DIR}"
+    local config_file="${CONFIG_DIR}/config.yaml"
+    if [ -f "${config_file}" ]; then
+        log_warn "Configuration already exists at ${config_file}"
+        log_info "Backing up to ${config_file}.bak"
+        cp "${config_file}" "${config_file}.bak"
+    fi
+    local install_role="${INSTALL_ROLE:-gateway}"
+    if [ "${install_role}" == "gateway" ]; then
+        cat > "${config_file}" <<GWEOF
+# StealthLink Gateway – UQSP Configuration
+# Generated by stealthlink-ctl install
+# Docs: stealthlink-ctl help | stealthlink-ctl wizard
+role: gateway
+variant: "4d"
+
+gateway:
+  listen: "0.0.0.0:8443"
+
+transport:
+  type: uqsp
+  uqsp:
+    carrier:
+      type: quic
+    congestion:
+      algorithm: brutal
+      bandwidth_mbps: 200
+    obfuscation:
+      profile: adaptive
+      morphing_enabled: true
+    capsules:
+      connect_ip: true
+
+security:
+  shared_key: "CHANGE_ME_$(openssl rand -hex 32 2>/dev/null || echo 'generate-with-stealthlink-ctl-secret')"
+
+auth:
+  strict: true
+  providers:
+    - name: "static-main"
+      type: "static"
+      enabled: true
+      static:
+        agent_tokens:
+          agent-1: "CHANGE_ME_$(openssl rand -hex 16 2>/dev/null || echo 'generate-agent-token')"
+
+services:
+  - name: "vpnlink"
+    protocol: "tun"
+    tun:
+      name: "sl0"
+      mode: "tun"
+      mtu: 1400
+  - name: "ssh"
+    protocol: "tcp"
+    listen: ":2222"
+    max_streams: 256
+    allow_cidrs:
+      - "0.0.0.0/0"
+
+vpn:
+  enabled: true
+  mode: "tun"
+  name: "sl0"
+  interface_ip: "10.77.0.1/30"
+  peer_ip: "10.77.0.2"
+  mtu: 1400
+  routes:
+    - destination: "10.88.0.0/16"
+      gateway: "10.77.0.2"
+
+metrics:
+  listen: "127.0.0.1:9091"
+
+logging:
+  level: info
+  format: json
+GWEOF
+    else
+        cat > "${config_file}" <<AGEOF
+# StealthLink Agent – UQSP Configuration
+# Generated by stealthlink-ctl install
+# Docs: stealthlink-ctl help | stealthlink-ctl wizard
+role: agent
+variant: "4d"
+
+agent:
+  id: "agent-1"
+  gateway_addr: "CHANGE_ME_GATEWAY_IP:8443"
+  reconnect_backoff: "3s"
+
+transport:
+  type: uqsp
+  uqsp:
+    carrier:
+      type: quic
+    congestion:
+      algorithm: brutal
+      bandwidth_mbps: 200
+    obfuscation:
+      profile: adaptive
+      morphing_enabled: true
+    capsules:
+      connect_ip: true
+
+security:
+  shared_key: "CHANGE_ME_SAME_AS_GATEWAY"
+
+auth:
+  strict: true
+  providers:
+    - name: "static-main"
+      type: "static"
+      enabled: true
+      static:
+        agent_tokens:
+          agent-1: "CHANGE_ME_SAME_AS_GATEWAY"
+
+services:
+  - name: "vpnlink"
+    protocol: "tun"
+    tun:
+      name: "sl0"
+      mode: "tun"
+      mtu: 1400
+  - name: "ssh"
+    protocol: "tcp"
+    target: "127.0.0.1:22"
+
+vpn:
+  enabled: true
+  mode: "tun"
+  name: "sl0"
+  interface_ip: "10.77.0.2/30"
+  peer_ip: "10.77.0.1"
+  mtu: 1400
+  routes:
+    - destination: "0.0.0.0/0"
+      gateway: "10.77.0.1"
+      metric: 100
+  dns:
+    - "1.1.1.1"
+    - "8.8.8.8"
+
+metrics:
+  listen: "127.0.0.1:9092"
+
+logging:
+  level: info
+  format: json
+AGEOF
+    fi
+    log_success "Configuration created at ${config_file}"
+    log_warn "IMPORTANT: Edit ${config_file} and replace CHANGE_ME placeholders!"
+}
+
+install_setup_service() {
+    log_step "Setting up service"
+    local binary_name="stealthlink-${INSTALL_ROLE:-gateway}"
+    local service_file="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+    if [ "${HAS_SYSTEMD}" = true ]; then
+        log_info "Creating systemd service..."
+        cat > "${service_file}" <<SVCEOF
+[Unit]
+Description=StealthLink ${INSTALL_ROLE:-gateway}
+Documentation=https://github.com/${GITHUB_REPO}
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${CONFIG_DIR}/config.yaml
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=-${BIN_DIR}/stealthlink-ctl firewall-systemd -c ${CONFIG_DIR}/config.yaml apply
+ExecStart=${CONFIG_DIR}/${binary_name} --config ${CONFIG_DIR}/config.yaml
+ExecStopPost=-${BIN_DIR}/stealthlink-ctl firewall-systemd -c ${CONFIG_DIR}/config.yaml remove
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${LOG_DIR}
+ReadOnlyPaths=${CONFIG_DIR}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stealthlink
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+        systemctl daemon-reload
+        log_success "Systemd service created at ${service_file}"
+        log_info "Enable with: systemctl enable ${SERVICE_NAME}"
+        log_info "Start with: systemctl start ${SERVICE_NAME}"
+    elif [ -d /etc/init.d ]; then
+        log_info "Creating OpenRC/SysVinit service..."
+        cat > "/etc/init.d/${SERVICE_NAME}" <<'INITEOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          stealthlink
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: StealthLink proxy
+### END INIT INFO
+INITEOF
+        cat >> "/etc/init.d/${SERVICE_NAME}" <<INITEOF2
+NAME="${SERVICE_NAME}"
+DAEMON="${CONFIG_DIR}/${binary_name}"
+DAEMON_ARGS="--config ${CONFIG_DIR}/config.yaml"
+PIDFILE="/var/run/\${NAME}.pid"
+case "\$1" in
+    start) echo "Starting \${NAME}..."; start-stop-daemon --start --quiet --pidfile "\${PIDFILE}" --exec "\${DAEMON}" -- \${DAEMON_ARGS} &; echo \$! > "\${PIDFILE}" ;;
+    stop) echo "Stopping \${NAME}..."; start-stop-daemon --stop --quiet --pidfile "\${PIDFILE}"; rm -f "\${PIDFILE}" ;;
+    restart) \$0 stop; sleep 2; \$0 start ;;
+    *) echo "Usage: \$0 {start|stop|restart}"; exit 1 ;;
+esac
+exit 0
+INITEOF2
+        chmod +x "/etc/init.d/${SERVICE_NAME}"
+        if command -v update-rc.d &>/dev/null; then update-rc.d "${SERVICE_NAME}" defaults 2>/dev/null || true
+        elif command -v chkconfig &>/dev/null; then chkconfig --add "${SERVICE_NAME}" 2>/dev/null || true; fi
+        log_success "Init script created at /etc/init.d/${SERVICE_NAME}"
+    else log_warn "No supported init system found"; fi
+}
+
+install_setup_capabilities() {
+    log_step "Applying binary capabilities"
+    if command -v setcap >/dev/null 2>&1; then
+        for bin in "${CONFIG_DIR}/stealthlink-gateway" "${CONFIG_DIR}/stealthlink-agent"; do
+            if [ -x "$bin" ]; then
+                setcap cap_net_raw,cap_net_admin+ep "$bin" || log_warn "Failed setcap on $bin"
+            fi
+        done
+    else log_warn "setcap not found; CAP_NET_RAW/CAP_NET_ADMIN not applied"; fi
+}
+
+install_deploy_dashboard() {
+    log_step "Deploying dashboard assets"
+    local dist_dir="${CONFIG_DIR}/dashboard/dist"
+    if [ ! -d "$dist_dir" ]; then
+        log_warn "Dashboard dist not found; run npm build in ${CONFIG_DIR}/dashboard"; return
+    fi
+    mkdir -p /var/www/stealthlink-dashboard
+    cp -r "${dist_dir}/." /var/www/stealthlink-dashboard/
+    if command -v caddy >/dev/null 2>&1; then
+        cat > /etc/caddy/Caddyfile-stealthlink-dashboard <<CADDYEOF
+:8088 {
+    root * /var/www/stealthlink-dashboard
+    file_server
+}
+CADDYEOF
+        log_success "Dashboard prepared for Caddy on :8088"
+    elif command -v nginx >/dev/null 2>&1; then
+        cat > /etc/nginx/conf.d/stealthlink-dashboard.conf <<NGXEOF
+server {
+    listen 8088;
+    server_name _;
+    root /var/www/stealthlink-dashboard;
+    index index.html;
+    location / {
+        try_files \$uri /index.html;
+    }
+}
+NGXEOF
+        log_success "Dashboard prepared for nginx on :8088"
+    else log_warn "Neither caddy nor nginx found; dashboard files copied only"; fi
+}
+
+install_setup_logrotate() {
+    log_step "Setting up log rotation"
+    if [ ! -d "${LOGROTATE_DIR}" ]; then log_warn "logrotate not available, skipping"; return; fi
+    cat > "${LOGROTATE_DIR}/stealthlink" <<LREOF
+${LOG_DIR}/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    missingok
+    copytruncate
+    maxsize 50M
+    create 0640 root root
+}
+LREOF
+    log_success "Logrotate configured at ${LOGROTATE_DIR}/stealthlink"
+}
+
+install_print_success() {
+    echo ""
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}╔════════════════════════════════════════════════════════════════╗${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}║          StealthLink Installation Complete!                   ║${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}╚════════════════════════════════════════════════════════════════╝${COLOR_RESET}"
+    echo ""
+    echo -e "${COLOR_CYAN}Installed Version:${COLOR_RESET} ${STEALTHLINK_VERSION:-1.0.0}"
+    echo -e "${COLOR_CYAN}Role:${COLOR_RESET} ${INSTALL_ROLE:-gateway}"
+    echo -e "${COLOR_CYAN}Install Directory:${COLOR_RESET} ${CONFIG_DIR}"
+    echo -e "${COLOR_CYAN}Config File:${COLOR_RESET} ${CONFIG_DIR}/config.yaml"
+    echo -e "${COLOR_CYAN}Log Directory:${COLOR_RESET} ${LOG_DIR}"
+    echo ""
+    echo -e "${COLOR_YELLOW}${COLOR_BOLD}Next Steps:${COLOR_RESET}"
+    echo -e "  ${COLOR_BOLD}1.${COLOR_RESET} Edit configuration: ${COLOR_CYAN}nano ${CONFIG_DIR}/config.yaml${COLOR_RESET}"
+    echo -e "     ${COLOR_DIM}Replace all CHANGE_ME placeholders with actual values${COLOR_RESET}"
+    echo ""
+    if [ "${HAS_SYSTEMD}" = true ]; then
+        echo -e "  ${COLOR_BOLD}2.${COLOR_RESET} Enable service: ${COLOR_CYAN}systemctl enable ${SERVICE_NAME}${COLOR_RESET}"
+        echo -e "  ${COLOR_BOLD}3.${COLOR_RESET} Start service: ${COLOR_CYAN}systemctl start ${SERVICE_NAME}${COLOR_RESET}"
+        echo -e "  ${COLOR_BOLD}4.${COLOR_RESET} Check status: ${COLOR_CYAN}systemctl status ${SERVICE_NAME}${COLOR_RESET}"
+        echo -e "  ${COLOR_BOLD}5.${COLOR_RESET} View logs: ${COLOR_CYAN}journalctl -u ${SERVICE_NAME} -f${COLOR_RESET}"
+    else
+        echo -e "  ${COLOR_BOLD}2.${COLOR_RESET} Start service: ${COLOR_CYAN}service ${SERVICE_NAME} start${COLOR_RESET}"
+        echo -e "  ${COLOR_BOLD}3.${COLOR_RESET} Check logs: ${COLOR_CYAN}tail -f ${LOG_DIR}/stealthlink.log${COLOR_RESET}"
+    fi
+    echo ""
+}
+
+cmd_install() {
+    require_root
+    INSTALL_ROLE="gateway"
+    STEALTHLINK_VERSION="${STEALTHLINK_VERSION:-1.0.0}"
+    INSTALL_BUNDLE_PATH="${INSTALL_BUNDLE_PATH:-}"
+    INSTALL_LOCAL_MODE="auto"
+    INSTALL_OFFLINE_MODE="auto"
+
+    for arg in "$@"; do
+        case "${arg}" in
+            --version=*) STEALTHLINK_VERSION="${arg#*=}" ;;
+            --bundle=*) INSTALL_BUNDLE_PATH="${arg#*=}" ;;
+            --local) INSTALL_LOCAL_MODE="true" ;;
+            --no-local) INSTALL_LOCAL_MODE="false" ;;
+            --offline) INSTALL_OFFLINE_MODE="true" ;;
+            --online) INSTALL_OFFLINE_MODE="false" ;;
+            --role=*)
+                INSTALL_ROLE="${arg#*=}"
+                if [[ ! "${INSTALL_ROLE}" =~ ^(gateway|agent)$ ]]; then
+                    log_error "Invalid role: ${INSTALL_ROLE}. Must be 'gateway' or 'agent'"; exit 1
+                fi ;;
+            *)
+                log_error "Unknown install option: ${arg}"
+                log_error "Supported options: --role=, --version=, --bundle=, --local, --no-local, --offline, --online"
+                exit 1 ;;
+        esac
+    done
+
+    # ZIP/bundle installs default to offline-safe behavior unless overridden.
+    if [[ -n "${INSTALL_BUNDLE_PATH}" && "${INSTALL_OFFLINE_MODE}" == "auto" ]]; then
+        INSTALL_OFFLINE_MODE="true"
+    fi
+    if [[ "${INSTALL_OFFLINE_MODE}" == "auto" ]]; then
+        INSTALL_OFFLINE_MODE="false"
+    fi
+
+    trap cleanup_install_tmp EXIT
+
+    echo -e "${COLOR_CYAN}"
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║           StealthLink Installer v${STEALTHLINK_VERSION}                     ║"
+    echo "║    Unified QUIC Superset Protocol - Bypass Everything         ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo -e "${COLOR_RESET}"
+
+    detect_os
+    detect_arch
+    install_detect_network
+    if [[ "${INSTALL_OFFLINE_MODE}" == "true" ]]; then
+        log_step "Offline install mode enabled (skipping package manager/toolchain bootstrap)"
+    else
+        install_deps
+    fi
+    install_download_binary
+    install_sync_local_assets
+    install_setup_config
+    if [[ "${INSTALL_OFFLINE_MODE}" == "true" ]]; then
+        log_info "Skipping Phase 5 toolchain build steps in offline mode"
+    else
+        install_phase5_tooling
+    fi
+    install_setup_service
+    install_setup_capabilities
+    install_deploy_dashboard
+    install_setup_logrotate
+    install_print_success
+
+    cleanup_install_tmp
+    trap - EXIT
+}
+
+
+#==============================================================================
+# Wizard Command (from stealthlink-wizard)
+#==============================================================================
+
+# TUI backend detection
+WIZARD_TUI_BACKEND=""
+
+wizard_detect_tui() {
+    if command -v whiptail &> /dev/null; then WIZARD_TUI_BACKEND="whiptail"
+    elif command -v dialog &> /dev/null; then WIZARD_TUI_BACKEND="dialog"
+    else WIZARD_TUI_BACKEND="plain"; fi
+}
+
+wizard_ask_yesno() {
+    local title="$1" message="$2" default="${3:-yes}"
+    case "$WIZARD_TUI_BACKEND" in
+        whiptail)
+            if [ "$default" = "yes" ]; then whiptail --title "$title" --yesno "$message" 10 60 --defaultno
+            else whiptail --title "$title" --yesno "$message" 10 60; fi ;;
+        dialog)
+            if [ "$default" = "yes" ]; then dialog --title "$title" --defaultno --yesno "$message" 10 60
+            else dialog --title "$title" --yesno "$message" 10 60; fi ;;
+        plain)
+            local prompt; [ "$default" = "yes" ] && prompt="[Y/n]" || prompt="[y/N]"
+            read -p "$message $prompt: " answer; answer="${answer:-$default}"
+            [[ "$answer" =~ ^[Yy] ]] ;;
+    esac
+}
+
+wizard_ask_input() {
+    local title="$1" message="$2" default="$3" result
+    case "$WIZARD_TUI_BACKEND" in
+        whiptail) result=$(whiptail --title "$title" --inputbox "$message" 10 60 "$default" 3>&1 1>&2 2>&3) ;;
+        dialog)   result=$(dialog --title "$title" --inputbox "$message" 10 60 "$default" 3>&1 1>&2 2>&3) ;;
+        plain)    read -p "$message [$default]: " result; result="${result:-$default}" ;;
+    esac
+    echo "$result"
+}
+
+wizard_ask_menu() {
+    local title="$1" message="$2"; shift 2
+    local options=("$@") result
+    case "$WIZARD_TUI_BACKEND" in
+        whiptail) result=$(whiptail --title "$title" --menu "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) ;;
+        dialog)   result=$(dialog --title "$title" --menu "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) ;;
+        plain)
+            echo "$message"
+            local i=1
+            while [ $i -le ${#options[@]} ]; do
+                echo "  $i) ${options[$i]}"; i=$((i + 2))
+            done
+            read -p "Select option: " selection
+            result="${options[$((selection * 2 - 1))]}" ;;
+    esac
+    echo "$result"
+}
+
+wizard_ask_checklist() {
+    local title="$1" message="$2"; shift 2
+    local options=("$@") result
+    case "$WIZARD_TUI_BACKEND" in
+        whiptail) result=$(whiptail --title "$title" --checklist "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) ;;
+        dialog)   result=$(dialog --title "$title" --checklist "$message" 20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) ;;
+        plain)
+            echo "$message"; echo "Enter space-separated numbers for your selections:"
+            local i=1
+            while [ $i -le ${#options[@]} ]; do
+                echo "  $((i/3 + 1))) ${options[$i]}"; i=$((i + 3))
+            done
+            read -p "Selections: " selections; result=""
+            for sel in $selections; do
+                idx=$(((sel - 1) * 3)); result="$result \"${options[$idx]}\""
+            done ;;
+    esac
+    echo "$result"
+}
+
+wizard_msgbox() {
+    local title="$1" message="$2"
+    case "$WIZARD_TUI_BACKEND" in
+        whiptail) whiptail --title "$title" --msgbox "$message" 15 70 ;;
+        dialog)   dialog --title "$title" --msgbox "$message" 15 70 ;;
+        plain)    echo -e "${COLOR_BLUE}=== $title ===${COLOR_RESET}"; echo "$message"; read -p "Press Enter to continue..." ;;
+    esac
+}
+
+wizard_detect_interfaces() {
+    ip -o link show | grep -v "lo:" | awk -F': ' '{print $2}' | sort
+}
+
+wizard_detect_interface() {
+    local interfaces; mapfile -t interfaces < <(wizard_detect_interfaces)
+    if [ ${#interfaces[@]} -eq 0 ]; then echo "eth0"; return; fi
+    if [ ${#interfaces[@]} -eq 1 ]; then echo "${interfaces[0]}"; return; fi
+    local menu_items=()
+    for iface in "${interfaces[@]}"; do menu_items+=("$iface" "Network interface"); done
+    wizard_ask_menu "Network Interface" "Select network interface for RawTCP:" "${menu_items[@]}"
+}
+
+wizard_detect_ip() {
+    local iface="$1"
+    ip -4 addr show "$iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1
+}
+
+wizard_detect_gateway_mac() {
+    local iface="$1" gateway_ip
+    gateway_ip=$(ip route | grep "default.*$iface" | awk '{print $3}' | head -n1)
+    if [ -z "$gateway_ip" ]; then echo "00:00:00:00:00:00"; return; fi
+    ping -c 1 -W 1 "$gateway_ip" &>/dev/null || true
+    local mac; mac=$(ip neigh show "$gateway_ip" dev "$iface" | awk '{print $5}' | head -n1)
+    echo "${mac:-00:00:00:00:00:00}"
+}
+
+wizard_generate_secret() {
+    if check_command stealthlink-tools; then stealthlink-tools secret
+    elif command -v openssl &> /dev/null; then openssl rand -hex 32
+    else head -c 32 /dev/urandom | xxd -p -c 32; fi
+}
+
+wizard_obfs4_seed_from_secret() {
+    local secret="$1"
+    if [ -z "$secret" ]; then
+        echo ""
+        return
+    fi
+    if command -v openssl &> /dev/null; then
+        printf "%s" "$secret" | openssl dgst -sha256 -binary | base64 | tr -d '\n'
+    else
+        printf "%s" "$secret" | base64 | tr -d '\n'
+    fi
+}
+
+cmd_wizard() {
+    wizard_detect_tui
+
+    # Configuration variables
+    local WIZ_ROLE="" WIZ_TRANSPORT="" WIZ_CARRIER="" WIZ_VARIANT="" WIZ_SHARED_KEY="" WIZ_AUTH_MODE="key" WIZ_OBFS4_SEED=""
+    local WIZ_METRICS_ENABLED="false" WIZ_METRICS_ADDR="127.0.0.1:9090"
+    local WIZ_WARP_ENABLED="false" WIZ_WARP_ROUTING_MODE="vpn_only" WIZ_WARP_VPN_SUBNET="10.8.0.0/24"
+    local WIZ_REVERSE_ENABLED="false" WIZ_REVERSE_ROLE="" WIZ_REVERSE_CLIENT_ADDR="" WIZ_REVERSE_SERVER_ADDR=""
+    local WIZ_TLS_CERT_FILE="" WIZ_TLS_KEY_FILE=""
+    local WIZ_RAWTCP_INTERFACE="" WIZ_RAWTCP_LOCAL_IP="" WIZ_RAWTCP_GATEWAY_MAC="" WIZ_RAWTCP_PORT="443"
+    local WIZ_RAWTCP_SETUP_FIREWALL="false"
+    local WIZ_GATEWAY_ADDR="" WIZ_AGENT_ID=""
+    local -a WIZ_BEHAVIORS=() WIZ_SERVICES=()
+    local WIZ_OUTPUT="${CONFIG_DIR}/config.yaml"
+
+    wizard_msgbox "StealthLink Configuration Wizard" \
+"Welcome to the StealthLink Configuration Wizard!
+
+This interactive tool will guide you through setting up your StealthLink configuration.
+
+Features:
+- Role-based setup (Gateway or Agent)
+- Multiple transport carriers
+- Behavior overlay selection
+- Automatic network detection
+- Service configuration
+
+Press OK to begin."
+
+    # Role
+    WIZ_ROLE=$(wizard_ask_menu "Role Selection" "Select the role for this StealthLink instance:" \
+        "gateway" "Gateway - Accepts connections from agents" \
+        "agent" "Agent - Connects to gateway")
+
+    # Transport
+    WIZ_TRANSPORT=$(wizard_ask_menu "Transport Selection" "Select transport protocol:" \
+        "uqsp" "UQSP - Unified QUIC Superset Protocol (recommended)" \
+        "direct" "Direct - Simple TCP/UDP transport")
+
+    # Carrier
+    if [ "$WIZ_TRANSPORT" = "uqsp" ]; then
+        WIZ_CARRIER=$(wizard_ask_menu "Carrier Selection" "Select UQSP carrier:" \
+            "quic" "QUIC - Standard QUIC protocol (default)" \
+            "rawtcp" "RawTCP - Raw TCP with custom framing" \
+            "faketcp" "FakeTCP - tcpraw/udp2raw-style over UDP" \
+            "icmptun" "ICMPTun - ICMP tunnel" \
+            "webtunnel" "WebTunnel - HTTP/WebSocket tunnel" \
+            "chisel" "Chisel - Fast TCP/UDP tunnel over HTTP" \
+            "xhttp" "XHTTP - Extended HTTP transport" \
+            "trusttunnel" "TrustTunnel - TLS-based tunnel")
+    else WIZ_CARRIER="tcp"; fi
+
+    # Variant (presets)
+    if [ "$WIZ_TRANSPORT" = "uqsp" ]; then
+        local variant_desc
+        variant_desc=$(wizard_ask_menu "Protocol Variant" "Select UQSP protocol variant:" \
+            "4a" "xhttp-tls: XHTTP + TLS + Domain Fronting + ECH" \
+            "4b" "raw-tcp: Raw TCP + obfs4 + AmneziaWG padding" \
+            "4c" "tls-mirror: REALITY/ShadowTLS + XTLS Vision + PQ" \
+            "4d" "udp: QUIC + Hysteria2 CC + Salamander (recommended)" \
+            "4e" "trust: TrustTunnel + HTTP/2 + HTTP/3 compatibility" \
+            "custom" "Custom: Manual carrier and behavior selection")
+        WIZ_VARIANT="$variant_desc"
+        case "$variant_desc" in
+            4a) WIZ_CARRIER="xhttp"; WIZ_BEHAVIORS=("ech" "domainfront" "vision" "tlsfrag") ;;
+            4b) WIZ_CARRIER="rawtcp"; WIZ_BEHAVIORS=("obfs4" "awg") ;;
+            4c) WIZ_CARRIER="xhttp"; WIZ_BEHAVIORS=("tlsmirror" "vision") ;;
+            4d) WIZ_CARRIER="quic"; WIZ_BEHAVIORS=("awg") ;;
+            4e) WIZ_CARRIER="trusttunnel"; WIZ_BEHAVIORS=("cstp" "tlsfrag") ;;
+            custom) WIZ_VARIANT="" ;;
+        esac
+    fi
+
+    # RawTCP config
+    if [ "$WIZ_CARRIER" = "rawtcp" ]; then
+        WIZ_RAWTCP_INTERFACE=$(wizard_detect_interface)
+        WIZ_RAWTCP_LOCAL_IP=$(wizard_detect_ip "$WIZ_RAWTCP_INTERFACE")
+        WIZ_RAWTCP_GATEWAY_MAC=$(wizard_detect_gateway_mac "$WIZ_RAWTCP_INTERFACE")
+        WIZ_RAWTCP_INTERFACE=$(wizard_ask_input "Interface" "Network interface:" "$WIZ_RAWTCP_INTERFACE")
+        WIZ_RAWTCP_LOCAL_IP=$(wizard_ask_input "Local IP" "Local IP address:" "$WIZ_RAWTCP_LOCAL_IP")
+        WIZ_RAWTCP_GATEWAY_MAC=$(wizard_ask_input "Gateway MAC" "Gateway MAC address:" "$WIZ_RAWTCP_GATEWAY_MAC")
+        WIZ_RAWTCP_PORT=$(wizard_ask_input "Port" "RawTCP port:" "$WIZ_RAWTCP_PORT")
+        if wizard_ask_yesno "Firewall Setup" "Do you want to setup firewall rules now?" "no"; then
+            WIZ_RAWTCP_SETUP_FIREWALL="true"
+        fi
+    fi
+
+    # Custom behaviors
+    if [ ${#WIZ_BEHAVIORS[@]} -eq 0 ] && [ "$WIZ_TRANSPORT" = "uqsp" ]; then
+        local selected
+        selected=$(wizard_ask_checklist "Behavior Overlays" "Select optional behavior overlays (space to select):" \
+            "shadowtls" "ShadowTLS - TLS camouflage" off \
+            "reality" "Reality - Advanced TLS masquerading" off \
+            "ech" "ECH - Encrypted Client Hello" off \
+            "tlsfrag" "TLSFrag - TLS fragmentation" off \
+            "domainfront" "DomainFront - Domain fronting" off \
+            "awg" "AWG - AmneziaWG obfuscation" off \
+            "vision" "Vision - Traffic shaping" off \
+            "obfs4" "Obfs4 - obfs4proxy integration" off \
+            "cstp" "CSTP - OpenConnect-compatible framing" off \
+            "tlsmirror" "TLSMirror - TLS mirroring" off \
+            "qpp" "QPP - Quantum Permutation Pads cipher" off \
+            "violated_tcp" "ViolatedTCP - Malformed TCP anti-DPI" off)
+        WIZ_BEHAVIORS=()
+        for item in $selected; do WIZ_BEHAVIORS+=("${item//\"/}"); done
+    fi
+
+    # Security
+    if wizard_ask_yesno "Security - Secret Key" "Generate a new shared secret key?" "yes"; then
+        WIZ_SHARED_KEY=$(wizard_generate_secret)
+        wizard_msgbox "Generated Key" "Your shared secret key is:\n\n$WIZ_SHARED_KEY\n\nPlease save this key securely."
+    else WIZ_SHARED_KEY=$(wizard_ask_input "Security - Secret Key" "Enter shared secret key:" ""); fi
+    WIZ_OBFS4_SEED=$(wizard_obfs4_seed_from_secret "$WIZ_SHARED_KEY")
+
+    WIZ_AUTH_MODE=$(wizard_ask_menu "Authentication Mode" "Select authentication mode:" \
+        "key" "Shared Key - Simple pre-shared key" \
+        "token" "Token - JWT token-based auth" \
+        "mtls" "mTLS - Mutual TLS authentication")
+
+    # Services (gateway only)
+    if [ "$WIZ_ROLE" = "gateway" ] && wizard_ask_yesno "Services" "Do you want to add services now?" "yes"; then
+        while true; do
+            local svc_type
+            svc_type=$(wizard_ask_menu "Service Type" "Select service type:" \
+                "tcp" "TCP - TCP port forwarding" \
+                "udp" "UDP - UDP port forwarding" \
+                "socks5" "SOCKS5 - SOCKS5 proxy server" \
+                "done" "Finish adding services")
+            if [ "$svc_type" = "done" ]; then break; fi
+            local listen_addr target_addr=""
+            case "$svc_type" in
+                tcp|udp)
+                    listen_addr=$(wizard_ask_input "Listen Address" "Listen address (e.g., 0.0.0.0:8080):" "0.0.0.0:8080")
+                    target_addr=$(wizard_ask_input "Target Address" "Target address (e.g., 192.168.1.10:80):" "192.168.1.10:80") ;;
+                socks5)
+                    listen_addr=$(wizard_ask_input "Listen Address" "SOCKS5 listen address:" "0.0.0.0:1080") ;;
+            esac
+            WIZ_SERVICES+=("$svc_type|$listen_addr|$target_addr")
+        done
+    fi
+
+    # Agent config
+    if [ "$WIZ_ROLE" = "agent" ]; then
+        WIZ_GATEWAY_ADDR=$(wizard_ask_input "Gateway Address" "Gateway address (host:port):" "gateway.example.com:443")
+        WIZ_AGENT_ID=$(wizard_ask_input "Agent ID" "Agent identifier:" "agent-$(hostname)")
+    fi
+
+    # Metrics
+    if wizard_ask_yesno "Metrics" "Enable metrics endpoint?" "no"; then
+        WIZ_METRICS_ENABLED="true"
+        WIZ_METRICS_ADDR=$(wizard_ask_input "Metrics Address" "Metrics listen address:" "127.0.0.1:9090")
+    fi
+
+    # WARP / Reverse / TLS
+    if wizard_ask_yesno "WARP" "Enable WARP server IP hiding?" "no"; then
+        WIZ_WARP_ENABLED="true"
+        WIZ_WARP_ROUTING_MODE=$(wizard_ask_menu "WARP Routing" "Select WARP routing mode:" \
+            "vpn_only" "Route VPN return traffic only (recommended)" \
+            "all" "Route all traffic via WARP")
+        WIZ_WARP_VPN_SUBNET=$(wizard_ask_input "WARP Subnet" "VPN subnet for split routing:" "10.8.0.0/24")
+    fi
+    if wizard_ask_yesno "Reverse Mode" "Enable reverse proxy mode?" "no"; then
+        WIZ_REVERSE_ENABLED="true"
+        if [ "$WIZ_ROLE" = "gateway" ]; then
+            WIZ_REVERSE_ROLE="dialer"
+            WIZ_REVERSE_CLIENT_ADDR=$(wizard_ask_input "Reverse Client Address" "Client listener address:" "127.0.0.1:9443")
+        else
+            WIZ_REVERSE_ROLE="listener"
+            WIZ_REVERSE_SERVER_ADDR=$(wizard_ask_input "Reverse Server Address" "Server dial target:" "0.0.0.0:9443")
+        fi
+    fi
+    if wizard_ask_yesno "TLS Certificates" "Configure TLS certificate paths?" "no"; then
+        WIZ_TLS_CERT_FILE=$(wizard_ask_input "TLS Cert" "TLS cert file path:" "/etc/letsencrypt/live/example/fullchain.pem")
+        WIZ_TLS_KEY_FILE=$(wizard_ask_input "TLS Key" "TLS key file path:" "/etc/letsencrypt/live/example/privkey.pem")
+    elif wizard_ask_yesno "ACME" "Use acme.sh defaults for Let's Encrypt?" "no"; then
+        local domain; domain=$(wizard_ask_input "ACME Domain" "Primary certificate domain:" "example.com")
+        WIZ_TLS_CERT_FILE="$HOME/.acme.sh/${domain}/fullchain.cer"
+        WIZ_TLS_KEY_FILE="$HOME/.acme.sh/${domain}/${domain}.key"
+    fi
+
+    # Generate YAML
+    local yaml=""
+    yaml+="# StealthLink Configuration\n"
+    yaml+="# Generated by stealthlink-ctl wizard on $(date)\n\n"
+    yaml+="role: $WIZ_ROLE\n\n"
+    if [ -n "$WIZ_VARIANT" ]; then
+        yaml+="variant: \"$WIZ_VARIANT\"\n\n"
+    fi
+    yaml+="transport:\n  type: $WIZ_TRANSPORT\n"
+    if [ -n "$WIZ_TLS_CERT_FILE" ] || [ -n "$WIZ_TLS_KEY_FILE" ]; then
+        yaml+="  tls:\n"
+        [ -n "$WIZ_TLS_CERT_FILE" ] && yaml+="    cert_file: \"$WIZ_TLS_CERT_FILE\"\n"
+        [ -n "$WIZ_TLS_KEY_FILE" ] && yaml+="    key_file: \"$WIZ_TLS_KEY_FILE\"\n"
+    fi
+    if [ "$WIZ_TRANSPORT" = "uqsp" ]; then
+        yaml+="  uqsp:\n    carrier:\n      type: $WIZ_CARRIER\n"
+        case "$WIZ_CARRIER" in
+            rawtcp)
+                local rawtcp_addr="$WIZ_RAWTCP_LOCAL_IP"
+                if [[ "$rawtcp_addr" != *:* ]]; then
+                    rawtcp_addr="${WIZ_RAWTCP_LOCAL_IP}:${WIZ_RAWTCP_PORT}"
+                fi
+                yaml+="      rawtcp:\n        raw:\n          interface: \"$WIZ_RAWTCP_INTERFACE\"\n          ipv4:\n            addr: \"$rawtcp_addr\"\n            router_mac: \"$WIZ_RAWTCP_GATEWAY_MAC\"\n          pcap:\n            sockbuf: 4194304\n          tcp:\n            local_flag: [\"PA\", \"SA\", \"FA\"]\n            remote_flag: [\"PA\", \"SA\", \"FA\"]\n            randomize: true\n            cycle_mode: random\n        kcp:\n          block: \"aes\"\n          mode: \"fast3\"\n          packet_guard: true\n          packet_guard_magic: \"PQT1\"\n          packet_guard_window: 30\n          packet_guard_skew: 1\n"
+                ;;
+            quic)
+                if [ "$WIZ_VARIANT" != "4d" ]; then
+                    yaml+="    congestion:\n      algorithm: bbr\n"
+                fi
+                ;;
+            xhttp)  yaml+="      xhttp:\n        mode: stream-up\n        max_connections: 4\n" ;;
+            webtunnel) yaml+="      webtunnel:\n        path: \"/tunnel\"\n        version: h2\n" ;;
+            trusttunnel) yaml+="      trusttunnel:\n        version: h2\n        max_concurrent: 16\n        stream_timeout: 45s\n        mtu_discovery: true\n" ;;
+        esac
+        case "$WIZ_VARIANT" in
+            4a)
+                yaml+="    obfuscation:\n      profile: adaptive\n"
+                ;;
+            4b)
+                yaml+="    obfuscation:\n      profile: adaptive\n      morphing_enabled: true\n"
+                ;;
+            4c)
+                yaml+="    security:\n      pq_kem: true\n"
+                ;;
+            4d)
+                yaml+="    congestion:\n      algorithm: brutal\n      bandwidth_mbps: 200\n"
+                yaml+="    obfuscation:\n      profile: adaptive\n      morphing_enabled: true\n"
+                ;;
+        esac
+        if [ ${#WIZ_BEHAVIORS[@]} -gt 0 ]; then
+            yaml+="    behaviors:\n"
+            for behavior in "${WIZ_BEHAVIORS[@]}"; do
+                case "$behavior" in
+                    ech)        yaml+="      ech:\n        enabled: true\n        public_name: \"cloudflare.com\"\n" ;;
+                    domainfront) yaml+="      domainfront:\n        enabled: true\n        front_domain: \"cloudflare.com\"\n        real_host: \"example.com\"\n" ;;
+                    reality)    yaml+="      reality:\n        enabled: true\n        dest: \"www.microsoft.com:443\"\n" ;;
+                    shadowtls)  yaml+="      shadowtls:\n        enabled: true\n        version: 3\n" ;;
+                    vision)     yaml+="      vision:\n        enabled: true\n        flow_auto_detect: true\n" ;;
+                    tlsfrag)    yaml+="      tlsfrag:\n        enabled: true\n        strategy: sni_split\n" ;;
+                    awg)        yaml+="      awg:\n        enabled: true\n" ;;
+                    obfs4)      yaml+="      obfs4:\n        enabled: true\n        seed: \"$WIZ_OBFS4_SEED\"\n        iat_mode: 1\n" ;;
+                    cstp)       yaml+="      cstp:\n        enabled: true\n        dpd_interval: 15s\n        mtu: 1350\n" ;;
+                    tlsmirror)  yaml+="      tlsmirror:\n        enabled: true\n" ;;
+                    qpp)
+                        local qpp_key
+                        qpp_key=$(head -c 32 /dev/urandom | base64 | head -c 32)
+                        yaml+="      qpp:\n        enabled: true\n        key: \"$qpp_key\"\n        num_sbox: 8\n" ;;
+                    violated_tcp) yaml+="      violated_tcp:\n        enabled: true\n        mode: malformed\n" ;;
+                    *)          yaml+="      $behavior:\n        enabled: true\n" ;;
+                esac
+            done
+        fi
+        if [ "$WIZ_REVERSE_ENABLED" = "true" ]; then
+            yaml+="    reverse:\n      enabled: true\n      role: \"$WIZ_REVERSE_ROLE\"\n"
+            [ -n "$WIZ_REVERSE_CLIENT_ADDR" ] && yaml+="      client_address: \"$WIZ_REVERSE_CLIENT_ADDR\"\n"
+            [ -n "$WIZ_REVERSE_SERVER_ADDR" ] && yaml+="      server_address: \"$WIZ_REVERSE_SERVER_ADDR\"\n"
+            yaml+="      heartbeat_interval: 10s\n      reconnect_delay: 5s\n      max_retries: 10\n"
+        fi
+    fi
+    yaml+="\n"
+    if [ "$WIZ_WARP_ENABLED" = "true" ]; then
+        yaml+="warp:\n  enabled: true\n  mode: builtin\n  endpoint: \"engage.cloudflareclient.com:2408\"\n  routing_mode: \"$WIZ_WARP_ROUTING_MODE\"\n  vpn_subnet: \"$WIZ_WARP_VPN_SUBNET\"\n\n"
+    fi
+    yaml+="security:\n  auth_mode: $WIZ_AUTH_MODE\n  shared_key: \"$WIZ_SHARED_KEY\"\n\n"
+    if [ "$WIZ_ROLE" = "gateway" ]; then
+        yaml+="gateway:\n  listen: 0.0.0.0:443\n"
+    else
+        yaml+="agent:\n  gateway_addr: \"$WIZ_GATEWAY_ADDR\"\n  id: \"$WIZ_AGENT_ID\"\n  reconnect_backoff: 5s\n"
+    fi
+    yaml+="\n"
+    if [ ${#WIZ_SERVICES[@]} -gt 0 ]; then
+        yaml+="services:\n"
+        local svc_idx=1
+        for svc in "${WIZ_SERVICES[@]}"; do
+            IFS='|' read -r svc_type listen_addr target_addr <<< "$svc"
+            yaml+="  - name: \"svc-${svc_idx}-${svc_type}\"\n"
+            yaml+="    protocol: \"$svc_type\"\n"
+            yaml+="    listen: \"$listen_addr\"\n"
+            [ -n "$target_addr" ] && yaml+="    target: \"$target_addr\"\n"
+            svc_idx=$((svc_idx + 1))
+        done
+        yaml+="\n"
+    fi
+    if [ "$WIZ_METRICS_ENABLED" = "true" ]; then
+        yaml+="metrics:\n  enabled: true\n  listen: \"$WIZ_METRICS_ADDR\"\n\n"
+    fi
+    yaml+="logging:\n  level: info\n  format: json\n"
+
+    # Review
+    local yaml_content; yaml_content=$(echo -e "$yaml")
+    local save_config=false
+    if [ "$WIZARD_TUI_BACKEND" = "plain" ]; then
+        echo -e "${COLOR_YELLOW}=== Configuration Review ===${COLOR_RESET}"
+        echo "$yaml_content"; echo ""
+        read -p "Save this configuration? [Y/n]: " answer; answer="${answer:-y}"
+        [[ "$answer" =~ ^[Yy] ]] && save_config=true
+    else
+        if whiptail --title "Configuration Review" --yesno "$(echo -e "Review your configuration:\n\n$yaml_content\n\nSave this configuration?")" 25 80 --scrolltext; then
+            save_config=true
+        fi
+    fi
+
+    if [ "$save_config" = true ]; then
+        mkdir -p "$CONFIG_DIR"
+        if [ -f "$WIZ_OUTPUT" ]; then
+            local backup="${WIZ_OUTPUT}.backup.$(date +%Y%m%d_%H%M%S)"
+            cp "$WIZ_OUTPUT" "$backup"
+            echo -e "${COLOR_YELLOW}Existing config backed up to: $backup${COLOR_RESET}"
+        fi
+        echo -e "$yaml" > "$WIZ_OUTPUT"
+        chmod 600 "$WIZ_OUTPUT"
+        echo -e "${COLOR_GREEN}Configuration written to: $WIZ_OUTPUT${COLOR_RESET}"
+        if [ "$WIZ_RAWTCP_SETUP_FIREWALL" = "true" ]; then
+            echo -e "${COLOR_BLUE}Applying firewall rules...${COLOR_RESET}"
+            fw_apply "$WIZ_RAWTCP_PORT"
+        fi
+        wizard_msgbox "Setup Complete" \
+"StealthLink configuration has been created successfully!
+
+Configuration file: $WIZ_OUTPUT
+
+Next steps:
+1. Review the configuration file
+2. Start StealthLink: systemctl start stealthlink
+3. Check status: systemctl status stealthlink
+4. View logs: journalctl -u stealthlink -f
+
+For the agent role, ensure you use the same shared key on the gateway."
+    else
+        echo -e "${COLOR_RED}Configuration cancelled.${COLOR_RESET}"; exit 1
+    fi
+}
+
+
+#==============================================================================
+# Telegram Monitoring Command (from stealthlink-telegram.sh)
+#==============================================================================
+
+telegram_load_config() {
+    if [[ ! -f "$TELEGRAM_CONFIG" ]]; then
+        log_error "Configuration file not found: $TELEGRAM_CONFIG"; return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$TELEGRAM_CONFIG"
+    if [[ -z "${BOT_TOKEN:-}" ]] || [[ -z "${CHAT_ID:-}" ]]; then
+        log_error "BOT_TOKEN and CHAT_ID must be set in $TELEGRAM_CONFIG"; return 1
+    fi
+    SERVER_LABEL="${SERVER_LABEL:-StealthLink}"
+    CHECK_INTERVAL="${CHECK_INTERVAL:-21600}"
+    ALERTS_ENABLED="${ALERTS_ENABLED:-true}"
+    log_info "Configuration loaded: SERVER_LABEL=$SERVER_LABEL"
+}
+
+telegram_get_token_file() {
+    local token_file; token_file=$(mktemp); chmod 600 "$token_file"
+    echo "$BOT_TOKEN" > "$token_file"; echo "$token_file"
+}
+
+telegram_send_message() {
+    local text="$1" token_file response
+    token_file=$(telegram_get_token_file)
+    response=$(curl -s -X POST \
+        "https://api.telegram.org/bot$(cat "$token_file")/sendMessage" \
+        -d "chat_id=$CHAT_ID" -d "parse_mode=HTML" -d "text=$text" 2>&1) || {
+        log_error "Failed to send message: $response"; rm -f "$token_file"; return 1
+    }
+    rm -f "$token_file"
+    if echo "$response" | grep -q '"ok":false'; then
+        log_error "Telegram API error: $response"; return 1
+    fi
+    log_info "Message sent successfully"
+}
+
+telegram_get_updates() {
+    local offset="${1:-0}" token_file response
+    token_file=$(telegram_get_token_file)
+    response=$(curl -s -X GET \
+        "https://api.telegram.org/bot$(cat "$token_file")/getUpdates?offset=$offset&timeout=5" 2>&1) || {
+        log_warn "Failed to get updates: $response"; rm -f "$token_file"; echo "{}"; return 1
+    }
+    rm -f "$token_file"; echo "$response"
+}
+
+telegram_get_cpu_usage() { top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1; }
+telegram_get_memory_usage() { free | grep Mem | awk '{printf "%.1f", ($3/$2) * 100.0}'; }
+telegram_get_active_sessions() {
+    local metrics; metrics=$(curl -s http://localhost:9090/metrics 2>/dev/null || echo "")
+    if [[ -n "$metrics" ]]; then echo "$metrics" | grep -oP 'stealthlink_active_sessions \K[0-9]+' || echo "N/A"
+    else echo "N/A"; fi
+}
+
+telegram_generate_status_report() {
+    local status uptime_text cpu_usage mem_usage sessions version timestamp status_icon
+    if systemctl is-active --quiet stealthlink; then status="running"; else status="stopped"; fi
+    if [[ "$status" == "running" ]]; then
+        local uptime_seconds current_time uptime_duration days hours minutes
+        uptime_seconds=$(systemctl show stealthlink --property=ActiveEnterTimestamp | cut -d= -f2 | xargs -I{} date -d "{}" +%s || echo "0")
+        current_time=$(date +%s); uptime_duration=$((current_time - uptime_seconds))
+        days=$((uptime_duration / 86400)); hours=$(( (uptime_duration % 86400) / 3600 )); minutes=$(( (uptime_duration % 3600) / 60 ))
+        if [[ $days -gt 0 ]]; then uptime_text="${days}d ${hours}h ${minutes}m"
+        elif [[ $hours -gt 0 ]]; then uptime_text="${hours}h ${minutes}m"
+        else uptime_text="${minutes}m"; fi
+    else uptime_text="N/A"; fi
+    cpu_usage=$(telegram_get_cpu_usage); mem_usage=$(telegram_get_memory_usage)
+    sessions=$(telegram_get_active_sessions)
+    if command -v stealthlink &>/dev/null; then version=$(stealthlink version 2>/dev/null | head -n1 || echo "unknown")
+    else version="not installed"; fi
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    if [[ "$status" == "running" ]]; then status_icon="✅"; else status_icon="🔴"; fi
+    cat <<REPORTEOF
+<b>$SERVER_LABEL Status Report</b>
+<i>$timestamp</i>
+
+<b>Service:</b> $status_icon $status
+<b>Version:</b> $version
+<b>Uptime:</b> $uptime_text
+
+<b>System Resources:</b>
+CPU: ${cpu_usage}%
+Memory: ${mem_usage}%
+
+<b>Connections:</b>
+Active Sessions: $sessions
+REPORTEOF
+}
+
+telegram_handle_command() {
+    local command="$1" response=""
+    log_info "Processing command: $command"
+    case "$command" in
+        /status) response=$(telegram_generate_status_report) ;;
+        /health)
+            local health_status cpu mem
+            if systemctl is-active --quiet stealthlink; then health_status="✅ Service is running"
+            else health_status="🔴 Service is not running"; fi
+            cpu=$(telegram_get_cpu_usage); mem=$(telegram_get_memory_usage)
+            response="<b>Health Check - $SERVER_LABEL</b>\n\n$health_status\nCPU: ${cpu}%\nMemory: ${mem}%" ;;
+        /restart)
+            if sudo systemctl restart stealthlink; then response="✅ StealthLink service restarted successfully"
+            else response="🔴 Failed to restart StealthLink service"; fi ;;
+        /stop)
+            if sudo systemctl stop stealthlink; then response="⏹️ StealthLink service stopped"
+            else response="🔴 Failed to stop StealthLink service"; fi ;;
+        /start)
+            if sudo systemctl start stealthlink; then response="▶️ StealthLink service started"
+            else response="🔴 Failed to start StealthLink service"; fi ;;
+        /version) local ver; ver=$(stealthlink version 2>/dev/null || echo "unknown")
+            response="<b>$SERVER_LABEL Version</b>\n\n$ver" ;;
+        *) response="Unknown command. Available commands:\n/status /health /restart /stop /start /version" ;;
+    esac
+    telegram_send_message "$response"
+}
+
+telegram_daemon_loop() {
+    log_info "Starting StealthLink Telegram monitoring daemon"
+    local poll_interval=30
+    local last_report_file="/var/tmp/stealthlink-telegram-last-report"
+    local last_state_file="/var/tmp/stealthlink-telegram-last-state"
+    local last_cpu_alert_file="/var/tmp/stealthlink-telegram-last-cpu-alert"
+    local alert_cooldown=300
+    UPDATE_OFFSET=0
+    local initial_updates last_update_id
+    initial_updates=$(telegram_get_updates 0)
+    last_update_id=$(echo "$initial_updates" | grep -oP '"update_id":\K[0-9]+' | tail -n1 || echo "0")
+    UPDATE_OFFSET=$((last_update_id + 1))
+    log_info "Initialized with update offset: $UPDATE_OFFSET"
+
+    while true; do
+        # Monitor service state changes
+        local current_state last_state
+        if systemctl is-active --quiet stealthlink; then current_state="running"; else current_state="stopped"; fi
+        if [[ -f "$last_state_file" ]]; then last_state=$(cat "$last_state_file"); else last_state=""; fi
+        if [[ -n "$last_state" ]] && [[ "$current_state" != "$last_state" ]] && [[ "$ALERTS_ENABLED" == "true" ]]; then
+            if [[ "$current_state" == "running" ]]; then
+                telegram_send_message "✅ <b>$SERVER_LABEL</b> - Service is UP\n\n$(date '+%Y-%m-%d %H:%M:%S')"
+            else
+                telegram_send_message "🔴 <b>$SERVER_LABEL</b> - Service is DOWN\n\n$(date '+%Y-%m-%d %H:%M:%S')"
+            fi
+        fi
+        echo "$current_state" > "$last_state_file"
+
+        # CPU alert
+        local cpu_usage; cpu_usage=$(telegram_get_cpu_usage)
+        if (( $(echo "$cpu_usage > 80" | bc -l 2>/dev/null || echo 0) )); then
+            local current_time last_cpu_alert; current_time=$(date +%s); last_cpu_alert=0
+            if [[ -f "$last_cpu_alert_file" ]]; then last_cpu_alert=$(cat "$last_cpu_alert_file"); fi
+            if [[ $((current_time - last_cpu_alert)) -gt $alert_cooldown ]] && [[ "$ALERTS_ENABLED" == "true" ]]; then
+                telegram_send_message "⚠️ <b>$SERVER_LABEL</b> - High CPU Usage\n\nCPU: ${cpu_usage}% (threshold: 80%)\n$(date '+%Y-%m-%d %H:%M:%S')"
+                echo "$current_time" > "$last_cpu_alert_file"
+            fi
+        fi
+
+        # Periodic report
+        local current_time last_report; current_time=$(date +%s); last_report=0
+        if [[ -f "$last_report_file" ]]; then last_report=$(cat "$last_report_file"); fi
+        if [[ $((current_time - last_report)) -gt $CHECK_INTERVAL ]]; then
+            log_info "Sending periodic status report"
+            telegram_send_message "$(telegram_generate_status_report)"
+            echo "$current_time" > "$last_report_file"
+        fi
+
+        # Process updates
+        local updates update_ids
+        updates=$(telegram_get_updates "$UPDATE_OFFSET")
+        update_ids=$(echo "$updates" | grep -oP '"update_id":\K[0-9]+' || echo "")
+        if [[ -n "$update_ids" ]]; then
+            while IFS= read -r update_id; do
+                if [[ -n "$update_id" ]] && [[ "$update_id" -gt "$UPDATE_OFFSET" ]]; then
+                    UPDATE_OFFSET=$((update_id + 1))
+                    local command; command=$(echo "$updates" | grep -oP '"text":"(/[^"]+)"' | head -n1 | cut -d'"' -f4 || echo "")
+                    if [[ -n "$command" ]]; then telegram_handle_command "$command"; fi
+                fi
+            done <<< "$update_ids"
+        fi
+        sleep "$poll_interval"
+    done
+}
+
+telegram_setup_wizard() {
+    echo "StealthLink Telegram Bot Setup"
+    echo "==============================="
+    echo ""
+    read -r -p "Enter Telegram Bot Token: " bot_token
+    read -r -p "Enter Telegram Chat ID: " chat_id
+    read -r -p "Enter Server Label (default: StealthLink): " server_label
+    server_label="${server_label:-StealthLink}"
+    read -r -p "Report Interval in seconds (default: 21600 = 6h): " check_interval
+    check_interval="${check_interval:-21600}"
+    read -r -p "Enable alerts? (true/false, default: true): " alerts_enabled
+    alerts_enabled="${alerts_enabled:-true}"
+    echo ""; echo "Creating configuration at $TELEGRAM_CONFIG..."
+    mkdir -p "$(dirname "$TELEGRAM_CONFIG")"
+    cat > "$TELEGRAM_CONFIG" <<TCONFEOF
+# StealthLink Telegram Bot Configuration
+BOT_TOKEN="$bot_token"
+CHAT_ID="$chat_id"
+SERVER_LABEL="$server_label"
+CHECK_INTERVAL=$check_interval
+ALERTS_ENABLED=$alerts_enabled
+TCONFEOF
+    chmod 600 "$TELEGRAM_CONFIG"
+    echo ""; echo "Configuration saved. Testing notification..."
+    if telegram_load_config; then
+        if telegram_send_message "✅ <b>$SERVER_LABEL</b> - Telegram bot configured successfully!"; then
+            echo ""; log_info "Setup complete! Test notification sent."
+            echo ""; echo "Next steps:"
+            echo "  1. Run: stealthlink-ctl telegram install-service"
+            echo "  2. Run: sudo systemctl start stealthlink-telegram"
+            echo "  3. Run: sudo systemctl enable stealthlink-telegram"
+        else log_error "Failed to send test notification. Check your bot token and chat ID."; exit 1; fi
+    fi
+}
+
+telegram_install_service() {
+    local service_file="${SYSTEMD_DIR}/stealthlink-telegram.service"
+    local script_path; script_path=$(realpath "$0")
+    log_info "Installing systemd service to $service_file"
+    cat > "$service_file" <<TSVCEOF
+[Unit]
+Description=StealthLink Telegram Monitoring Bot
+After=network.target stealthlink.service
+Wants=stealthlink.service
+
+[Service]
+Type=simple
+ExecStart=$script_path telegram daemon
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+TSVCEOF
+    systemctl daemon-reload
+    log_info "Service installed successfully"
+    echo ""; echo "To start: sudo systemctl start stealthlink-telegram"
+    echo "To enable: sudo systemctl enable stealthlink-telegram"
+}
+
+telegram_test_config() {
+    log_info "Testing configuration..."
+    if ! telegram_load_config; then exit 1; fi
+    log_info "Sending test message..."
+    if telegram_send_message "🧪 <b>Test Message</b>\n\nStealthLink Telegram bot is working!\n\n$(telegram_generate_status_report)"; then
+        log_info "Test successful!"
+    else log_error "Test failed!"; exit 1; fi
+}
+
+cmd_telegram() {
+    local subcmd="${1:-}"
+    case "$subcmd" in
+        setup)           telegram_setup_wizard ;;
+        install-service) require_root; telegram_install_service ;;
+        test)            telegram_test_config ;;
+        daemon|start)
+            if ! telegram_load_config; then
+                log_error "Failed to load configuration. Run: stealthlink-ctl telegram setup"; exit 1
+            fi
+            telegram_daemon_loop ;;
+        *)
+            echo "Usage: stealthlink-ctl telegram {setup|install-service|test|daemon}"
+            echo ""
+            echo "Commands:"
+            echo "  setup           - Interactive setup wizard"
+            echo "  install-service - Install systemd service"
+            echo "  test            - Test configuration and send test message"
+            echo "  daemon          - Run monitoring daemon"
+            exit 1 ;;
+    esac
+}
+
+
+#==============================================================================
+# Kernel Optimization Command (from optimize-kernel.sh)
+#==============================================================================
+
+cmd_optimize_kernel() {
+    require_root
+    local mode="${1:-standard}"
+    local qdisc="${2:-fq}"
+
+    echo "========================================"
+    echo "  StealthLink Kernel Optimization"
+    echo "========================================"
+    echo
+
+    # Backup sysctl
+    local backup_file="/etc/sysctl.conf.backup.$(date +%Y%m%d_%H%M%S)"
+    if [[ -f /etc/sysctl.conf ]]; then
+        cp /etc/sysctl.conf "$backup_file"
+        log_success "Backup created: $backup_file"
+    fi
+
+    case $mode in
+        standard)
+            log_info "Running standard optimizations..."
+            kernel_enable_bbr
+            kernel_optimize_buffers
+            kernel_enable_fastopen
+            kernel_enable_ecn
+            kernel_configure_qdisc "$qdisc"
+            kernel_optimize_tcp
+            kernel_optimize_connections
+            kernel_optimize_memory
+            kernel_create_service_optimizations
+            ;;
+        xanmod)
+            log_info "Running XanMod optimizations..."
+            kernel_install_xanmod
+            kernel_enable_bbr3
+            kernel_optimize_buffers
+            kernel_enable_fastopen
+            kernel_enable_ecn
+            kernel_configure_qdisc "$qdisc"
+            kernel_optimize_tcp
+            kernel_optimize_connections
+            kernel_optimize_memory
+            kernel_create_service_optimizations
+            ;;
+        minimal)
+            log_info "Running minimal optimizations..."
+            kernel_enable_bbr
+            kernel_optimize_buffers
+            kernel_enable_fastopen
+            ;;
+        verify)
+            kernel_show_current
+            kernel_verify
+            return 0
+            ;;
+        *)
+            echo "Usage: stealthlink-ctl optimize-kernel [standard|xanmod|minimal|verify] [fq|fq_codel|cake]"
+            echo ""; echo "Modes:"
+            echo "  standard  - Full optimization with BBR (default)"
+            echo "  xanmod    - Install XanMod kernel with BBRv3"
+            echo "  minimal   - Basic optimizations only"
+            echo "  verify    - Check current settings"
+            return 1
+            ;;
+    esac
+
+    log_info "Applying sysctl changes..."
+    sysctl -p 2>/dev/null || log_warn "Some sysctl values could not be applied immediately"
+    echo ""; echo "========================================"
+    log_success "Optimization complete!"
+    echo "========================================"; echo
+    kernel_show_current; echo
+    log_info "Some changes may require a reboot to take full effect."
+    log_info "Run 'stealthlink-ctl optimize-kernel verify' after reboot to confirm settings."
+}
+
+kernel_enable_bbr() {
+    log_info "Configuring BBR congestion control..."
+    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
+        log_warn "BBR not available in kernel. Loading tcp_bbr module..."
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    cat >> /etc/sysctl.conf << 'BBREOF'
+
+# BBR Congestion Control
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+BBREOF
+    sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || log_warn "Failed to set BBR (may require newer kernel)"
+    sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+    log_success "BBR configuration applied"
+}
+
+kernel_enable_bbr3() {
+    log_info "Checking for BBRv3 support..."
+    if uname -r | grep -qi "xanmod"; then
+        log_info "XanMod kernel detected, BBRv3 available"
+        cat >> /etc/sysctl.conf << 'BBR3EOF'
+
+# BBRv3 Congestion Control (XanMod)
+net.ipv4.tcp_congestion_control=bbr3
+net.core.default_qdisc=fq
+BBR3EOF
+        sysctl -w net.ipv4.tcp_congestion_control=bbr3 2>/dev/null || log_warn "BBRv3 not available, falling back to BBR"
+        log_success "BBRv3 configuration applied"
+    else
+        log_warn "BBRv3 requires XanMod kernel. Using standard BBR."
+        kernel_enable_bbr
+    fi
+}
+
+kernel_optimize_buffers() {
+    log_info "Optimizing buffer sizes..."
+    cat >> /etc/sysctl.conf << 'BUFEOF'
+
+# Buffer Size Optimization
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.core.netdev_max_backlog=65536
+net.ipv4.tcp_rmem=4096 262144 33554432
+net.ipv4.tcp_wmem=4096 262144 33554432
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+BUFEOF
+    sysctl -w net.core.rmem_max=33554432
+    sysctl -w net.core.wmem_max=33554432
+    sysctl -w net.core.netdev_max_backlog=65536
+    sysctl -w net.ipv4.tcp_rmem="4096 262144 33554432"
+    sysctl -w net.ipv4.tcp_wmem="4096 262144 33554432"
+    log_success "Buffer sizes optimized"
+}
+
+kernel_enable_fastopen() {
+    log_info "Enabling TCP Fast Open..."
+    cat >> /etc/sysctl.conf << 'TFOEOF'
+
+# TCP Fast Open
+net.ipv4.tcp_fastopen=3
+TFOEOF
+    sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || log_warn "TCP Fast Open not supported"
+    log_success "TCP Fast Open enabled"
+}
+
+kernel_enable_ecn() {
+    log_info "Configuring ECN..."
+    cat >> /etc/sysctl.conf << 'ECNEOF'
+
+# ECN Configuration
+net.ipv4.tcp_ecn=1
+ECNEOF
+    sysctl -w net.ipv4.tcp_ecn=1 2>/dev/null || log_warn "ECN configuration failed"
+    log_success "ECN enabled"
+}
+
+kernel_configure_qdisc() {
+    local qdisc=${1:-fq}
+    log_info "Configuring queueing algorithm: $qdisc"
+    printf "\n# Queueing Algorithm - %s\nnet.core.default_qdisc=%s\n" "$qdisc" "$qdisc" >> /etc/sysctl.conf
+    if [[ "$qdisc" == "cake" ]]; then
+        log_warn "CAKE requires kernel support. Install linux-modules-extra if needed."
+    fi
+    sysctl -w net.core.default_qdisc=$qdisc 2>/dev/null || log_warn "Failed to set queueing algorithm"
+    log_success "Queueing algorithm configured"
+}
+
+kernel_optimize_tcp() {
+    log_info "Applying additional TCP optimizations..."
+    cat >> /etc/sysctl.conf << 'TCPEOF'
+
+# TCP Optimizations
+net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_max_tw_buckets=5000
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_moderate_rcvbuf=1
+net.ipv4.tcp_slow_start_after_idle=0
+TCPEOF
+    sysctl -w net.ipv4.tcp_notsent_lowat=16384
+    sysctl -w net.ipv4.tcp_tw_reuse=1
+    sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+    sysctl -w net.ipv4.tcp_mtu_probing=1
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+    log_success "TCP optimizations applied"
+}
+
+kernel_optimize_connections() {
+    log_info "Optimizing for high connection counts..."
+    cat >> /etc/sysctl.conf << 'CONNEOF'
+
+# Connection Limits
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=65536
+net.ipv4.tcp_max_syn_backlog=65536
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_probes=5
+net.ipv4.tcp_keepalive_intvl=15
+fs.file-max=2097152
+fs.nr_open=2097152
+CONNEOF
+    cat >> /etc/security/limits.conf << 'LIMEOF'
+
+# StealthLink Limits
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc 1048576
+* hard nproc 1048576
+LIMEOF
+    sysctl -w net.core.somaxconn=65535
+    sysctl -w fs.file-max=2097152
+    log_success "Connection optimizations applied"
+}
+
+kernel_optimize_memory() {
+    log_info "Applying memory optimizations..."
+    cat >> /etc/sysctl.conf << 'MEMEOF'
+
+# Memory Optimizations
+vm.swappiness=10
+vm.dirty_ratio=40
+vm.dirty_background_ratio=10
+vm.vfs_cache_pressure=50
+MEMEOF
+    sysctl -w vm.swappiness=10 2>/dev/null || true
+    log_success "Memory optimizations applied"
+}
+
+kernel_install_xanmod() {
+    log_info "XanMod kernel installation..."
+    log_warn "This will install a new kernel. Reboot required after installation."
+    read -p "Install XanMod kernel? (y/N) " -n 1 -r; echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then log_info "Skipping XanMod installation"; return; fi
+    if [[ -f /etc/debian_version ]]; then
+        apt-get update
+        apt-get install -y wget gnupg
+        wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
+        echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' > /etc/apt/sources.list.d/xanmod-release.list
+        apt-get update
+        apt-get install -y linux-xanmod-x64v3
+    elif [[ -f /etc/redhat-release ]]; then
+        log_warn "XanMod for RHEL-based systems requires manual steps"
+        log_info "Visit: https://xanmod.org/#install_via_akmods"
+    else log_warn "Unsupported distribution for XanMod installation"; fi
+}
+
+kernel_create_service_optimizations() {
+    log_info "Creating service optimizations..."
+    mkdir -p /etc/systemd/system/stealthlink.service.d/
+    cat > /etc/systemd/system/stealthlink.service.d/limits.conf << 'SLIMEOF'
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=1048576
+LimitMEMLOCK=infinity
+SLIMEOF
+    systemctl daemon-reload 2>/dev/null || true
+    log_success "Service optimizations created"
+}
+
+kernel_show_current() {
+    log_info "Current TCP congestion control:"; sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
+    log_info "Current queueing algorithm:"; sysctl net.core.default_qdisc 2>/dev/null || true
+    log_info "Current buffer sizes:"
+    sysctl net.core.rmem_max 2>/dev/null || true; sysctl net.core.wmem_max 2>/dev/null || true
+}
+
+kernel_verify() {
+    log_info "Verifying optimizations..."
+    local errors=0
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+        log_success "BBR is active"
+    else log_warn "BBR is not active"; errors=$((errors + 1)); fi
+    local rmem_max; rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "0")
+    if [[ "$rmem_max" -ge 33554432 ]]; then log_success "Buffer sizes optimized"
+    else log_warn "Buffer sizes may not be optimal: rmem_max=$rmem_max"; errors=$((errors + 1)); fi
+    if [[ $errors -eq 0 ]]; then log_success "All optimizations verified successfully"
+    else log_warn "Some optimizations could not be verified. A reboot may be required."; fi
+}
+
+
+#==============================================================================
+# Interactive Menu
+#==============================================================================
+
+cmd_menu() {
+    while true; do
+        echo ""
+        echo -e "${COLOR_BOLD}StealthLink Service Control${COLOR_RESET}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  1) Status"
+        echo "  2) Logs"
+        echo "  3) Health Check"
+        echo "  4) Benchmark"
+        echo "  5) Test Connectivity"
+        echo "  6) Monitor (Real-time Dashboard)"
+        echo "  7) Rotate Keys"
+        echo "  8) Switch Mode"
+        echo "  9) Restart Service"
+        echo " 10) Update"
+        echo " 11) Edit Config"
+        echo " 12) Backup Config"
+        echo " 13) Restore Config"
+        echo " 14) Firewall Management"
+        echo " 15) Version Info"
+        echo " 16) Configuration Wizard"
+        echo " 17) Telegram Monitoring"
+        echo " 18) Kernel Optimization"
+        echo " 19) Install"
+        echo "  0) Exit"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        read -p "Select option: " choice
+
+        case "$choice" in
+            1) cmd_status ;;
+            2) cmd_logs ;;
+            3) cmd_health ;;
+            4) cmd_benchmark ;;
+            5) 
+                echo ""
+                echo "Test options: 4a, 4b, 4c, 4d, 4e, tun"
+                read -p "Variant: " test_var
+                read -p "Target (optional): " test_target
+                cmd_test "$test_var" "$test_target" ;;
+            6) cmd_monitor dashboard 2 ;;
+            7) cmd_rotate_keys ;;
+            8) read -p "Mode (4a..4e): " m; cmd_switch_mode "$m" ;;
+            9) cmd_restart ;;
+            10) cmd_update ;;
+            11) cmd_config ;;
+            12) cmd_backup ;;
+            13) cmd_restore ;;
+            14)
+                echo ""
+                echo "Firewall Actions: apply, remove, persist, status"
+                read -p "Action: " fw_action
+                read -p "Port (optional): " fw_port
+                cmd_firewall "$fw_action" "$fw_port" ;;
+            15) cmd_version ;;
+            16) cmd_wizard ;;
+            17)
+                echo ""
+                echo "Telegram Commands: setup, test, daemon, install-service"
+                read -p "Command: " tg_cmd
+                cmd_telegram "$tg_cmd" ;;
+            18)
+                echo ""
+                echo "Modes: standard, xanmod, minimal, verify"
+                read -p "Mode [standard]: " ko_mode
+                cmd_optimize_kernel "${ko_mode:-standard}" ;;
+            19) cmd_install ;;
+            0) exit 0 ;;
+            *) log_error "Invalid option" ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+#==============================================================================
+# Help
+#==============================================================================
+
+cmd_help() {
+    cat <<HELPEOF
+${COLOR_BOLD}StealthLink Unified Control (stealthlink-ctl)${COLOR_RESET}
+Version: $SCRIPT_VERSION
+
+${COLOR_BOLD}USAGE:${COLOR_RESET}
+    stealthlink-ctl [COMMAND] [OPTIONS]
+
+${COLOR_BOLD}COMMANDS:${COLOR_RESET}
+    install             Install StealthLink (--role=, --version=, --bundle=, --local, --offline)
+    uninstall           Uninstall StealthLink completely
+    configure           Interactive configuration wizard (alias for wizard)
+    wizard              Interactive configuration wizard
+    status              Show service status and metrics
+    start               Start the service
+    stop                Stop the service
+    restart             Restart the service
+    logs [-f]           Show/follow service logs
+    health              Run health checks
+    benchmark [target]  Run throughput benchmark
+    validate-live <target> Run live mode-matrix validation (4a..4e, WARP on/off)
+    stress              Run stress validation workflow (1000+ conn/churn gate)
+    soak [seconds]      Run long-duration soak workflow (default: 86400s)
+    profile [pprof_url] Capture CPU/heap pprof snapshots for leak/hotspot checks
+    test <variant>      Quick connectivity test for variant (4a..4e, tun)
+    monitor [mode]      Real-time metrics dashboard (dashboard|metrics|json)
+    overlay <cmd>       Runtime overlay management (list|enable|disable)
+    warp <cmd>          Cloudflare WARP management (status|register|enable|disable)
+    config              Edit configuration file
+    backup              Create config backup
+    restore             Restore config from backup
+    rotate-keys         Rotate shared secret key
+    switch-mode <mode>  Switch protocol variant (4a..4e)
+    update [--force]    Update from GitHub releases
+    rollback            Restore previous binary
+    firewall <action>   Manage iptables rules (apply|remove|persist|status)
+    firewall-systemd    Auto-apply firewall rules from config (for systemd hooks)
+    telegram <cmd>      Telegram monitoring (setup|test|daemon|install-service)
+    optimize-kernel     Apply kernel tuning for tunneling
+    secret              Generate new secret key
+    version             Show version info
+    menu                Interactive menu
+    help                Show help
+
+${COLOR_BOLD}EXAMPLES:${COLOR_RESET}
+    stealthlink-ctl install --role=gateway --version=1.2.3
+    stealthlink-ctl install --bundle=./stealthlink-linux-amd64-v1.2.3.zip --role=gateway
+    stealthlink-ctl install --bundle=./stealthlink-linux-amd64-v1.2.3.zip --role=agent --offline
+    stealthlink-ctl install --local --role=agent
+    stealthlink-ctl configure
+    stealthlink-ctl wizard
+    stealthlink-ctl status
+    stealthlink-ctl restart
+    stealthlink-ctl update --force
+    stealthlink-ctl firewall apply 8443
+    stealthlink-ctl logs -f --mode=uqsp
+    stealthlink-ctl benchmark 1.2.3.4
+    stealthlink-ctl validate-live 1.2.3.4
+    stealthlink-ctl stress
+    stealthlink-ctl soak 3600
+    stealthlink-ctl profile http://127.0.0.1:9090
+    stealthlink-ctl test tun
+    stealthlink-ctl monitor
+    stealthlink-ctl monitor dashboard 5
+    stealthlink-ctl telegram setup
+    stealthlink-ctl optimize-kernel standard
+
+${COLOR_BOLD}FILES:${COLOR_RESET}
+    Config:  $CONFIG_FILE
+    Binary:  $BINARY_PATH
+    Backups: $BACKUP_DIR
+
+For more information, visit: https://github.com/${GITHUB_REPO}
+HELPEOF
+}
+
+#==============================================================================
+# Main Command Router
+#==============================================================================
+
+main() {
+    local command="${1:-menu}"
+
+    case "$command" in
+        install)         shift; cmd_install "$@" ;;
+        uninstall)       cmd_uninstall ;;
+        configure)       cmd_wizard ;;
+        wizard)          cmd_wizard ;;
+        status)          cmd_status ;;
+        start)           cmd_start ;;
+        stop)            cmd_stop ;;
+        restart)         cmd_restart ;;
+        logs)            shift; cmd_logs "$@" ;;
+        health)          cmd_health ;;
+        benchmark)       shift; cmd_benchmark "$@" ;;
+        validate-live)   shift; cmd_validate_live "$@" ;;
+        stress)          shift; cmd_stress "$@" ;;
+        soak)            shift; cmd_soak "$@" ;;
+        profile)         shift; cmd_profile "$@" ;;
+        test)            shift; cmd_test "$@" ;;
+        monitor)         shift; cmd_monitor "$@" ;;
+        overlay)         shift; cmd_overlay "$@" ;;
+        warp)            shift; cmd_warp "$@" ;;
+        config)          cmd_config ;;
+        backup)          cmd_backup ;;
+        restore)         cmd_restore ;;
+        rotate-keys)     cmd_rotate_keys ;;
+        switch-mode)     shift; cmd_switch_mode "$@" ;;
+        update)          shift; cmd_update "$@" ;;
+        rollback)        cmd_rollback ;;
+        firewall)        shift; cmd_firewall "$@" ;;
+        firewall-systemd) shift; cmd_firewall_systemd "$@" ;;
+        telegram)        shift; cmd_telegram "$@" ;;
+        optimize-kernel) shift; cmd_optimize_kernel "$@" ;;
+        secret)          cmd_secret ;;
+        version)         cmd_version ;;
+        help|--help|-h)  cmd_help ;;
+        menu)            cmd_menu ;;
+        *)
+            log_error "Unknown command: $command"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+# Run main with all arguments unless sourced for tests.
+if [[ "${STEALTHLINK_CTL_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi
