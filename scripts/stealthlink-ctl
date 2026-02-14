@@ -63,10 +63,54 @@ reattach_tty(){
 }
 
 print_banner(){ echo -e "${C_CYAN}StealthLink Control v${SCRIPT_VERSION}${C_RESET}"; }
-press_enter(){ echo ""; echo -e "${C_DIM}Press Enter to continue...${C_RESET}"; read -r || true; }
-read_input(){ local p="$1" d="${2:-}" v=""; echo -ne "${C_CYAN}${p}${C_RESET} [${d}]: "; read -r v || true; printf "%s" "${v:-${d}}"; }
-read_password(){ local p="$1" v=""; echo -ne "${C_CYAN}${p}${C_RESET}: "; read -rs v || true; echo ""; printf "%s" "${v}"; }
-read_yesno(){ local p="$1" d="${2:-y}" a="" h="[Y/n]"; [[ "${d}" == "n" ]] && h="[y/N]"; echo -ne "${C_YELLOW}${p}${C_RESET} ${h}: "; read -r a || true; a="${a:-${d}}"; [[ "${a}" =~ ^[Yy] ]]; }
+press_enter(){
+  if [[ -r /dev/tty ]]; then
+    echo "" >/dev/tty
+    echo -e "${C_DIM}Press Enter to continue...${C_RESET}" >/dev/tty
+    read -r </dev/tty || true
+  else
+    echo "" >&2
+    echo -e "${C_DIM}Press Enter to continue...${C_RESET}" >&2
+    read -r || true
+  fi
+}
+read_input(){
+  local p="$1" d="${2:-}" v=""
+  if [[ -r /dev/tty ]]; then
+    echo -ne "${C_CYAN}${p}${C_RESET} [${d}]: " >/dev/tty
+    read -r v </dev/tty || true
+  else
+    echo -ne "${C_CYAN}${p}${C_RESET} [${d}]: " >&2
+    read -r v || true
+  fi
+  printf "%s" "${v:-${d}}"
+}
+read_password(){
+  local p="$1" v=""
+  if [[ -r /dev/tty ]]; then
+    echo -ne "${C_CYAN}${p}${C_RESET}: " >/dev/tty
+    read -rs v </dev/tty || true
+    echo "" >/dev/tty
+  else
+    echo -ne "${C_CYAN}${p}${C_RESET}: " >&2
+    read -rs v || true
+    echo "" >&2
+  fi
+  printf "%s" "${v}"
+}
+read_yesno(){
+  local p="$1" d="${2:-y}" a="" h="[Y/n]"
+  [[ "${d}" == "n" ]] && h="[y/N]"
+  if [[ -r /dev/tty ]]; then
+    echo -ne "${C_YELLOW}${p}${C_RESET} ${h}: " >/dev/tty
+    read -r a </dev/tty || true
+  else
+    echo -ne "${C_YELLOW}${p}${C_RESET} ${h}: " >&2
+    read -r a || true
+  fi
+  a="${a:-${d}}"
+  [[ "${a}" =~ ^[Yy] ]]
+}
 
 select_menu(){
   local title="$1"; shift
@@ -766,8 +810,10 @@ USAGE
 main(){
   local cmd="${1:-}"
   case "${cmd}" in
+    ""|setup|wizard|monitor|network) reattach_tty "$@" ;;
+  esac
+  case "${cmd}" in
     "")
-      reattach_tty "$@"
       require_root "$@"
       main_menu
       ;;
