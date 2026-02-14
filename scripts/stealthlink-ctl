@@ -63,6 +63,20 @@ reattach_tty(){
 }
 
 print_banner(){ echo -e "${C_CYAN}StealthLink Control v${SCRIPT_VERSION}${C_RESET}"; }
+ui_print(){
+  if [[ -w /dev/tty ]]; then
+    echo -e "$*" >/dev/tty
+  else
+    echo -e "$*" >&2
+  fi
+}
+ui_printf(){
+  if [[ -w /dev/tty ]]; then
+    printf "$@" >/dev/tty
+  else
+    printf "$@" >&2
+  fi
+}
 press_enter(){
   if [[ -r /dev/tty ]]; then
     echo "" >/dev/tty
@@ -115,10 +129,12 @@ read_yesno(){
 select_menu(){
   local title="$1"; shift
   local -a opts=("$@")
-  echo ""; echo -e "${C_BOLD}${title}${C_RESET}"; echo -e "${C_DIM}─────────────────────────────────────${C_RESET}"
+  ui_print ""
+  ui_print "${C_BOLD}${title}${C_RESET}"
+  ui_print "${C_DIM}─────────────────────────────────────${C_RESET}"
   local i=1
-  while (( i <= ${#opts[@]} )); do printf "  ${C_GREEN}%2d)${C_RESET} %s\n" "$(( (i+1)/2 ))" "${opts[$i]}"; i=$((i+2)); done
-  echo ""
+  while (( i <= ${#opts[@]} )); do ui_printf "  ${C_GREEN}%2d)${C_RESET} %s\n" "$(( (i+1)/2 ))" "${opts[$i]}"; i=$((i+2)); done
+  ui_print ""
   local sel idx
   sel=$(read_input "Select" "1")
   idx=$(( (sel-1)*2 + 1 ))
@@ -297,7 +313,9 @@ JSON
 write_yaml(){ local path="$1" content="$2"; umask 077; mkdir -p "$(dirname "${path}")"; printf "%s\n" "${content}" >"${path}"; chmod 0600 "${path}" 2>/dev/null || true; }
 
 wizard_variant(){
-  echo ""; echo -e "${C_BOLD}Select Variant${C_RESET}"; echo "  1) 4a  2) 4b  3) 4c  4) 4d  5) 4e  6) custom"
+  ui_print ""
+  ui_print "${C_BOLD}Select Variant${C_RESET}"
+  ui_print "  1) 4a  2) 4b  3) 4c  4) 4d  5) 4e  6) custom"
   case "$(read_input "Select" "4")" in 1) echo "4a";; 2) echo "4b";; 3) echo "4c";; 4) echo "4d";; 5) echo "4e";; *) echo "custom";; esac
 }
 
@@ -306,16 +324,16 @@ wizard_carrier(){
   case "${variant}" in
     4a) echo "xhttp";; 4b) echo "rawtcp";; 4c) echo "xhttp";; 4d) echo "quic";; 4e) echo "trusttunnel";;
     custom)
-      echo "Carrier: 1)quic 2)xhttp 3)rawtcp 4)faketcp 5)masque 6)trusttunnel"
+      ui_print "Carrier: 1)quic 2)xhttp 3)rawtcp 4)faketcp 5)masque 6)trusttunnel"
       case "$(read_input "Carrier" "1")" in 2) echo "xhttp";; 3) echo "rawtcp";; 4) echo "faketcp";; 5) echo "masque";; 6) echo "trusttunnel";; *) echo "quic";; esac ;;
     *) echo "quic" ;;
   esac
 }
 
-wizard_connectivity(){ echo "Model: 1) Agent dials Gateway  2) Reverse-connect"; [[ "$(read_input "Select" "1")" == "2" ]] && echo reverse || echo normal; }
+wizard_connectivity(){ ui_print "Model: 1) Agent dials Gateway  2) Reverse-connect"; [[ "$(read_input "Select" "1")" == "2" ]] && echo reverse || echo normal; }
 
 wizard_overlays(){
-  echo "Overlays (space-separated numbers): 1)ech 2)reality 3)shadowtls 4)tlsfrag 5)obfs4 6)awg 7)none"
+  ui_print "Overlays (space-separated numbers): 1)ech 2)reality 3)shadowtls 4)tlsfrag 5)obfs4 6)awg 7)none"
   local s o=""; s=$(read_input "Select" "7")
   for n in ${s}; do case "$n" in 1)o+="ech ";;2)o+="reality ";;3)o+="shadowtls ";;4)o+="tlsfrag ";;5)o+="obfs4 ";;6)o+="awg ";; esac; done
   printf "%s" "${o}"
