@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.0.0"
+SCRIPT_VERSION="5.1.0"
 
 BIN_DIR="${STEALTHLINK_BIN_DIR:-/usr/local/bin}"
 ETC_DIR="${STEALTHLINK_ETC_DIR:-/etc/stealthlink}"
@@ -76,6 +76,11 @@ ui_printf(){
   else
     printf "$@" >&2
   fi
+}
+ui_section(){
+  ui_print ""
+  ui_print "${C_BOLD}${C_CYAN}$1${C_RESET}"
+  ui_print "${C_DIM}------------------------------------------------------------${C_RESET}"
 }
 press_enter(){
   if [[ -r /dev/tty ]]; then
@@ -312,11 +317,36 @@ JSON
 
 write_yaml(){ local path="$1" content="$2"; umask 077; mkdir -p "$(dirname "${path}")"; printf "%s\n" "${content}" >"${path}"; chmod 0600 "${path}" 2>/dev/null || true; }
 
+WIZARD_PROFILE_NAME=""
+WIZARD_PROFILE_DESC=""
+
 wizard_variant(){
+  ui_section "Connection Profile"
+  ui_print "Choose a plain-English profile. Internal mode code is shown in parentheses."
   ui_print ""
-  ui_print "${C_BOLD}Select Variant${C_RESET}"
-  ui_print "  1) 4a  2) 4b  3) 4c  4) 4d  5) 4e  6) custom"
-  case "$(read_input "Select" "4")" in 1) echo "4a";; 2) echo "4b";; 3) echo "4c";; 4) echo "4d";; 5) echo "4e";; *) echo "custom";; esac
+  ui_print "  1) Balanced UDP/QUIC (Recommended)           (maps to 4d)"
+  ui_print "     Best default for most VPS pairs: low latency, high throughput."
+  ui_print "  2) Fronted XHTTP + ECH + Vision              (maps to 4a)"
+  ui_print "     Better censorship resistance with domain-front style behavior."
+  ui_print "  3) RawTCP Camouflage                          (maps to 4b)"
+  ui_print "     Raw socket style transport for hostile filtering networks."
+  ui_print "  4) TLS Look-Alike + Vision                    (maps to 4c)"
+  ui_print "     Mimics common TLS patterns (REALITY/ShadowTLS-like behavior)."
+  ui_print "  5) Enterprise TLS Tunnel                      (maps to 4e)"
+  ui_print "     Conservative TLS-oriented profile for strict enterprise paths."
+  ui_print "  6) Advanced Builder                           (custom)"
+  ui_print "     Manually choose carrier and behavior overlays."
+  while true; do
+    case "$(read_input "Profile number" "1")" in
+      1) WIZARD_PROFILE_NAME="Balanced UDP/QUIC"; WIZARD_PROFILE_DESC="Low-latency + high-throughput baseline"; echo "4d"; return 0 ;;
+      2) WIZARD_PROFILE_NAME="Fronted XHTTP + ECH + Vision"; WIZARD_PROFILE_DESC="Censorship-resistant fronted TLS profile"; echo "4a"; return 0 ;;
+      3) WIZARD_PROFILE_NAME="RawTCP Camouflage"; WIZARD_PROFILE_DESC="RawTCP/faketcp-style profile"; echo "4b"; return 0 ;;
+      4) WIZARD_PROFILE_NAME="TLS Look-Alike + Vision"; WIZARD_PROFILE_DESC="REALITY/ShadowTLS-like profile"; echo "4c"; return 0 ;;
+      5) WIZARD_PROFILE_NAME="Enterprise TLS Tunnel"; WIZARD_PROFILE_DESC="TrustTunnel/CSTP-like profile"; echo "4e"; return 0 ;;
+      6) WIZARD_PROFILE_NAME="Advanced Builder"; WIZARD_PROFILE_DESC="Manual carrier + overlays"; echo "custom"; return 0 ;;
+      *) ui_print "${C_YELLOW}Invalid profile choice. Please select 1-6.${C_RESET}" ;;
+    esac
+  done
 }
 
 wizard_carrier(){
@@ -324,16 +354,49 @@ wizard_carrier(){
   case "${variant}" in
     4a) echo "xhttp";; 4b) echo "rawtcp";; 4c) echo "xhttp";; 4d) echo "quic";; 4e) echo "trusttunnel";;
     custom)
-      ui_print "Carrier: 1)quic 2)xhttp 3)rawtcp 4)faketcp 5)masque 6)trusttunnel"
-      case "$(read_input "Carrier" "1")" in 2) echo "xhttp";; 3) echo "rawtcp";; 4) echo "faketcp";; 5) echo "masque";; 6) echo "trusttunnel";; *) echo "quic";; esac ;;
+      ui_section "Advanced Carrier Selection"
+      ui_print "  1) quic        - fast UDP-based baseline"
+      ui_print "  2) xhttp       - HTTP-style tunnel carrier"
+      ui_print "  3) rawtcp      - raw packet TCP camouflage"
+      ui_print "  4) faketcp     - fake TCP behavior over raw path"
+      ui_print "  5) masque      - connect-udp / MASQUE-like profile"
+      ui_print "  6) trusttunnel - TLS/HTTP tunnel carrier"
+      while true; do
+        case "$(read_input "Carrier number" "1")" in
+          1) echo "quic"; return 0 ;;
+          2) echo "xhttp"; return 0 ;;
+          3) echo "rawtcp"; return 0 ;;
+          4) echo "faketcp"; return 0 ;;
+          5) echo "masque"; return 0 ;;
+          6) echo "trusttunnel"; return 0 ;;
+          *) ui_print "${C_YELLOW}Invalid carrier choice. Please select 1-6.${C_RESET}" ;;
+        esac
+      done ;;
     *) echo "quic" ;;
   esac
 }
 
-wizard_connectivity(){ ui_print "Model: 1) Agent dials Gateway  2) Reverse-connect"; [[ "$(read_input "Select" "1")" == "2" ]] && echo reverse || echo normal; }
+wizard_connectivity(){
+  ui_section "Connectivity Model"
+  ui_print "  1) Agent -> Gateway (classic)"
+  ui_print "     Agent dials gateway listener."
+  ui_print "  2) Reverse-connect"
+  ui_print "     Gateway dials agent-side listener (useful behind NAT/firewalls)."
+  while true; do
+    case "$(read_input "Model number" "1")" in
+      1) echo normal; return 0 ;;
+      2) echo reverse; return 0 ;;
+      *) ui_print "${C_YELLOW}Invalid model choice. Please select 1-2.${C_RESET}" ;;
+    esac
+  done
+}
 
 wizard_overlays(){
-  ui_print "Overlays (space-separated numbers): 1)ech 2)reality 3)shadowtls 4)tlsfrag 5)obfs4 6)awg 7)none"
+  ui_section "Optional Behavior Overlays"
+  ui_print "Space-separated numbers (example: 1 4 6), or 7 for none:"
+  ui_print "  1) ech       2) reality   3) shadowtls"
+  ui_print "  4) tlsfrag   5) obfs4     6) awg"
+  ui_print "  7) none"
   local s o=""; s=$(read_input "Select" "7")
   for n in ${s}; do case "$n" in 1)o+="ech ";;2)o+="reality ";;3)o+="shadowtls ";;4)o+="tlsfrag ";;5)o+="obfs4 ";;6)o+="awg ";; esac; done
   printf "%s" "${o}"
@@ -344,15 +407,21 @@ generate_behavior_yaml(){ local overlays="$1" yaml=""; local o; for o in ${overl
 wizard_pair(){
   local mode="${1:-pair}"
   ensure_dirs
-  local variant carrier connectivity shared_key gw_listen gw_addr agent_id iface mtu gw_vip agent_vip gw_peer agent_peer
+  ui_section "StealthLink Configuration Wizard"
+  ui_print "Target output: ${mode} (gateway, agent, or pair)"
+  local variant profile_name profile_desc carrier connectivity shared_key gw_listen gw_addr agent_id iface mtu gw_vip agent_vip gw_peer agent_peer
   variant="$(wizard_variant)"
+  profile_name="${WIZARD_PROFILE_NAME:-Custom}"
+  profile_desc="${WIZARD_PROFILE_DESC:-}"
   carrier="$(wizard_carrier "${variant}")"
   connectivity="$(wizard_connectivity)"
+  ui_section "Security"
   if read_yesno "Generate new shared key?" "y"; then shared_key="$(gen_secret)"; else shared_key="$(read_password "Shared key")"; fi
-  gw_listen="$(read_input "Gateway listen" "0.0.0.0:8443")"
-  gw_addr="$(read_input "Gateway public address" "127.0.0.1:8443")"
+  ui_section "Endpoint and Tunnel Parameters"
+  gw_listen="$(read_input "Gateway listen address" "0.0.0.0:8443")"
+  gw_addr="$(read_input "Gateway public address (for agent)" "127.0.0.1:8443")"
   agent_id="$(read_input "Agent ID" "agent-1")"
-  iface="$(read_input "TUN interface" "sl0")"
+  iface="$(read_input "Virtual interface name" "sl0")"
   mtu="$(read_input "MTU" "1400")"
   gw_vip="$(read_input "Gateway virtual IP (CIDR)" "10.77.0.1/30")"
   agent_vip="$(read_input "Agent virtual IP (CIDR)" "10.77.0.2/30")"
@@ -361,6 +430,7 @@ wizard_pair(){
   local reverse_enabled="false" reverse_auth=""
   if [[ "${connectivity}" == "reverse" ]]; then reverse_enabled="true"; reverse_auth="$(gen_token)"; fi
   local warp_enabled="false" warp_required="true"
+  ui_section "Underlay and Obfuscation"
   if read_yesno "Enable WARP underlay?" "n"; then warp_enabled="true"; read_yesno "WARP required/fail-closed?" "y" || warp_required="false"; fi
 
   local overlays="" behavior_yaml=""
@@ -381,12 +451,25 @@ wizard_pair(){
   local agent_cfg="# StealthLink Agent\nrole: agent\nvariant: \"${variant}\"\nagent:\n  id: \"${agent_id}\"\n  gateway_addr: \"${gw_addr}\"\n  reconnect_backoff: \"3s\"\n${transport_yaml}${dialer_yaml}security:\n  shared_key: \"${shared_key}\"\nvpn:\n  enabled: true\n  mode: tun\n  name: \"${iface}\"\n  interface_ip: \"${agent_vip}\"\n  peer_ip: \"${agent_peer}\"\n  mtu: ${mtu}\nmetrics:\n  listen: \"127.0.0.1:9092\"\n${warp_yaml}"
 
   local key_hash; key_hash="$(sha256_text "${shared_key}")"
+  ui_section "Configuration Summary"
+  ui_print "Profile:      ${profile_name} (${variant})"
+  [[ -n "${profile_desc}" ]] && ui_print "Description:  ${profile_desc}"
+  ui_print "Carrier:      ${carrier}"
+  ui_print "Connectivity: ${connectivity}"
+  ui_print "Gateway VIP:  ${gw_vip}"
+  ui_print "Agent VIP:    ${agent_vip}"
+  ui_print "WARP:         ${warp_enabled} (required=${warp_required})"
+  if ! read_yesno "Write configuration files now?" "y"; then
+    log_w "Skipped writing configuration files."
+    return 0
+  fi
   case "${mode}" in gateway) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; log_ok "Wrote ${GATEWAY_CFG}";; agent) write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${AGENT_CFG}";; *) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${GATEWAY_CFG} and ${AGENT_CFG}";; esac
 
   cat >"${LIB_DIR}/pairing.txt" <<TXT
 StealthLink Pairing Information
 Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
+Profile: ${profile_name}
 Variant: ${variant}
 Carrier: ${carrier}
 Connectivity: ${connectivity}
@@ -803,11 +886,12 @@ main_menu(){
 }
 
 usage(){
-  cat <<'USAGE'
-stealthlink-ctl v5.0.0
+  cat <<USAGE
+stealthlink-ctl v${SCRIPT_VERSION}
 
 Usage:
   stealthlink-ctl
+  stealthlink-ctl setup
   stealthlink-ctl install [--bundle PATH] [--role gateway|agent|both] [--offline]
   stealthlink-ctl wizard gateway|agent|pair
   stealthlink-ctl deps install|check [--offline]
@@ -923,15 +1007,60 @@ main(){
     setup)
       shift
       require_root setup
-      local bundle=""
+      ui_section "One-shot Guided Setup"
+      ui_print "This flow installs from your local bundle, configures tunnel, and starts services."
+      local bundle="" role="both" offline=0 wizard_target="pair" tune_profile="balanced"
       bundle=$(read_input "Bundle path (ZIP or directory)" "")
-      install_binaries "${bundle}" both 0
-      wizard_pair pair
+      role=$(select_menu "This host role" "gateway" "Gateway host" "agent" "Agent host" "both" "Generate both roles")
+      read_yesno "Offline mode (skip package install)?" "n" && offline=1
+
+      ui_section "Step 1/6: Install / Upgrade"
+      install_binaries "${bundle}" "${role}" "${offline}"
+
+      ui_section "Step 2/6: Configure Wizard"
+      case "${role}" in
+        gateway) wizard_target="gateway" ;;
+        agent) wizard_target="agent" ;;
+        both) wizard_target="pair" ;;
+      esac
+      if [[ "${role}" != "both" ]] && read_yesno "Also generate both configs on this host?" "n"; then wizard_target="pair"; fi
+      wizard_pair "${wizard_target}"
+
+      ui_section "Step 3/6: Network & VPN Setup"
       network_setup
-      apply_tuning balanced
-      apply_firewall_role gateway auto
-      service_op gateway enable || true
-      service_op gateway start || true
+
+      ui_section "Step 4/6: Host Tuning"
+      tune_profile=$(select_menu "Tuning profile" \
+        "balanced" "Balanced (recommended)" \
+        "latency" "Lower latency" \
+        "throughput" "Higher throughput" \
+        "skip" "Skip tuning")
+      [[ "${tune_profile}" != "skip" ]] && apply_tuning "${tune_profile}"
+
+      ui_section "Step 5/6: Firewall"
+      if read_yesno "Apply firewall rules now?" "y"; then
+        [[ "${role}" == "gateway" || "${role}" == "both" ]] && apply_firewall_role gateway auto
+        [[ "${role}" == "agent" || "${role}" == "both" ]] && apply_firewall_role agent auto
+      fi
+
+      ui_section "Step 6/6: Enable + Start Services"
+      if [[ "${role}" == "gateway" || "${role}" == "both" ]]; then
+        if read_yesno "Enable/start gateway service?" "y"; then
+          service_op gateway enable || true
+          service_op gateway restart || service_op gateway start || true
+        fi
+      fi
+      if [[ "${role}" == "agent" || "${role}" == "both" ]]; then
+        if read_yesno "Enable/start agent service?" "y"; then
+          service_op agent enable || true
+          service_op agent restart || service_op agent start || true
+        fi
+      fi
+
+      ui_section "Setup Complete"
+      ui_print "Configs: ${GATEWAY_CFG} ${AGENT_CFG}"
+      ui_print "Pairing note: ${LIB_DIR}/pairing.txt"
+      ui_print "Check services: stealthlink-ctl service gateway status | stealthlink-ctl service agent status"
       log_ok "One-shot setup completed" ;;
     secret) gen_secret ;;
     *) usage; die "Unknown command: ${cmd}" ;;
