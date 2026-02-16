@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,13 +27,13 @@ func TestRuntimeDialerListenerRoundTrip(t *testing.T) {
 	serverCfg := &config.Config{}
 	serverCfg.Role = "gateway"
 	serverCfg.Transport.Type = "uqsp"
-	serverCfg.Variant = "4d"
+	serverCfg.Variant = "UDP+"
 	serverCfg.Transport.UQSP.Carrier.Type = "quic"
 
 	clientCfg := &config.Config{}
 	clientCfg.Role = "agent"
 	clientCfg.Transport.Type = "uqsp"
-	clientCfg.Variant = "4d"
+	clientCfg.Variant = "UDP+"
 	clientCfg.Transport.UQSP.Carrier.Type = "quic"
 
 	smuxCfg := smux.DefaultConfig()
@@ -131,12 +132,96 @@ func TestRuntimeListenerRejectsClientOnlyCarrierForGateway(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Role = "gateway"
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4a"
+	cfg.Variant = "HTTP+"
 	cfg.Transport.UQSP.Carrier.Type = "xhttp" // dial-only carrier
 
 	_, err := NewRuntimeListener("127.0.0.1:0", cfg, serverTLS, smux.DefaultConfig(), "shared-token")
 	if err == nil {
 		t.Fatal("expected NewRuntimeListener() to fail for gateway + xhttp without reverse")
+	}
+}
+
+func TestRuntimeDialerMaxConcurrentDialsConfig(t *testing.T) {
+	_, clientTLS := runtimeTLSConfigPair(t)
+
+	cfg := &config.Config{}
+	cfg.Role = "agent"
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = "UDP+"
+	cfg.Transport.UQSP.Carrier.Type = "quic"
+	cfg.Transport.UQSP.Runtime.MaxConcurrentDials = 7
+
+	dialer, err := NewRuntimeDialer(cfg, clientTLS, smux.DefaultConfig(), "shared-token")
+	if err != nil {
+		t.Fatalf("NewRuntimeDialer() error = %v", err)
+	}
+
+	if dialer.dialSem == nil {
+		t.Fatal("expected dial semaphore to be initialized")
+	}
+	if got := cap(dialer.dialSem); got != 7 {
+		t.Fatalf("expected dial semaphore capacity 7, got %d", got)
+	}
+}
+
+func TestRuntimeDialer_DialConcurrencyNotSerialized(t *testing.T) {
+	const (
+		workers      = 20
+		sleepPerDial = 100 * time.Millisecond
+		maxWall      = 600 * time.Millisecond
+	)
+
+	smuxCfg := smux.DefaultConfig()
+	smuxCfg.KeepAliveDisabled = true
+
+	rd := &RuntimeDialer{
+		variant: VariantUDP,
+		smuxCfg: smuxCfg,
+		dialSem: make(chan struct{}, workers),
+		dialFn: func(ctx context.Context, addr string) (net.Conn, error) {
+			select {
+			case <-time.After(sleepPerDial):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			c1, c2 := net.Pipe()
+			go func() {
+				_, _ = io.Copy(io.Discard, c2)
+				_ = c2.Close()
+			}()
+			return c1, nil
+		},
+	}
+
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			sess, err := rd.dialOne(ctx, "ignored")
+			if err == nil {
+				_ = sess.Close()
+			}
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("dialOne error: %v", err)
+		}
+	}
+
+	elapsed := time.Since(start)
+	if elapsed > maxWall {
+		t.Fatalf("expected parallel dialing (wall<=%v), got %v", maxWall, elapsed)
 	}
 }
 

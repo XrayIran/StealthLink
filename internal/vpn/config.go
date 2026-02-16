@@ -1,9 +1,9 @@
 package vpn
 
-// Config holds VPN configuration for TUN/TAP mode.
+// Config holds VPN configuration for TUN (L3) mode.
 type Config struct {
 	Enabled     bool     `yaml:"enabled"`
-	Mode        string   `yaml:"mode"`         // "tun" or "tap"
+	Mode        string   `yaml:"mode"`         // "tun" (only)
 	Name        string   `yaml:"name"`         // Interface name (e.g., "stealth0")
 	InterfaceIP string   `yaml:"interface_ip"` // Local IP with CIDR (e.g., "10.0.0.1/24")
 	PeerIP      string   `yaml:"peer_ip"`      // Remote peer IP (optional, for point-to-point)
@@ -46,7 +46,11 @@ func (c *Config) Validate() error {
 		return nil
 	}
 
-	if c.Mode != "tun" && c.Mode != "tap" {
+	// L3-only: reject TAP.
+	if c.Mode == "" {
+		c.Mode = "tun"
+	}
+	if c.Mode != "tun" {
 		return ErrInvalidMode
 	}
 

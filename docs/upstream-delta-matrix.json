@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-02-14T19:31:57Z",
+  "generated_at": "2026-02-16T01:51:34Z",
   "rule_version": 2,
   "statuses": [
     "integrated",
@@ -11,8 +11,8 @@
     {
       "upstream": "6TO4-GRE-IPIP-SIT",
       "mode_stack": "underlay-tunneling",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/6TO4-GRE-IPIP-SIT",
       "destinations": [
@@ -34,21 +34,22 @@
     },
     {
       "upstream": "EasyTier",
-      "mode_stack": "l2-mesh",
-      "status": "out_of_scope_l3",
-      "base_status": "out_of_scope_l3",
+      "mode_stack": "l3-path-policy",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/EasyTier",
       "destinations": [
-        "internal/transport/taptun"
+        "internal/transport/underlay/path_policy_dialer.go",
+        "internal/transport/racing"
       ],
       "missing_destinations": []
     },
     {
       "upstream": "FRP_Reverse_Loadbalance",
       "mode_stack": "reverse-orchestration",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/FRP_Reverse_Loadbalance",
       "destinations": [
@@ -61,7 +62,7 @@
       "mode_stack": "l2-tap",
       "status": "out_of_scope_l3",
       "base_status": "out_of_scope_l3",
-      "source_exists": true,
+      "source_exists": false,
       "source_path": "sources/Layer2_TapTunnel",
       "destinations": [
         "internal/transport/taptun"
@@ -70,7 +71,7 @@
     },
     {
       "upstream": "TrustTunnel",
-      "mode_stack": "4e-trusttunnel",
+      "mode_stack": "TLS-trusttunnel",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
@@ -88,7 +89,6 @@
       "source_exists": true,
       "source_path": "sources/Tunnel",
       "destinations": [
-        "internal/transport/reverse",
         "internal/transport/uqsp/reverse.go"
       ],
       "missing_destinations": []
@@ -96,8 +96,8 @@
     {
       "upstream": "VPS-Optimizer",
       "mode_stack": "ops-tuning",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/VPS-Optimizer",
       "destinations": [
@@ -108,8 +108,8 @@
     {
       "upstream": "VornaTunnel",
       "mode_stack": "carrier-experiments",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/VornaTunnel",
       "destinations": [
@@ -155,7 +155,7 @@
     },
     {
       "upstream": "Xray-core",
-      "mode_stack": "4a-4c-xhttp-reality",
+      "mode_stack": "HTTP+-TLS+-xhttp-reality",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
@@ -181,7 +181,7 @@
     },
     {
       "upstream": "anytls-go",
-      "mode_stack": "4c-4e-anytls",
+      "mode_stack": "TLS+-TLS-anytls",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
@@ -199,15 +199,16 @@
       "source_exists": true,
       "source_path": "sources/conjure",
       "destinations": [
-        "internal/transport/conjure"
+        "internal/transport/phantom",
+        "internal/transport/uqsp/behavior/domainfront.go"
       ],
       "missing_destinations": []
     },
     {
       "upstream": "dae",
       "mode_stack": "routing-policy",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/dae",
       "destinations": [
@@ -217,21 +218,22 @@
     },
     {
       "upstream": "daggerConnect",
-      "mode_stack": "anyconnect-variants",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "mode_stack": "reverse-init-ops",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/daggerConnect",
       "destinations": [
-        "internal/transport/anyconnect"
+        "internal/transport/uqsp/reverse.go",
+        "internal/transport/underlay"
       ],
       "missing_destinations": []
     },
     {
       "upstream": "gfw_resist_HTTPS_proxy",
       "mode_stack": "gfw-resist",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/gfw_resist_HTTPS_proxy",
       "destinations": [
@@ -242,8 +244,8 @@
     {
       "upstream": "gfw_resist_tcp_proxy",
       "mode_stack": "gfw-resist",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/gfw_resist_tcp_proxy",
       "destinations": [
@@ -254,8 +256,8 @@
     {
       "upstream": "gfw_resist_tls_proxy",
       "mode_stack": "gfw-resist",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/gfw_resist_tls_proxy",
       "destinations": [
@@ -266,8 +268,8 @@
     {
       "upstream": "gost",
       "mode_stack": "proxy-suite",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/gost",
       "destinations": [
@@ -278,8 +280,8 @@
     {
       "upstream": "grasshopper",
       "mode_stack": "udp-obfs",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/grasshopper",
       "destinations": [
@@ -290,8 +292,8 @@
     {
       "upstream": "haproxy",
       "mode_stack": "fronting-lb",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/haproxy",
       "destinations": [
@@ -301,7 +303,7 @@
     },
     {
       "upstream": "hysteria",
-      "mode_stack": "4d-quic",
+      "mode_stack": "UDP+-quic",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
@@ -313,9 +315,9 @@
     },
     {
       "upstream": "juicity",
-      "mode_stack": "4d-quic",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "mode_stack": "UDP+-quic",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/juicity",
       "destinations": [
@@ -351,8 +353,8 @@
     {
       "upstream": "leaf",
       "mode_stack": "routing-policy",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/leaf",
       "destinations": [
@@ -376,8 +378,8 @@
     {
       "upstream": "mihomo",
       "mode_stack": "routing-policy",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/mihomo",
       "destinations": [
@@ -387,7 +389,7 @@
     },
     {
       "upstream": "ocserv",
-      "mode_stack": "4e-cstp",
+      "mode_stack": "TLS-cstp",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
@@ -400,7 +402,7 @@
     },
     {
       "upstream": "openconnect",
-      "mode_stack": "4e-cstp",
+      "mode_stack": "TLS-cstp",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
@@ -431,28 +433,29 @@
       "source_exists": true,
       "source_path": "sources/paqet",
       "destinations": [
-        "internal/transport/rawpacket",
         "internal/transport/rawtcp"
       ],
       "missing_destinations": []
     },
     {
       "upstream": "psiphon-tunnel-core",
-      "mode_stack": "meek-fronting",
+      "mode_stack": "front-pool-scoring",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/psiphon-tunnel-core",
       "destinations": [
-        "internal/transport/psiphon"
+        "internal/tlsutil/front_pool.go",
+        "internal/transport/uqsp/carrier/tlsdial.go",
+        "internal/transport/uqsp/behavior/domainfront.go"
       ],
       "missing_destinations": []
     },
     {
       "upstream": "qtun",
-      "mode_stack": "4d-quic",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "mode_stack": "UDP+-quic",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/qtun",
       "destinations": [
@@ -463,8 +466,8 @@
     {
       "upstream": "rust-tun",
       "mode_stack": "tun-impl",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/rust-tun",
       "destinations": [
@@ -475,8 +478,8 @@
     {
       "upstream": "shadowsocks-rust",
       "mode_stack": "proxy-suite",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/shadowsocks-rust",
       "destinations": [
@@ -486,7 +489,7 @@
     },
     {
       "upstream": "sing-box",
-      "mode_stack": "4c-4e-tls-lookalike",
+      "mode_stack": "TLS+-TLS-tls-lookalike",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,
@@ -517,15 +520,17 @@
       "source_exists": true,
       "source_path": "sources/snowflake",
       "destinations": [
-        "internal/transport/snowflake"
+        "internal/transport/snowflake",
+        "internal/transport/uqsp/reverse.go",
+        "internal/transport/uqsp/rendezvous"
       ],
       "missing_destinations": []
     },
     {
       "upstream": "tuic",
-      "mode_stack": "4d-quic",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "mode_stack": "UDP+-quic",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/tuic",
       "destinations": [
@@ -536,8 +541,8 @@
     {
       "upstream": "tun2proxy",
       "mode_stack": "tun-routing",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/tun2proxy",
       "destinations": [
@@ -548,8 +553,8 @@
     {
       "upstream": "udp_tun",
       "mode_stack": "udp-obfs",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/udp_tun",
       "destinations": [
@@ -560,8 +565,8 @@
     {
       "upstream": "v2ray-core",
       "mode_stack": "compat",
-      "status": "verify_only",
-      "base_status": "verify_only",
+      "status": "integrated",
+      "base_status": "integrated",
       "source_exists": true,
       "source_path": "sources/v2ray-core",
       "destinations": [
@@ -571,7 +576,7 @@
     },
     {
       "upstream": "webtunnel",
-      "mode_stack": "4e-webtunnel",
+      "mode_stack": "TLS-webtunnel",
       "status": "integrated",
       "base_status": "integrated",
       "source_exists": true,

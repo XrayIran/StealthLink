@@ -6,7 +6,6 @@
 package outbound
 
 import (
-	_ "github.com/daeuniverse/outbound/dialer/anytls"
 	_ "github.com/daeuniverse/outbound/dialer/http"
 	_ "github.com/daeuniverse/outbound/dialer/hysteria2"
 	_ "github.com/daeuniverse/outbound/dialer/juicity"
@@ -16,7 +15,6 @@ import (
 	_ "github.com/daeuniverse/outbound/dialer/trojan"
 	_ "github.com/daeuniverse/outbound/dialer/tuic"
 	_ "github.com/daeuniverse/outbound/dialer/v2ray"
-	_ "github.com/daeuniverse/outbound/protocol/anytls"
 	_ "github.com/daeuniverse/outbound/protocol/hysteria2"
 	_ "github.com/daeuniverse/outbound/protocol/juicity"
 	_ "github.com/daeuniverse/outbound/protocol/shadowsocks"

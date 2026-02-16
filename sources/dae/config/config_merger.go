@@ -134,11 +134,7 @@ func (m *Merger) dfsMerge(entry string, fatherEntry string) (err error) {
 		switch v := include.Value.(type) {
 		case *config_parser.Param:
 			nextEntry := v.String(true, false)
-			if filepath.IsAbs(nextEntry) {
-				patterEntries = append(patterEntries, nextEntry)
-			} else {
-				patterEntries = append(patterEntries, filepath.Join(m.entryDir, nextEntry))
-			}
+			patterEntries = append(patterEntries, filepath.Join(m.entryDir, nextEntry))
 		default:
 			return fmt.Errorf("unsupported include grammar in %v: %v", entry, include.String(false, false))
 		}

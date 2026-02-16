@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+// UPSTREAM_WIRING: lyrebird
+
 func TestObfs4OverlayValidateDerivesKeypairFromSeed(t *testing.T) {
 	seed := make([]byte, 32)
 	for i := range seed {
@@ -127,5 +129,46 @@ func TestDeriveKeysReturns64Bytes(t *testing.T) {
 	keys := deriveKeys(shared, clientPub, serverPub)
 	if len(keys) != 64 {
 		t.Fatalf("deriveKeys length = %d, want 64", len(keys))
+	}
+}
+
+func TestObfs4OverlayValidateRejectsInvalidIATMode(t *testing.T) {
+	seed := make([]byte, 32)
+	ov := &Obfs4Overlay{
+		EnabledField: true,
+		Seed:         base64.StdEncoding.EncodeToString(seed),
+		IATMode:      99,
+	}
+	if err := ov.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestObfs4OverlayValidateRejectsInvalidPublicKeyBase64(t *testing.T) {
+	ov := &Obfs4Overlay{
+		EnabledField: true,
+		PublicKey:    "!!!not-base64!!!",
+	}
+	if err := ov.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestObfs4OverlayValidateRejectsMissingKeyMaterial(t *testing.T) {
+	ov := &Obfs4Overlay{EnabledField: true}
+	if err := ov.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestObfs4OverlayValidateRejectsServerModeWithoutPrivateKeyOrSeed(t *testing.T) {
+	pk := make([]byte, 32)
+	ov := &Obfs4Overlay{
+		EnabledField: true,
+		ServerMode:   true,
+		PublicKey:    base64.StdEncoding.EncodeToString(pk),
+	}
+	if err := ov.Validate(); err == nil {
+		t.Fatal("expected error")
 	}
 }

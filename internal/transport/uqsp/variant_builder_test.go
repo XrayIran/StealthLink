@@ -107,7 +107,7 @@ func TestVariantBuilder4AIncludesGFWResistTLS(t *testing.T) {
 		t.Fatalf("build variant: %v", err)
 	}
 	if !containsOverlay(proto.variant.Behaviors, "gfwresist_tls") {
-		t.Fatalf("expected gfwresist_tls overlay in 4a")
+		t.Fatalf("expected gfwresist_tls overlay in HTTP+")
 	}
 }
 
@@ -125,7 +125,7 @@ func TestVariantBuilder4BIncludesGFWResistTCP(t *testing.T) {
 		t.Fatalf("build variant: %v", err)
 	}
 	if !containsOverlay(proto.variant.Behaviors, "gfwresist_tcp") {
-		t.Fatalf("expected gfwresist_tcp overlay in 4b")
+		t.Fatalf("expected gfwresist_tcp overlay in TCP+")
 	}
 }
 
@@ -149,13 +149,13 @@ func TestVariantBuilder4CComposesMultipleTLSLookAlikes(t *testing.T) {
 		t.Fatalf("build variant: %v", err)
 	}
 	if !containsOverlay(proto.variant.Behaviors, "reality") {
-		t.Fatalf("expected reality overlay in 4c")
+		t.Fatalf("expected reality overlay in TLS+")
 	}
 	if !containsOverlay(proto.variant.Behaviors, "shadowtls") {
-		t.Fatalf("expected shadowtls overlay in 4c")
+		t.Fatalf("expected shadowtls overlay in TLS+")
 	}
 	if !containsOverlay(proto.variant.Behaviors, "tlsmirror") {
-		t.Fatalf("expected tlsmirror overlay in 4c")
+		t.Fatalf("expected tlsmirror overlay in TLS+")
 	}
 }
 
@@ -201,14 +201,14 @@ func TestBuildVariantForRoleRejectsDefault4AForGatewayWithoutReverse(t *testing.
 	cfg := &config.Config{}
 	cfg.Role = "gateway"
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4a" // default carrier resolves to xhttp (dial-only)
+	cfg.Variant = config.VariantHTTPPlus // default carrier resolves to xhttp (dial-only)
 
 	_, _, err := BuildVariantForRole(cfg, &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"uqsp-test"},
 	}, smux.DefaultConfig(), "token")
 	if err == nil {
-		t.Fatal("expected error for gateway 4a without reverse mode")
+		t.Fatal("expected error for gateway HTTP+ without reverse mode")
 	}
 }
 
@@ -216,7 +216,7 @@ func TestBuildVariantForRoleAllowsGateway4AWithReverse(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Role = "gateway"
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4a"
+	cfg.Variant = config.VariantHTTPPlus
 	cfg.Transport.UQSP.Reverse.Enabled = true
 	cfg.Transport.UQSP.Reverse.Role = "listener"
 	cfg.Transport.UQSP.Reverse.ServerAddress = "127.0.0.1:0"
@@ -226,7 +226,7 @@ func TestBuildVariantForRoleAllowsGateway4AWithReverse(t *testing.T) {
 		NextProtos:         []string{"uqsp-test"},
 	}, smux.DefaultConfig(), "token")
 	if err != nil {
-		t.Fatalf("expected reverse-enabled gateway 4a to build, got error: %v", err)
+		t.Fatalf("expected reverse-enabled gateway HTTP+ to build, got error: %v", err)
 	}
 	if proto == nil {
 		t.Fatal("expected protocol, got nil")
@@ -252,10 +252,10 @@ func TestVariantBuilder4EIncludesCSTPAndTLSFrag(t *testing.T) {
 		t.Fatalf("build variant: %v", err)
 	}
 	if !containsOverlay(proto.variant.Behaviors, "cstp") {
-		t.Fatalf("expected cstp overlay in 4e")
+		t.Fatalf("expected cstp overlay in TLS")
 	}
 	if !containsOverlay(proto.variant.Behaviors, "tlsfrag") {
-		t.Fatalf("expected tlsfrag overlay in 4e")
+		t.Fatalf("expected tlsfrag overlay in TLS")
 	}
 }
 
@@ -273,7 +273,7 @@ func TestVariantBuilder4EDefaultsToTrustTunnelCarrier(t *testing.T) {
 		t.Fatalf("build variant: %v", err)
 	}
 	if proto == nil || proto.variant.Carrier == nil {
-		t.Fatalf("variant 4e resolved to nil protocol or carrier")
+		t.Fatalf("variant TLS resolved to nil protocol or carrier")
 	}
 }
 
@@ -300,11 +300,11 @@ func TestVariantBuilderPerModePolicyOverrides(t *testing.T) {
 		variant ProtocolVariant
 		key     string
 	}{
-		{name: "4a", variant: VariantXHTTP_TLS, key: "4a"},
-		{name: "4b", variant: VariantRawTCP, key: "4b"},
-		{name: "4c", variant: VariantTLSMirror, key: "4c"},
-		{name: "4d", variant: VariantUDP, key: "4d"},
-		{name: "4e", variant: VariantTrust, key: "4e"},
+		{name: config.VariantHTTPPlus, variant: VariantXHTTP_TLS, key: config.VariantHTTPPlus},
+		{name: config.VariantTCPPlus, variant: VariantRawTCP, key: config.VariantTCPPlus},
+		{name: config.VariantTLSPlus, variant: VariantTLSMirror, key: config.VariantTLSPlus},
+		{name: config.VariantUDPPlus, variant: VariantUDP, key: config.VariantUDPPlus},
+		{name: config.VariantTLS, variant: VariantTrust, key: config.VariantTLS},
 	}
 
 	t.Run("disable specific mode when global enabled", func(t *testing.T) {
@@ -361,7 +361,7 @@ func TestVariantBuilderPerModePolicyOverrides(t *testing.T) {
 					t.Fatalf("expected reverse mode to be configured for %s", tc.name)
 				}
 
-				// 4a/4e should opt into HTTP registration in reverse mode.
+				// HTTP+/TLS should opt into HTTP registration in reverse mode.
 				expectHTTPReg := tc.variant == VariantXHTTP_TLS || tc.variant == VariantTrust
 				if proto.variant.ReverseMode.UseHTTPRegistration != expectHTTPReg {
 					t.Fatalf("reverse HTTP registration mismatch for %s: got=%v want=%v",
@@ -377,11 +377,11 @@ func TestVariantPolicyKeysMatchAllKnownVariants(t *testing.T) {
 		variant ProtocolVariant
 		wantKey string
 	}{
-		{VariantXHTTP_TLS, "4a"},
-		{VariantRawTCP, "4b"},
-		{VariantTLSMirror, "4c"},
-		{VariantUDP, "4d"},
-		{VariantTrust, "4e"},
+		{VariantXHTTP_TLS, config.VariantHTTPPlus},
+		{VariantRawTCP, config.VariantTCPPlus},
+		{VariantTLSMirror, config.VariantTLSPlus},
+		{VariantUDP, config.VariantUDPPlus},
+		{VariantTrust, config.VariantTLS},
 	}
 	for _, tc := range cases {
 		if got := variantPolicyKey(tc.variant); got != tc.wantKey {

@@ -20,6 +20,7 @@ latest_zip="$(ls -1t dist/stealthlink-*.zip 2>/dev/null | head -1 || true)"
 
 assets_dir="dist/release-assets"
 mkdir -p "${assets_dir}"
+find "${assets_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 cp -f "${latest_zip}" "${assets_dir}/"
 cp -f "scripts/stealthlink-ctl" "${assets_dir}/stealthlink-ctl"
 chmod 0755 "${assets_dir}/stealthlink-ctl"
@@ -42,6 +43,8 @@ with (assets / "SHA256SUMS").open("w", encoding="utf-8") as out:
         out.write(f"{h.hexdigest()}  {rel}\n")
 PY
 fi
+
+./scripts/release-assets-preflight.sh --assets-dir "${assets_dir}"
 
 echo "Release assets ready in ${assets_dir}:"
 echo "  - $(basename "${latest_zip}")"

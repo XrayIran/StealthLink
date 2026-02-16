@@ -9,8 +9,8 @@ agent:
   gateway_addr: gateway.example.com:443
 
 transport:
-  type: stealth
-  mode: "4a"  # XHTTP + Domain Fronting
+  type: uqsp
+  mode: "HTTP+"  # XHTTP + Domain Fronting
   
   # Underlay dialer configuration
   dialer: warp  # Route through Cloudflare WARP
@@ -20,13 +20,12 @@ transport:
     mode: consumer  # "consumer" | "zero-trust" | "connector"
     device_id: ""   # Optional: pre-registered device ID
   
-  stealth:
+  uqsp:
     carrier:
-      kind: tcp
-    camouflage:
-      mode: tls
-      tls:
-        server_name: gateway.example.com
+      type: xhttp
+    behaviors:
+      ech:
+        enabled: true
 
 # WARP configuration (global)
 warp:

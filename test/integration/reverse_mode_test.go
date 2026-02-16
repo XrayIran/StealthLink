@@ -13,6 +13,8 @@ import (
 	uqsp "stealthlink/internal/transport/uqsp"
 )
 
+// UPSTREAM_WIRING: Tunnel
+
 func TestReverseDialerServerInitiatedConnection(t *testing.T) {
 	testReverseDialerServerInitiatedConnection(t, false)
 }
@@ -66,7 +68,7 @@ func testReverseDialerServerInitiatedConnection(t *testing.T, useHTTPRegistratio
 			reader = br
 		}
 
-		got, err := readReverseAuthToken(reader)
+		got, err := readReverseAuthToken(reader, len(token))
 		if err != nil {
 			serverDone <- err
 			return
@@ -129,9 +131,30 @@ func testReverseDialerServerInitiatedConnection(t *testing.T, useHTTPRegistratio
 	}
 }
 
-func readReverseAuthToken(r io.Reader) (string, error) {
+func readReverseAuthToken(r io.Reader, tokenLen int) (string, error) {
+	var first [1]byte
+	if _, err := io.ReadFull(r, first[:]); err != nil {
+		return "", err
+	}
+
+	if first[0] == 1 {
+		var headerTail [8 + 16]byte
+		if _, err := io.ReadFull(r, headerTail[:]); err != nil {
+			return "", err
+		}
+		if tokenLen < 0 || tokenLen > 4096 {
+			return "", io.ErrUnexpectedEOF
+		}
+		token := make([]byte, tokenLen)
+		if _, err := io.ReadFull(r, token); err != nil {
+			return "", err
+		}
+		return string(token), nil
+	}
+
 	var lengthBuf [4]byte
-	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
+	lengthBuf[0] = first[0]
+	if _, err := io.ReadFull(r, lengthBuf[1:]); err != nil {
 		return "", err
 	}
 	length := binary.BigEndian.Uint32(lengthBuf[:])

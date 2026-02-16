@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -20,14 +21,30 @@ type UQSPConfig struct {
 	Behaviors   UQSPBehaviorConfig    `yaml:"behaviors"`
 	Reverse     UQSPReverseConfig     `yaml:"reverse"`
 	Runtime     UQSPRuntimeConfig     `yaml:"runtime"`
+	PathPolicy  UQSPPathPolicyConfig  `yaml:"path_policy"`
 	// VariantProfile is an optional in-transport preset selector.
 	// Top-level "variant" remains the primary selector.
 	VariantProfile string `yaml:"variant_profile"`
 
 	// VariantPolicy allows per-mode overrides for WARP and reverse.
-	// Keys are variant names: "4a", "4b", "4c", "4d", "4e".
+	// Keys are variant names: "HTTP+", "TCP+", "TLS+", "UDP+", "TLS".
 	// A nil or missing entry means "use global config".
 	VariantPolicy map[string]UQSPVariantPolicy `yaml:"variant_policy"`
+}
+
+// UQSPPathPolicyConfig configures EasyTier-inspired L3 path selection for a point-to-point tunnel.
+// It selects the best available underlay (direct vs WARP) for the current carrier and re-races on failures.
+type UQSPPathPolicyConfig struct {
+	Mode             string              `yaml:"mode"` // off | race | sticky_race
+	Candidates       []UQSPPathCandidate `yaml:"candidates"`
+	ProbeInterval    time.Duration       `yaml:"probe_interval"`
+	FailureThreshold int                 `yaml:"failure_threshold"`
+	Cooldown         time.Duration       `yaml:"cooldown"`
+}
+
+type UQSPPathCandidate struct {
+	Underlay string `yaml:"underlay"` // direct | warp
+	Carrier  string `yaml:"carrier"`  // reserved for future underlay+carrier combo selection
 }
 
 // UQSPVariantPolicy holds per-variant overrides for WARP and reverse mode.
@@ -118,6 +135,8 @@ type UQSPRuntimeConfig struct {
 	// - "unified" (default): BuildVariantForRole -> UnifiedProtocol runtime
 	// - "legacy": historical NewDialer/NewListener path
 	Mode string `yaml:"mode"`
+	// MaxConcurrentDials limits concurrent outbound runtime dial attempts.
+	MaxConcurrentDials int `yaml:"max_concurrent_dials"`
 }
 
 // ApplyUQSPDefaults applies default values to UQSP configuration.
@@ -267,6 +286,9 @@ func (c *Config) ApplyUQSPDefaults() {
 	if u.Reverse.KeepaliveInterval == 0 {
 		u.Reverse.KeepaliveInterval = 30 * time.Second
 	}
+	if u.Reverse.Rendezvous.UTLSFingerprint == "" {
+		u.Reverse.Rendezvous.UTLSFingerprint = "chrome_auto"
+	}
 
 	// Behavior defaults
 	// AWG's special-junk packets are optional by default for compatibility
@@ -369,6 +391,23 @@ func (c *Config) ApplyUQSPDefaults() {
 	if strings.TrimSpace(u.Runtime.Mode) == "" {
 		u.Runtime.Mode = "unified"
 	}
+	if u.Runtime.MaxConcurrentDials <= 0 {
+		u.Runtime.MaxConcurrentDials = 16
+	}
+
+	// Path policy defaults
+	if strings.TrimSpace(u.PathPolicy.Mode) == "" {
+		u.PathPolicy.Mode = "off"
+	}
+	if u.PathPolicy.ProbeInterval == 0 {
+		u.PathPolicy.ProbeInterval = 30 * time.Second
+	}
+	if u.PathPolicy.FailureThreshold == 0 {
+		u.PathPolicy.FailureThreshold = 3
+	}
+	if u.PathPolicy.Cooldown == 0 {
+		u.PathPolicy.Cooldown = 30 * time.Second
+	}
 }
 
 // ValidateUQSP validates UQSP configuration.
@@ -464,11 +503,29 @@ func (c *Config) ValidateUQSP() error {
 	default:
 		return fmt.Errorf("transport.uqsp.runtime.mode must be one of: unified, legacy")
 	}
+	if u.Runtime.MaxConcurrentDials < 1 || u.Runtime.MaxConcurrentDials > 128 {
+		return fmt.Errorf("transport.uqsp.runtime.max_concurrent_dials must be between 1 and 128")
+	}
 
 	// Validate optional in-transport variant profile selector.
 	if strings.TrimSpace(u.VariantProfile) != "" {
 		if _, ok := parseVariantValue(u.VariantProfile); !ok {
-			return fmt.Errorf("transport.uqsp.variant_profile must be one of: 4a, 4b, 4c, 4d, 4e")
+			return fmt.Errorf("transport.uqsp.variant_profile must be one of: %s", allowedVariantNamesText())
+		}
+	}
+
+	// Validate per-variant policy keys.
+	if len(u.VariantPolicy) > 0 {
+		seen := map[string]string{}
+		for key := range u.VariantPolicy {
+			canonical, ok := canonicalVariantName(key)
+			if !ok {
+				return fmt.Errorf("transport.uqsp.variant_policy key %q must be one of: %s", key, allowedVariantNamesText())
+			}
+			if prev, exists := seen[canonical]; exists && prev != key {
+				return fmt.Errorf("transport.uqsp.variant_policy has duplicate logical key %q via %q and %q", canonical, prev, key)
+			}
+			seen[canonical] = key
 		}
 	}
 
@@ -479,6 +536,14 @@ func (c *Config) ValidateUQSP() error {
 	default:
 		return fmt.Errorf("transport.uqsp.carrier.type has unsupported value %q", u.Carrier.Type)
 	}
+
+	// Validate carrier-variant compatibility when both are explicitly set.
+	// This runs before carrier-specific checks so the user gets a clear
+	// "incompatible" message rather than a confusing sub-field error.
+	if err := c.validateVariantCarrier(); err != nil {
+		return err
+	}
+
 	if carrierType == "rawtcp" {
 		u.Carrier.RawTCP.Raw.applyDefaults(c.Role)
 		if err := u.Carrier.RawTCP.Raw.validate(c.Role, c.Gateway.Listen); err != nil {
@@ -549,6 +614,38 @@ func (c *Config) ValidateUQSP() error {
 	if strings.TrimSpace(u.Carrier.XHTTP.TLSFingerprint) == "" {
 		return fmt.Errorf("transport.uqsp.carrier.xhttp.tls_fingerprint is required")
 	}
+
+	// Validate path policy (EasyTier-inspired L3 selection)
+	switch strings.ToLower(strings.TrimSpace(u.PathPolicy.Mode)) {
+	case "", "off", "race", "sticky_race":
+	default:
+		return fmt.Errorf("transport.uqsp.path_policy.mode must be one of: off, race, sticky_race")
+	}
+	if strings.ToLower(strings.TrimSpace(u.PathPolicy.Mode)) != "off" {
+		if len(u.PathPolicy.Candidates) == 0 {
+			return fmt.Errorf("transport.uqsp.path_policy.candidates is required when path_policy is enabled")
+		}
+		for i, cnd := range u.PathPolicy.Candidates {
+			switch strings.ToLower(strings.TrimSpace(cnd.Underlay)) {
+			case "direct", "warp":
+			default:
+				return fmt.Errorf("transport.uqsp.path_policy.candidates[%d].underlay must be one of: direct, warp", i)
+			}
+			// Reserved for future underlay+carrier combo selection. For now, only allow empty or the active carrier.
+			if s := strings.ToLower(strings.TrimSpace(cnd.Carrier)); s != "" && s != carrierType {
+				return fmt.Errorf("transport.uqsp.path_policy.candidates[%d].carrier must be empty or match carrier.type (%s)", i, carrierType)
+			}
+		}
+		if u.PathPolicy.FailureThreshold < 1 || u.PathPolicy.FailureThreshold > 50 {
+			return fmt.Errorf("transport.uqsp.path_policy.failure_threshold must be between 1 and 50")
+		}
+		if u.PathPolicy.ProbeInterval < 0 {
+			return fmt.Errorf("transport.uqsp.path_policy.probe_interval must be >= 0")
+		}
+		if u.PathPolicy.Cooldown < 0 {
+			return fmt.Errorf("transport.uqsp.path_policy.cooldown must be >= 0")
+		}
+	}
 	for _, metaField := range []struct {
 		name      string
 		placement string
@@ -604,6 +701,25 @@ func (c *Config) ValidateUQSP() error {
 		if u.Reverse.KeepaliveInterval <= 0 {
 			return fmt.Errorf("transport.uqsp.reverse.keepalive_interval must be > 0")
 		}
+		if u.Reverse.Rendezvous.Enabled {
+			broker := strings.TrimSpace(u.Reverse.Rendezvous.BrokerURL)
+			if broker == "" {
+				return fmt.Errorf("transport.uqsp.reverse.rendezvous.broker_url is required when rendezvous is enabled")
+			}
+			pu, err := url.Parse(broker)
+			if err != nil {
+				return fmt.Errorf("transport.uqsp.reverse.rendezvous.broker_url invalid: %w", err)
+			}
+			if pu.Scheme != "http" && pu.Scheme != "https" {
+				return fmt.Errorf("transport.uqsp.reverse.rendezvous.broker_url scheme must be http or https")
+			}
+			if strings.TrimSpace(pu.Host) == "" {
+				return fmt.Errorf("transport.uqsp.reverse.rendezvous.broker_url missing host")
+			}
+			if strings.TrimSpace(u.Reverse.Rendezvous.UTLSFingerprint) == "" {
+				return fmt.Errorf("transport.uqsp.reverse.rendezvous.utls_fingerprint must not be empty")
+			}
+		}
 	}
 
 	if u.Behaviors.ViolatedTCP.FakeHTTPEnabled {
@@ -641,6 +757,49 @@ func (c *Config) ValidateUQSP() error {
 	}
 
 	return nil
+}
+
+// validateVariantCarrier checks that the explicitly selected carrier is
+// compatible with the explicitly selected variant.  If either is unset
+// (i.e. will be resolved by defaults), the check is skipped.
+func (c *Config) validateVariantCarrier() error {
+	raw := c.selectedVariantRaw()
+	variant, ok := parseVariantValue(raw)
+	if !ok {
+		return nil // variant not explicitly set
+	}
+
+	carrier := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
+	if carrier == "" {
+		return nil // carrier not explicitly set
+	}
+
+	type rule struct {
+		code    string
+		allowed []string
+	}
+
+	rules := []rule{
+		{VariantHTTPPlus, []string{"xhttp", "quic"}},
+		{VariantTCPPlus, []string{"rawtcp", "faketcp", "icmptun"}},
+		{VariantTLSPlus, []string{"xhttp", "anytls"}},
+		{VariantUDPPlus, []string{"quic", "masque", "kcp"}},
+		{VariantTLS, []string{"trusttunnel", "webtunnel", "anytls", "chisel"}},
+	}
+
+	if variant < 0 || variant >= len(rules) {
+		return nil
+	}
+
+	r := rules[variant]
+	for _, a := range r.allowed {
+		if carrier == a {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("transport.uqsp: carrier %q is not compatible with variant %s; allowed carriers for %s: %s",
+		carrier, r.code, r.code, strings.Join(r.allowed, ", "))
 }
 
 // UQSPEnabled returns true if UQSP transport is configured.
@@ -825,15 +984,15 @@ type XHTTPCarrierConfig struct {
 
 // AnyTLSCarrierConfig configures AnyTLS as a carrier.
 type AnyTLSCarrierConfig struct {
-	Server             string   `yaml:"server"`
-	Password           string   `yaml:"password"`
-	PaddingScheme      string   `yaml:"padding_scheme"` // random | fixed | burst | adaptive or custom lines
-	PaddingMin         int      `yaml:"padding_min"`
-	PaddingMax         int      `yaml:"padding_max"`
-	PaddingLines       []string `yaml:"padding_lines"`
-	IdleSessionTimeout int      `yaml:"idle_session_timeout"` // seconds
-	TLSInsecureSkipVerify bool   `yaml:"tls_insecure_skip_verify"`
-	TLSServerName         string `yaml:"tls_server_name"`
+	Server                string   `yaml:"server"`
+	Password              string   `yaml:"password"`
+	PaddingScheme         string   `yaml:"padding_scheme"` // random | fixed | burst | adaptive or custom lines
+	PaddingMin            int      `yaml:"padding_min"`
+	PaddingMax            int      `yaml:"padding_max"`
+	PaddingLines          []string `yaml:"padding_lines"`
+	IdleSessionTimeout    int      `yaml:"idle_session_timeout"` // seconds
+	TLSInsecureSkipVerify bool     `yaml:"tls_insecure_skip_verify"`
+	TLSServerName         string   `yaml:"tls_server_name"`
 }
 
 // XHTTPMetadataConfig controls where session/sequence/mode metadata is encoded.
@@ -930,11 +1089,11 @@ type AWGMagicConfig struct {
 
 // RealityBehaviorConfig ports XTLS REALITY behaviors as an overlay.
 type RealityBehaviorConfig struct {
-	Enabled         bool     `yaml:"enabled"`
-	Dest            string   `yaml:"dest"`
-	ServerNames     []string `yaml:"server_names"`
+	Enabled           bool     `yaml:"enabled"`
+	Dest              string   `yaml:"dest"`
+	ServerNames       []string `yaml:"server_names"`
 	PrivateKey        string   `yaml:"private_key"`
-	ServerPublicKey string   `yaml:"server_public_key"`
+	ServerPublicKey   string   `yaml:"server_public_key"`
 	ShortIDs          []string `yaml:"short_ids"`
 	SpiderX           string   `yaml:"spider_x"`
 	SpiderY           []int    `yaml:"spider_y"`
@@ -979,9 +1138,19 @@ type DomainFrontBehaviorConfig struct {
 	Enabled            bool     `yaml:"enabled"`
 	FrontDomain        string   `yaml:"front_domain"`
 	RealHost           string   `yaml:"real_host"`
+	CFWorker           string   `yaml:"cf_worker"`
 	RotateIPs          bool     `yaml:"rotate_ips"`
 	CustomIPs          []string `yaml:"custom_ips"`
+	FailoverDomains    []string `yaml:"failover_domains"`
 	PreserveHostHeader bool     `yaml:"preserve_host_header"`
+	Phantom            struct {
+		Enabled        bool   `yaml:"enabled"`
+		SharedSecret   string `yaml:"shared_secret"`
+		EpochSeed      string `yaml:"epoch_seed"`
+		SubnetPrefixV4 string `yaml:"subnet_prefix_v4"`
+		SubnetPrefixV6 string `yaml:"subnet_prefix_v6"`
+		PoolSize       int    `yaml:"pool_size"`
+	} `yaml:"phantom"`
 }
 
 // TLSFragBehaviorConfig configures TLS Fragmentation as an overlay.
@@ -1016,6 +1185,18 @@ type UQSPReverseConfig struct {
 	MaxRetries        int           `yaml:"max_retries"`
 	AuthToken         string        `yaml:"auth_token"`
 	KeepaliveInterval time.Duration `yaml:"keepalive_interval"` // Keepalive interval for persistent connections
+
+	Rendezvous UQSPReverseRendezvousConfig `yaml:"rendezvous"`
+}
+
+// UQSPReverseRendezvousConfig configures an optional HTTP rendezvous broker
+// that assists reverse-init by exchanging a dialable address out-of-band.
+// It is technique-only and does not claim interop with Tor Snowflake.
+type UQSPReverseRendezvousConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	BrokerURL       string `yaml:"broker_url"`
+	FrontDomain     string `yaml:"front_domain"`
+	UTLSFingerprint string `yaml:"utls_fingerprint"`
 }
 
 type ViolatedTCPBehaviorConfig struct {
@@ -1047,7 +1228,19 @@ func (c *UQSPConfig) variantPolicyFor(variant string) UQSPVariantPolicy {
 	if c.VariantPolicy == nil {
 		return UQSPVariantPolicy{}
 	}
-	return c.VariantPolicy[strings.ToLower(strings.TrimSpace(variant))]
+	canonical, ok := canonicalVariantName(variant)
+	if !ok {
+		return UQSPVariantPolicy{}
+	}
+	if p, ok := c.VariantPolicy[canonical]; ok {
+		return p
+	}
+	for key, p := range c.VariantPolicy {
+		if k, ok := canonicalVariantName(key); ok && k == canonical {
+			return p
+		}
+	}
+	return UQSPVariantPolicy{}
 }
 
 // WARPEnabledForVariant returns whether WARP should be enabled for the given

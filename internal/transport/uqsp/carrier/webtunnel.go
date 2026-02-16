@@ -24,8 +24,8 @@ import (
 type WebTunnelCarrier struct {
 	config    WebTunnelConfig
 	smuxCfg   *smux.Config
-	client    *http.Client
-	tlsConfig *tls.Config
+	clientTLS *tls.Config
+	serverTLS *tls.Config
 }
 
 // WebTunnelConfig configures the WebTunnel carrier.
@@ -52,7 +52,7 @@ type WebTunnelConfig struct {
 }
 
 // NewWebTunnelCarrier creates a new WebTunnel carrier.
-func NewWebTunnelCarrier(cfg WebTunnelConfig, smuxCfg *smux.Config) *WebTunnelCarrier {
+func NewWebTunnelCarrier(cfg WebTunnelConfig, baseTLS *tls.Config, smuxCfg *smux.Config) *WebTunnelCarrier {
 	if cfg.Path == "" {
 		cfg.Path = "/tunnel"
 	}
@@ -63,26 +63,25 @@ func NewWebTunnelCarrier(cfg WebTunnelConfig, smuxCfg *smux.Config) *WebTunnelCa
 		cfg.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0"
 	}
 
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: cfg.TLSInsecureSkipVerify,
-		ServerName:         cfg.TLSServerName,
+	clientTLS := &tls.Config{}
+	if baseTLS != nil {
+		clientTLS = baseTLS.Clone()
+	}
+	clientTLS.InsecureSkipVerify = cfg.TLSInsecureSkipVerify
+	if strings.TrimSpace(cfg.TLSServerName) != "" {
+		clientTLS.ServerName = strings.TrimSpace(cfg.TLSServerName)
 	}
 
-	httpTransport := &http.Transport{
-		TLSClientConfig: tlsConfig,
-	}
-	httpTransport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialCarrierTLS(ctx, network, addr, tlsConfig, cfg.TLSFingerprint)
+	serverTLS := baseTLS
+	if serverTLS == nil {
+		serverTLS = &tls.Config{}
 	}
 
 	return &WebTunnelCarrier{
-		config:  cfg,
-		smuxCfg: smuxCfg,
-		client: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: httpTransport,
-		},
-		tlsConfig: tlsConfig,
+		config:    cfg,
+		smuxCfg:   smuxCfg,
+		clientTLS: clientTLS,
+		serverTLS: serverTLS,
 	}
 }
 
@@ -101,7 +100,7 @@ func (c *WebTunnelCarrier) Dial(ctx context.Context, addr string) (net.Conn, err
 // dialH1 uses HTTP/1.1 Upgrade to establish the tunnel.
 func (c *WebTunnelCarrier) dialH1(ctx context.Context, addr string) (net.Conn, error) {
 	// Connect to server
-	conn, err := dialCarrierTLS(ctx, "tcp", c.config.Server, c.tlsConfig, c.config.TLSFingerprint)
+	conn, err := dialCarrierTLS(ctx, "tcp", c.config.Server, c.clientTLS, c.config.TLSFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("tls dial: %w", err)
 	}
@@ -141,7 +140,7 @@ func (c *WebTunnelCarrier) dialH1(ctx context.Context, addr string) (net.Conn, e
 		return nil, fmt.Errorf("upgrade failed: %s", resp.Status)
 	}
 
-	if resp.Header.Get("Upgrade") != "stealthlink" {
+	if !hasUpgradeToken(resp.Header.Get("Upgrade"), "stealthlink") {
 		conn.Close()
 		return nil, fmt.Errorf("unexpected upgrade header: %s", resp.Header.Get("Upgrade"))
 	}
@@ -149,10 +148,29 @@ func (c *WebTunnelCarrier) dialH1(ctx context.Context, addr string) (net.Conn, e
 	return conn, nil
 }
 
+func hasUpgradeToken(headerValue string, want string) bool {
+	if strings.TrimSpace(headerValue) == "" {
+		return false
+	}
+	// RFC 7230 token list; be permissive about comma/space separated values.
+	for _, part := range strings.Split(headerValue, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), want) {
+			return true
+		}
+	}
+	// Some stacks may send space-separated values.
+	for _, part := range strings.Fields(headerValue) {
+		if strings.EqualFold(strings.TrimSpace(part), want) {
+			return true
+		}
+	}
+	return false
+}
+
 // dialH2 uses HTTP/2 CONNECT to establish the tunnel.
 func (c *WebTunnelCarrier) dialH2(ctx context.Context, addr string) (net.Conn, error) {
 	// Connect to server
-	conn, err := dialCarrierTLS(ctx, "tcp", c.config.Server, c.tlsConfig, c.config.TLSFingerprint)
+	conn, err := dialCarrierTLS(ctx, "tcp", c.config.Server, c.clientTLS, c.config.TLSFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("tls dial: %w", err)
 	}
@@ -452,7 +470,10 @@ func (c *WebTunnelCarrier) Network() string {
 
 // Listen creates a WebTunnel server listener.
 func (c *WebTunnelCarrier) Listen(addr string) (Listener, error) {
-	wl, err := NewWebTunnelListener(addr, c.tlsConfig, c.config.Path)
+	if c.serverTLS == nil || (len(c.serverTLS.Certificates) == 0 && c.serverTLS.GetCertificate == nil && c.serverTLS.GetConfigForClient == nil) {
+		return nil, fmt.Errorf("webtunnel listen requires a server TLS config with certificates")
+	}
+	wl, err := NewWebTunnelListener(addr, c.serverTLS, c.config.Path)
 	if err != nil {
 		return nil, fmt.Errorf("webtunnel listen: %w", err)
 	}
@@ -477,7 +498,6 @@ func (c *WebTunnelCarrier) Name() string {
 // WebTunnelListener implements a WebTunnel server listener.
 type WebTunnelListener struct {
 	listener  net.Listener
-	handler   http.Handler
 	tlsConfig *tls.Config
 	path      string
 	acceptCh  chan net.Conn
@@ -502,49 +522,140 @@ func NewWebTunnelListener(addr string, tlsConfig *tls.Config, path string) (*Web
 		acceptCh:  make(chan net.Conn, 64),
 	}
 
-	// Setup HTTP handler
-	mux := http.NewServeMux()
-	mux.HandleFunc(path, wl.handleTunnel)
-	wl.handler = mux
-
-	// Start HTTP server
-	go http.Serve(ln, wl.handler)
+	go wl.acceptLoop()
 
 	return wl, nil
 }
 
-// handleTunnel handles WebTunnel upgrade requests.
-func (l *WebTunnelListener) handleTunnel(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Upgrade") != "stealthlink" {
-		http.Error(w, "Invalid upgrade header", http.StatusBadRequest)
+func (l *WebTunnelListener) acceptLoop() {
+	for {
+		conn, err := l.listener.Accept()
+		if err != nil {
+			if l.closed {
+				return
+			}
+			continue
+		}
+		go l.handleConn(conn)
+	}
+}
+
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+func (l *WebTunnelListener) handleConn(conn net.Conn) {
+	defer func() {
+		// If we didn't hand it off, close it.
+	}()
+
+	br := bufio.NewReader(conn)
+	preface := []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	peek, err := br.Peek(len(preface))
+	_ = conn.SetReadDeadline(time.Time{})
+
+	if err == nil && bytes.Equal(peek, preface) {
+		if err := l.handleH2(conn, br); err != nil {
+			_ = conn.Close()
+		}
 		return
 	}
-
-	// Hijack the connection
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
+	if err := l.handleH1(conn, br); err != nil {
+		_ = conn.Close()
 	}
+}
 
-	conn, bufrw, err := hijacker.Hijack()
+func (l *WebTunnelListener) handleH1(conn net.Conn, br *bufio.Reader) error {
+	req, err := http.ReadRequest(br)
 	if err != nil {
-		http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
-		return
+		return err
+	}
+	defer req.Body.Close()
+	if req.URL == nil || req.URL.Path != l.path {
+		_, _ = io.WriteString(conn, "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return fmt.Errorf("invalid webtunnel path")
+	}
+	if req.Header.Get("Upgrade") != "stealthlink" {
+		_, _ = io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return fmt.Errorf("invalid upgrade header")
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: stealthlink\r\nConnection: Upgrade\r\n\r\n")
+	select {
+	case l.acceptCh <- &bufferedConn{Conn: conn, r: br}:
+		return nil
+	default:
+		return fmt.Errorf("accept queue full")
+	}
+}
+
+func (l *WebTunnelListener) handleH2(conn net.Conn, br *bufio.Reader) error {
+	// Consume client preface.
+	preface := []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+	if _, err := io.ReadFull(br, make([]byte, len(preface))); err != nil {
+		return err
 	}
 
-	// Send 101 Switching Protocols
-	fmt.Fprintf(bufrw, "HTTP/1.1 101 Switching Protocols\r\n")
-	fmt.Fprintf(bufrw, "Upgrade: stealthlink\r\n")
-	fmt.Fprintf(bufrw, "Connection: Upgrade\r\n")
-	fmt.Fprintf(bufrw, "\r\n")
-	bufrw.Flush()
+	// Await client's SETTINGS.
+	for {
+		ft, flags, sid, payload, err := readH2Frame(br)
+		if err != nil {
+			return err
+		}
+		if sid != 0 {
+			continue
+		}
+		if ft == 0x04 && flags&0x01 == 0 { // SETTINGS (non-ACK)
+			if len(payload)%6 != 0 {
+				return fmt.Errorf("invalid SETTINGS payload length: %d", len(payload))
+			}
+			break
+		}
+	}
 
-	// Pass the hijacked connection to the accept channel
+	// Send server SETTINGS (empty is fine) and ACK client's SETTINGS.
+	if err := writeH2Frame(conn, 0x04, 0x00, 0, nil); err != nil {
+		return err
+	}
+	if err := writeH2Frame(conn, 0x04, 0x01, 0, nil); err != nil {
+		return err
+	}
+
+	// Read until CONNECT HEADERS on stream 1, then respond with :status 200.
+	for {
+		ft, flags, sid, payload, err := readH2Frame(br)
+		if err != nil {
+			return err
+		}
+		if sid == 0 {
+			if err := handleH2ControlFrame(conn, ft, flags, payload); err != nil {
+				return err
+			}
+			continue
+		}
+		if sid != 1 || ft != 0x01 { // HEADERS
+			continue
+		}
+
+		var hb bytes.Buffer
+		enc := hpack.NewEncoder(&hb)
+		_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+		_ = enc.WriteField(hpack.HeaderField{Name: "server", Value: "stealthlink"})
+		if err := writeH2Frame(conn, 0x01, 0x04, 1, hb.Bytes()); err != nil {
+			return err
+		}
+		break
+	}
+
 	select {
-	case l.acceptCh <- conn:
+	case l.acceptCh <- &h2Conn{Conn: &bufferedConn{Conn: conn, r: br}, streamID: 1}:
+		return nil
 	default:
-		conn.Close()
+		return fmt.Errorf("accept queue full")
 	}
 }
 

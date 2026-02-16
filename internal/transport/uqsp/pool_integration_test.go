@@ -87,6 +87,7 @@ func TestPool_LatencyReductionIntegration(t *testing.T) {
 
 		const numRequests = 20
 		dialLatencies := make([]time.Duration, numRequests)
+		var mu sync.Mutex
 		var wg sync.WaitGroup
 		wg.Add(numRequests)
 
@@ -94,7 +95,7 @@ func TestPool_LatencyReductionIntegration(t *testing.T) {
 		for i := 0; i < numRequests; i++ {
 			go func(idx int) {
 				defer wg.Done()
-				
+
 				// Simulate high load with some stagger
 				time.Sleep(time.Duration(idx*10) * time.Millisecond)
 
@@ -103,8 +104,12 @@ func TestPool_LatencyReductionIntegration(t *testing.T) {
 
 				startDial := time.Now()
 				sess, err := dialer.Dial(ctx, actualAddr)
-				dialLatencies[idx] = time.Since(startDial)
-				
+				elapsed := time.Since(startDial)
+
+				mu.Lock()
+				dialLatencies[idx] = elapsed
+				mu.Unlock()
+
 				if err != nil {
 					t.Errorf("dial failed: %v", err)
 					return

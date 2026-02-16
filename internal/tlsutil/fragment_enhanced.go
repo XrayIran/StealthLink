@@ -73,18 +73,18 @@ type AdaptiveFragmenter struct {
 
 // FragmentStrategy defines a fragmentation approach.
 type FragmentStrategy struct {
-	Name        string
-	Mode        FragmentMode
-	Size        int
+	Name         string
+	Mode         FragmentMode
+	Size         int
 	NumFragments int
-	Sleep       time.Duration
-	Randomize   bool
+	Sleep        time.Duration
+	Randomize    bool
 }
 
 // StrategyStats tracks success/failure for a strategy.
 type StrategyStats struct {
-	Success int
-	Failure int
+	Success  int
+	Failure  int
 	LastUsed time.Time
 }
 
@@ -211,10 +211,10 @@ func (f *AdaptiveFragmenter) evaluateAndAdapt() {
 // EnhancedFragmentedConn wraps a connection with enhanced fragmentation.
 type EnhancedFragmentedConn struct {
 	net.Conn
-	config    EnhancedFragmentConfig
-	adaptive  *AdaptiveFragmenter
+	config        EnhancedFragmentConfig
+	adaptive      *AdaptiveFragmenter
 	handshakeDone bool
-	mu        sync.Mutex
+	mu            sync.Mutex
 }
 
 // NewEnhancedFragmentedConn creates a new enhanced fragmented connection.
@@ -258,12 +258,12 @@ func (c *EnhancedFragmentedConn) writeEnhancedFragmented(p []byte) (int, error) 
 	if c.adaptive != nil {
 		strategy := c.adaptive.GetStrategy()
 		fragConfig = FragmentConfig{
-			Enabled:      true,
-			Size:         strategy.Size,
-			NumFragments: strategy.NumFragments,
+			Enabled:       true,
+			Size:          strategy.Size,
+			NumFragments:  strategy.NumFragments,
 			FragmentSleep: strategy.Sleep,
-			Mode:         strategy.Mode,
-			Randomize:    strategy.Randomize,
+			Mode:          strategy.Mode,
+			Randomize:     strategy.Randomize,
 		}
 	} else {
 		fragConfig = c.config.FragmentConfig

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"stealthlink/internal/config"
+	"stealthlink/internal/metrics"
 	"stealthlink/internal/transport"
 	"stealthlink/internal/transport/uqsp/carrier"
 
@@ -32,6 +33,8 @@ type Dialer struct {
 // Deprecated: NewDialer creates a legacy UQSP dialer. Use NewRuntimeDialer instead.
 func NewDialer(cfg *config.UQSPConfig, tlsCfg *tls.Config, smuxCfg *smux.Config, authToken string) *Dialer {
 	log.Println("WARNING: using deprecated legacy UQSP Dialer; migrate to runtime.mode=unified (RuntimeDialer) — legacy mode will be removed in a future release")
+	metrics.IncDeprecatedLegacyMode()
+	metrics.SetActivePathVariant("legacy")
 	if cfg == nil {
 		cfg = &config.UQSPConfig{}
 	}
@@ -130,7 +133,7 @@ func (d *Dialer) selectCarrier() (carrier.Carrier, error) {
 			TLSServerName:         cfg.WebTunnel.TLSServerName,
 			TLSFingerprint:        cfg.WebTunnel.TLSFingerprint,
 		}
-		c := carrier.NewWebTunnelCarrier(wtCfg, d.SmuxConfig)
+		c := carrier.NewWebTunnelCarrier(wtCfg, d.TLSConfig, d.SmuxConfig)
 		d.carrier = c
 		return c, nil
 

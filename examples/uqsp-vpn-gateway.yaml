@@ -1,5 +1,5 @@
 role: gateway
-variant: "4d"
+variant: "UDP+"
 
 gateway:
   listen: "0.0.0.0:8443"

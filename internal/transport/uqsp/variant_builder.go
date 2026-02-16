@@ -117,9 +117,19 @@ func (b *VariantBuilder) BuildVariantXHTTPTLS() (*UnifiedProtocol, error) {
 			EnabledField:       behaviorsCfg.DomainFront.Enabled,
 			FrontDomain:        behaviorsCfg.DomainFront.FrontDomain,
 			RealHost:           behaviorsCfg.DomainFront.RealHost,
+			CFWorker:           behaviorsCfg.DomainFront.CFWorker,
 			RotateIPs:          behaviorsCfg.DomainFront.RotateIPs,
 			CustomIPs:          behaviorsCfg.DomainFront.CustomIPs,
+			FailoverDomains:    behaviorsCfg.DomainFront.FailoverDomains,
 			PreserveHostHeader: behaviorsCfg.DomainFront.PreserveHostHeader,
+			Phantom: behavior.DomainFrontPhantomConfig{
+				Enabled:        behaviorsCfg.DomainFront.Phantom.Enabled,
+				SharedSecret:   behaviorsCfg.DomainFront.Phantom.SharedSecret,
+				EpochSeed:      behaviorsCfg.DomainFront.Phantom.EpochSeed,
+				SubnetPrefixV4: behaviorsCfg.DomainFront.Phantom.SubnetPrefixV4,
+				SubnetPrefixV6: behaviorsCfg.DomainFront.Phantom.SubnetPrefixV6,
+				PoolSize:       behaviorsCfg.DomainFront.Phantom.PoolSize,
+			},
 		}
 		variantCfg.Behaviors = append(variantCfg.Behaviors, dfOverlay)
 	}
@@ -455,15 +465,15 @@ func (b *VariantBuilder) BuildVariantTrust() (*UnifiedProtocol, error) {
 func variantPolicyKey(v ProtocolVariant) string {
 	switch v {
 	case VariantXHTTP_TLS:
-		return "4a"
+		return config.VariantHTTPPlus
 	case VariantRawTCP:
-		return "4b"
+		return config.VariantTCPPlus
 	case VariantTLSMirror:
-		return "4c"
+		return config.VariantTLSPlus
 	case VariantUDP:
-		return "4d"
+		return config.VariantUDPPlus
 	case VariantTrust:
-		return "4e"
+		return config.VariantTLS
 	default:
 		return ""
 	}
@@ -502,6 +512,12 @@ func (b *VariantBuilder) buildReverseMode(variant ProtocolVariant) *ReverseMode 
 		MaxRetries:        rev.MaxRetries,
 		AuthToken:         rev.AuthToken,
 		TLSConfig:         b.tlsCfg,
+		Rendezvous: ReverseRendezvous{
+			Enabled:         rev.Rendezvous.Enabled,
+			BrokerURL:       rev.Rendezvous.BrokerURL,
+			FrontDomain:     rev.Rendezvous.FrontDomain,
+			UTLSFingerprint: rev.Rendezvous.UTLSFingerprint,
+		},
 	}
 	// HTTP registration improves reverse connectability behind CDNs.
 	if variant == VariantXHTTP_TLS || variant == VariantTrust {
@@ -524,10 +540,22 @@ func BuildVariantForRole(cfg *config.Config, tlsCfg *tls.Config, smuxCfg *smux.C
 	// Underlay dialer is the single place we decide how TCP dials are made
 	// (direct, WARP, SOCKS). Carriers that use tlsutil.DialUTLS will pick it up
 	// via context injection in UnifiedProtocol.Dial.
-	d, err := underlay.NewDialer(&cfg.Transport)
-	if err != nil {
-		_ = proto.Close()
-		return nil, variant, fmt.Errorf("underlay dialer: %w", err)
+	var d underlay.Dialer
+	ppMode := strings.ToLower(strings.TrimSpace(cfg.Transport.UQSP.PathPolicy.Mode))
+	if ppMode != "" && ppMode != "off" {
+		pp, perr := underlay.NewPathPolicyDialer(cfg.Transport.UQSP.PathPolicy, &cfg.Transport)
+		if perr != nil {
+			_ = proto.Close()
+			return nil, variant, fmt.Errorf("path_policy underlay dialer: %w", perr)
+		}
+		d = pp
+	} else {
+		base, berr := underlay.NewDialer(&cfg.Transport)
+		if berr != nil {
+			_ = proto.Close()
+			return nil, variant, fmt.Errorf("underlay dialer: %w", berr)
+		}
+		d = base
 	}
 	proto.variant.UnderlayDialer = d
 
@@ -538,6 +566,13 @@ func BuildVariantForRole(cfg *config.Config, tlsCfg *tls.Config, smuxCfg *smux.C
 	// ensure the carrier supports Listen.  Client-only carriers that cannot
 	// listen will error immediately rather than at runtime.
 	carrierType := effectiveCarrierType(cfg, variant)
+	if carrierType != "" && !carrier.IsCarrierAvailable(carrierType) {
+		reason := carrier.UnavailableReason(carrierType)
+		if strings.TrimSpace(reason) != "" {
+			return nil, variant, fmt.Errorf("carrier %q is not available: %s", carrierType, reason)
+		}
+		return nil, variant, fmt.Errorf("carrier %q is not available", carrierType)
+	}
 	if cfg.Role == "gateway" || cfg.Role == "server" {
 		if !proto.variant.EnableReverse && !carrier.SupportsListen(carrierType) {
 			return nil, variant, fmt.Errorf("carrier %q does not support listen role; choose quic/trusttunnel/rawtcp/faketcp/icmptun/webtunnel or enable reverse mode", carrierType)
@@ -598,31 +633,31 @@ func DetectVariant(cfg *config.Config) ProtocolVariant {
 func VariantName(v ProtocolVariant) string {
 	switch v {
 	case VariantXHTTP_TLS:
-		return "xhttp-tls"
+		return config.VariantHTTPPlus
 	case VariantRawTCP:
-		return "raw-tcp"
+		return config.VariantTCPPlus
 	case VariantTLSMirror:
-		return "tls-mirror"
+		return config.VariantTLSPlus
 	case VariantUDP:
-		return "udp"
+		return config.VariantUDPPlus
 	case VariantTrust:
-		return "trust"
+		return config.VariantTLS
 	default:
 		return "unknown"
 	}
 }
 
 func VariantFromName(name string) ProtocolVariant {
-	switch name {
-	case "xhttp-tls", "xhttp_tls", "4a":
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case config.VariantHTTPPlus:
 		return VariantXHTTP_TLS
-	case "raw-tcp", "raw_tcp", "4b":
+	case config.VariantTCPPlus:
 		return VariantRawTCP
-	case "tls-mirror", "tls_mirror", "4c":
+	case config.VariantTLSPlus:
 		return VariantTLSMirror
-	case "udp", "4d":
+	case config.VariantUDPPlus:
 		return VariantUDP
-	case "trust", "4e":
+	case config.VariantTLS:
 		return VariantTrust
 	default:
 		return VariantUDP

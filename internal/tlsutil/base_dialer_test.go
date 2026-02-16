@@ -88,4 +88,3 @@ func selfSignedCert() (tls.Certificate, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
-

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.2.0"
+SCRIPT_VERSION="6.0.0"
 
 BIN_DIR="${STEALTHLINK_BIN_DIR:-/usr/local/bin}"
 ETC_DIR="${STEALTHLINK_ETC_DIR:-/etc/stealthlink}"
@@ -20,7 +20,7 @@ AGENT_CFG="${ETC_DIR}/agent.yaml"
 STATE_DIR="${LIB_DIR}/state"
 BACKUP_DIR="${LIB_DIR}/backups"
 FIREWALL_STATE_DIR="${LIB_DIR}/firewall"
-FIREWALL_STATE_FILE="${FIREWALL_STATE_DIR}/state.json"
+MSS_STATE_FILE="${FIREWALL_STATE_DIR}/mss.json"
 HOSTOPT_TOKEN_FILE="${LIB_DIR}/hostopt-last-token"
 
 TMP_DIR=""
@@ -29,6 +29,11 @@ os_id="unknown"
 os_family="unknown"
 pkg_mgr="unknown"
 DEFAULT_RELEASE_REPO="${STEALTHLINK_RELEASE_REPO:-XrayIran/StealthLink}"
+SKIP_CHECKSUM=0
+BUNDLE_CHECKSUMS_URL=""
+
+# When set, the script must not prompt for input; it should use defaults.
+NON_INTERACTIVE="${STEALTHLINK_NON_INTERACTIVE:-0}"
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'; C_BLUE=$'\033[0;34m'; C_CYAN=$'\033[0;36m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -54,6 +59,19 @@ require_root(){
   fi
 }
 
+tty_usable(){
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  (: </dev/tty) 2>/dev/null || return 1
+  return 0
+}
+
+require_interactive(){
+  if [[ "${NON_INTERACTIVE}" == "1" ]]; then return 0; fi
+  if tty_usable; then return 0; fi
+  if [[ -t 0 && -t 1 ]]; then return 0; fi
+  die "Interactive input is not available (no usable TTY). Run from a real terminal, or pass --non-interactive."
+}
+
 reattach_tty(){
   if [[ "${STEALTHLINK_TTY_REATTACHED:-0}" == "1" ]]; then return 0; fi
   if [[ -t 0 && -t 1 && -t 2 ]]; then return 0; fi
@@ -65,14 +83,14 @@ reattach_tty(){
 
 print_banner(){ echo -e "${C_CYAN}StealthLink Control v${SCRIPT_VERSION}${C_RESET}"; }
 ui_print(){
-  if [[ -w /dev/tty ]]; then
+  if tty_usable; then
     echo -e "$*" >/dev/tty
   else
     echo -e "$*" >&2
   fi
 }
 ui_printf(){
-  if [[ -w /dev/tty ]]; then
+  if tty_usable; then
     printf "$@" >/dev/tty
   else
     printf "$@" >&2
@@ -84,7 +102,7 @@ ui_section(){
   ui_print "${C_DIM}------------------------------------------------------------${C_RESET}"
 }
 press_enter(){
-  if [[ -r /dev/tty ]]; then
+  if tty_usable; then
     echo "" >/dev/tty
     echo -e "${C_DIM}Press Enter to continue...${C_RESET}" >/dev/tty
     read -r </dev/tty || true
@@ -96,7 +114,8 @@ press_enter(){
 }
 read_input(){
   local p="$1" d="${2:-}" v=""
-  if [[ -r /dev/tty ]]; then
+  require_interactive
+  if tty_usable; then
     echo -ne "${C_CYAN}${p}${C_RESET} [${d}]: " >/dev/tty
     read -r v </dev/tty || true
   else
@@ -107,7 +126,8 @@ read_input(){
 }
 read_password(){
   local p="$1" v=""
-  if [[ -r /dev/tty ]]; then
+  require_interactive
+  if tty_usable; then
     echo -ne "${C_CYAN}${p}${C_RESET}: " >/dev/tty
     read -rs v </dev/tty || true
     echo "" >/dev/tty
@@ -121,7 +141,13 @@ read_password(){
 read_yesno(){
   local p="$1" d="${2:-y}" a="" h="[Y/n]"
   [[ "${d}" == "n" ]] && h="[y/N]"
-  if [[ -r /dev/tty ]]; then
+  if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+    a="${d}"
+    [[ "${a}" =~ ^[Yy] ]]
+    return
+  fi
+  require_interactive
+  if tty_usable; then
     echo -ne "${C_YELLOW}${p}${C_RESET} ${h}: " >/dev/tty
     read -r a </dev/tty || true
   else
@@ -138,13 +164,19 @@ select_menu(){
   ui_print ""
   ui_print "${C_BOLD}${title}${C_RESET}"
   ui_print "${C_DIM}─────────────────────────────────────${C_RESET}"
-  local i=1
-  while (( i <= ${#opts[@]} )); do ui_printf "  ${C_GREEN}%2d)${C_RESET} %s\n" "$(( (i+1)/2 ))" "${opts[$i]}"; i=$((i+2)); done
+  local i=0 n=1
+  while (( i+1 < ${#opts[@]} )); do
+    ui_printf "  ${C_GREEN}%2d)${C_RESET} %s\n" "${n}" "${opts[$((i+1))]}"
+    n=$((n+1))
+    i=$((i+2))
+  done
   ui_print ""
   local sel idx
   sel=$(read_input "Select" "1")
-  idx=$(( (sel-1)*2 + 1 ))
-  if (( idx > 0 && idx < ${#opts[@]} )); then printf "%s" "${opts[$idx]}"; else printf "%s" "${opts[1]}"; fi
+  if [[ ! "${sel}" =~ ^[0-9]+$ ]]; then sel="1"; fi
+  if (( sel < 1 || sel > n-1 )); then sel="1"; fi
+  idx=$(( (sel-1)*2 ))
+  if (( idx >= 0 && idx < ${#opts[@]} )); then printf "%s" "${opts[$idx]}"; else printf "%s" "${opts[0]}"; fi
 }
 
 detect_os(){
@@ -200,28 +232,45 @@ resolve_latest_bundle_url(){
   [[ -n "${GITHUB_TOKEN:-}" ]] && hdr+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
   json="$(curl -fsSL "${hdr[@]}" "${api}")" || return 1
   command -v python3 >/dev/null 2>&1 || die "python3 is required to resolve --latest from GitHub; install python3 or use --bundle"
-  python3 - "${repo}" "${os}" "${arch}" <<'PY' <<<"${json}"
-import json,re,sys
+  python3 -c 'import json,re,sys
 repo,os_name,arch=sys.argv[1:4]
 doc=json.load(sys.stdin)
 assets=doc.get("assets") or []
 compiled=[
-    re.compile(rf"^stealthlink-{re.escape(os_name)}-{re.escape(arch)}-v[^/]+\.zip$"),
-    re.compile(rf"^stealthlink-{re.escape(os_name)}-{re.escape(arch)}[^/]*\.zip$"),
+  re.compile(rf"^stealthlink-{re.escape(os_name)}-{re.escape(arch)}-v[^/]+\\.zip$"),
+  re.compile(rf"^stealthlink-{re.escape(os_name)}-{re.escape(arch)}[^/]*\\.zip$"),
 ]
 for pat in compiled:
-    for a in assets:
-        name=(a.get("name") or "").strip()
-        if pat.match(name):
-            print(a.get("browser_download_url") or "")
-            raise SystemExit(0)
-for a in assets:
+  for a in assets:
     name=(a.get("name") or "").strip()
-    if name.endswith(".zip") and f"-{os_name}-" in name and f"-{arch}" in name and name.startswith("stealthlink-"):
+    if pat.match(name):
+      print(a.get("browser_download_url") or "")
+      raise SystemExit(0)
+for a in assets:
+  name=(a.get("name") or "").strip()
+  if name.endswith(".zip") and f"-{os_name}-" in name and f"-{arch}" in name and name.startswith("stealthlink-"):
+    print(a.get("browser_download_url") or "")
+    raise SystemExit(0)
+raise SystemExit(2)
+' "${repo}" "${os}" "${arch}" <<<"${json}"
+}
+
+resolve_latest_checksums_url(){
+  local repo="${1:?repo required}"
+  local api="https://api.github.com/repos/${repo}/releases/latest" json
+  local -a hdr=(-H "Accept: application/vnd.github+json")
+  [[ -n "${GITHUB_TOKEN:-}" ]] && hdr+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  json="$(curl -fsSL "${hdr[@]}" "${api}")" || return 1
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to resolve --latest from GitHub; install python3 or use --bundle"
+  python3 -c 'import json,sys
+doc=json.load(sys.stdin)
+for a in (doc.get("assets") or []):
+    name=(a.get("name") or "").strip()
+    if name == "SHA256SUMS":
         print(a.get("browser_download_url") or "")
         raise SystemExit(0)
 raise SystemExit(2)
-PY
+' <<<"${json}"
 }
 
 map_pkg(){
@@ -282,17 +331,52 @@ deps_install(){
   fi
   mapfile -t pkgs < <(deps_required_pkgs "${backend}")
   echo "Packages to install:"; printf '  - %s\n' "${pkgs[@]}"
+  if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+    pkg_install "${pkgs[@]}"
+    return 0
+  fi
   if read_yesno "Install dependencies now?" "y"; then pkg_install "${pkgs[@]}"; fi
 }
 
 sha256_text(){
-  if command -v sha256sum >/dev/null 2>&1; then printf "%s" "$1" | sha256sum | awk '{print $1}';
-  elif command -v shasum >/dev/null 2>&1; then printf "%s" "$1" | shasum -a 256 | awk '{print $1}';
-  else python3 - <<'PY'
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf "%s" "$1" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf "%s" "$1" | shasum -a 256 | awk '{print $1}'
+  else
+    python3 - <<'PY'
 import hashlib,sys
 print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
 PY
   fi
+}
+
+sha256_file(){
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+  else
+    python3 - "${file}" <<'PY'
+import hashlib,sys
+h=hashlib.sha256()
+with open(sys.argv[1],'rb') as f:
+    for c in iter(lambda: f.read(1024*1024), b''):
+        h.update(c)
+print(h.hexdigest())
+PY
+  fi
+}
+
+verify_download_checksum(){
+  local artifact_path="$1" sums_path="$2" artifact_name expected actual
+  artifact_name="$(basename "${artifact_path}")"
+  expected="$(awk -v target="${artifact_name}" '$2==target || substr($2,2)==target{print $1; exit}' "${sums_path}")"
+  [[ -n "${expected}" ]] || die "SHA256SUMS does not contain entry for ${artifact_name}"
+  actual="$(sha256_file "${artifact_path}")"
+  [[ "${actual}" == "${expected}" ]] || die "Checksum mismatch for ${artifact_name}: expected ${expected}, got ${actual}"
+  log_ok "Checksum verified for ${artifact_name}"
 }
 
 gen_secret(){ command -v openssl >/dev/null 2>&1 && openssl rand -hex 32 || head -c 32 /dev/urandom | xxd -p -c 64; }
@@ -326,9 +410,27 @@ bundle_resolve(){
   fi
   if [[ -n "${bundle_path}" && "${bundle_path}" =~ ^https?:// ]]; then
     TMP_DIR="$(mktemp -d)"
-    local dl="${TMP_DIR}/bundle.zip"
+    local clean_url dl_name dl
+    clean_url="${bundle_path%%\?*}"
+    clean_url="${clean_url%%\#*}"
+    dl_name="${clean_url##*/}"
+    if [[ -z "${dl_name}" ]]; then
+      dl_name="bundle.zip"
+    fi
+    dl="${TMP_DIR}/${dl_name}"
+    local sums_url="${BUNDLE_CHECKSUMS_URL:-}" sums_file="${TMP_DIR}/SHA256SUMS"
     log_i "Downloading bundle: ${bundle_path}"
     curl -fL --retry 3 --connect-timeout 15 --max-time 300 -o "${dl}" "${bundle_path}" || die "Failed to download bundle URL: ${bundle_path}"
+    if [[ "${SKIP_CHECKSUM}" != "1" ]]; then
+      if [[ -z "${sums_url}" ]]; then
+        sums_url="${clean_url%/*}/SHA256SUMS"
+      fi
+      log_i "Downloading checksums: ${sums_url}"
+      curl -fL --retry 3 --connect-timeout 15 --max-time 120 -o "${sums_file}" "${sums_url}" || die "Failed to download SHA256SUMS from ${sums_url} (use --skip-checksum to bypass)"
+      verify_download_checksum "${dl}" "${sums_file}"
+    else
+      log_w "Checksum verification skipped (--skip-checksum)"
+    fi
     bundle_path="${dl}"
   fi
   if [[ -d "${bundle_path}" ]]; then
@@ -383,34 +485,52 @@ JSON
 
 write_yaml(){ local path="$1" content="$2"; umask 077; mkdir -p "$(dirname "${path}")"; printf "%s\n" "${content}" >"${path}"; chmod 0600 "${path}" 2>/dev/null || true; }
 
+# ---------------------------------------------------------------------------
+# Wizard v6: Dual-mode setup, mode-gated prompts, state machine, pairing bundles
+# ---------------------------------------------------------------------------
 WIZARD_PROFILE_NAME=""
 WIZARD_PROFILE_DESC=""
+WIZARD_EXPERT=0
 
+# Per-mode state variables (populated by wizard_mode_*_params)
+W_DOMAIN="" W_FRONT_DOMAIN="" W_ECH_PUBLIC_NAME="" W_SESSION_PLACEMENT="" W_SESSION_KEY=""
+W_NET_IFACE="" W_IFACE_IPV4="" W_ROUTER_MAC="" W_TCP_FINGERPRINT="" W_AEAD_MODE="" W_BPF_FILTER=""
+W_TLS_ENGINE="" W_REALITY_DEST="" W_REALITY_SHORT_ID="" W_ANYTLS_PASSWORD="" W_PADDING_SCHEME="" W_CONN_ROTATION=""
+W_BANDWIDTH="" W_FEC_ENABLED="" W_FEC_DATA="" W_FEC_PARITY="" W_OBFUSCATION="" W_CONGESTION=""
+W_TLS_DOMAIN="" W_TLS_CERT_MODE="" W_TLS_CERT="" W_TLS_KEY="" W_HTTP_VERSION="" W_CSTP_PATH=""
+
+generate_behavior_yaml(){ local overlays="$1" yaml=""; local o; for o in ${overlays}; do yaml+="      ${o}:"$'\n'"        enabled: true"$'\n'; done; printf "%s" "${yaml}"; }
+
+# ── Mode selection ──
 wizard_variant(){
-  ui_section "Connection Profile"
-  ui_print "Choose a plain-English profile. Internal mode code is shown in parentheses."
   ui_print ""
-  ui_print "  1) Balanced UDP/QUIC (Recommended)           (maps to 4d)"
-  ui_print "     Best default for most VPS pairs: low latency, high throughput."
-  ui_print "  2) Fronted XHTTP + ECH + Vision              (maps to 4a)"
-  ui_print "     Better censorship resistance with domain-front style behavior."
-  ui_print "  3) RawTCP Camouflage                          (maps to 4b)"
-  ui_print "     Raw socket style transport for hostile filtering networks."
-  ui_print "  4) TLS Look-Alike + Vision                    (maps to 4c)"
-  ui_print "     Mimics common TLS patterns (REALITY/ShadowTLS-like behavior)."
-  ui_print "  5) Enterprise TLS Tunnel                      (maps to 4e)"
-  ui_print "     Conservative TLS-oriented profile for strict enterprise paths."
-  ui_print "  6) Advanced Builder                           (custom)"
-  ui_print "     Manually choose carrier and behavior overlays."
+  ui_print "${C_BOLD}${C_CYAN}═══ Connection Mode ═══${C_RESET}"
+  ui_print "${C_DIM}───────────────────────${C_RESET}"
+  ui_print ""
+  ui_print "  ${C_GREEN}1)${C_RESET} ${C_BOLD}HTTP+${C_RESET}   Fronted XHTTP + ECH + Vision"
+  ui_print "           ${C_DIM}CDN-fronted, best censorship resistance${C_RESET}"
+  ui_print "  ${C_GREEN}2)${C_RESET} ${C_BOLD}TCP+${C_RESET}    Raw TCP Camouflage"
+  ui_print "           ${C_DIM}Raw socket transport for hostile networks (needs: interface, MAC)${C_RESET}"
+  ui_print "  ${C_GREEN}3)${C_RESET} ${C_BOLD}TLS+${C_RESET}    TLS Look-Alike + Vision"
+  ui_print "           ${C_DIM}REALITY/AnyTLS mimicry (needs: destination domain or password)${C_RESET}"
+  ui_print "  ${C_GREEN}4)${C_RESET} ${C_BOLD}UDP+${C_RESET}    Balanced UDP/QUIC  ${C_YELLOW}⭐ Recommended${C_RESET}"
+  ui_print "           ${C_DIM}Low latency, high throughput (needs: bandwidth estimate)${C_RESET}"
+  ui_print "  ${C_GREEN}5)${C_RESET} ${C_BOLD}TLS${C_RESET}     Enterprise TLS Tunnel"
+  ui_print "           ${C_DIM}Conservative TLS for corporate paths (needs: certificate)${C_RESET}"
+  ui_print "  ${C_GREEN}6)${C_RESET} ${C_BOLD}Custom${C_RESET}  Advanced Builder"
+  ui_print "           ${C_DIM}Manual carrier + overlay selection${C_RESET}"
+  ui_print ""
+  ui_print "  ${C_DIM}0) Back${C_RESET}"
   while true; do
-    case "$(read_input "Profile number" "1")" in
-      1) WIZARD_PROFILE_NAME="Balanced UDP/QUIC"; WIZARD_PROFILE_DESC="Low-latency + high-throughput baseline"; echo "4d"; return 0 ;;
-      2) WIZARD_PROFILE_NAME="Fronted XHTTP + ECH + Vision"; WIZARD_PROFILE_DESC="Censorship-resistant fronted TLS profile"; echo "4a"; return 0 ;;
-      3) WIZARD_PROFILE_NAME="RawTCP Camouflage"; WIZARD_PROFILE_DESC="RawTCP/faketcp-style profile"; echo "4b"; return 0 ;;
-      4) WIZARD_PROFILE_NAME="TLS Look-Alike + Vision"; WIZARD_PROFILE_DESC="REALITY/ShadowTLS-like profile"; echo "4c"; return 0 ;;
-      5) WIZARD_PROFILE_NAME="Enterprise TLS Tunnel"; WIZARD_PROFILE_DESC="TrustTunnel/CSTP-like profile"; echo "4e"; return 0 ;;
+    case "$(read_input "Mode" "4")" in
+      1) WIZARD_PROFILE_NAME="Fronted XHTTP + ECH + Vision"; WIZARD_PROFILE_DESC="CDN-fronted, best censorship resistance"; echo "HTTP+"; return 0 ;;
+      2) WIZARD_PROFILE_NAME="Raw TCP Camouflage"; WIZARD_PROFILE_DESC="Raw socket transport for hostile networks"; echo "TCP+"; return 0 ;;
+      3) WIZARD_PROFILE_NAME="TLS Look-Alike + Vision"; WIZARD_PROFILE_DESC="REALITY/AnyTLS mimicry"; echo "TLS+"; return 0 ;;
+      4) WIZARD_PROFILE_NAME="Balanced UDP/QUIC"; WIZARD_PROFILE_DESC="Low latency, high throughput"; echo "UDP+"; return 0 ;;
+      5) WIZARD_PROFILE_NAME="Enterprise TLS Tunnel"; WIZARD_PROFILE_DESC="Conservative TLS for corporate paths"; echo "TLS"; return 0 ;;
       6) WIZARD_PROFILE_NAME="Advanced Builder"; WIZARD_PROFILE_DESC="Manual carrier + overlays"; echo "custom"; return 0 ;;
-      *) ui_print "${C_YELLOW}Invalid profile choice. Please select 1-6.${C_RESET}" ;;
+      0) echo "BACK"; return 0 ;;
+      *) ui_print "${C_YELLOW}Invalid choice. Select 1-6 or 0 for back.${C_RESET}" ;;
     esac
   done
 }
@@ -418,23 +538,24 @@ wizard_variant(){
 wizard_carrier(){
   local variant="$1"
   case "${variant}" in
-    4a) echo "xhttp";; 4b) echo "rawtcp";; 4c) echo "xhttp";; 4d) echo "quic";; 4e) echo "trusttunnel";;
+    HTTP+) echo "xhttp";;
+    TCP+) echo "rawtcp";;
+    TLS+) echo "xhttp";;
+    UDP+) echo "quic";;
+    TLS) echo "trusttunnel";;
     custom)
-      ui_section "Advanced Carrier Selection"
-      ui_print "  1) quic        - fast UDP-based baseline"
-      ui_print "  2) xhttp       - HTTP-style tunnel carrier"
-      ui_print "  3) rawtcp      - raw packet TCP camouflage"
-      ui_print "  4) faketcp     - fake TCP behavior over raw path"
-      ui_print "  5) masque      - connect-udp / MASQUE-like profile"
-      ui_print "  6) trusttunnel - TLS/HTTP tunnel carrier"
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}═══ Advanced Carrier Selection ═══${C_RESET}"
+      ui_print "  ${C_GREEN}1)${C_RESET} quic        ${C_DIM}Fast UDP-based baseline${C_RESET}"
+      ui_print "  ${C_GREEN}2)${C_RESET} xhttp       ${C_DIM}HTTP-style tunnel carrier${C_RESET}"
+      ui_print "  ${C_GREEN}3)${C_RESET} rawtcp      ${C_DIM}Raw packet TCP camouflage${C_RESET}"
+      ui_print "  ${C_GREEN}4)${C_RESET} faketcp     ${C_DIM}Fake TCP behavior over raw path${C_RESET}"
+      ui_print "  ${C_GREEN}5)${C_RESET} masque      ${C_DIM}CONNECT-UDP / MASQUE-like profile${C_RESET}"
+      ui_print "  ${C_GREEN}6)${C_RESET} trusttunnel ${C_DIM}TLS/HTTP tunnel carrier${C_RESET}"
       while true; do
         case "$(read_input "Carrier number" "1")" in
-          1) echo "quic"; return 0 ;;
-          2) echo "xhttp"; return 0 ;;
-          3) echo "rawtcp"; return 0 ;;
-          4) echo "faketcp"; return 0 ;;
-          5) echo "masque"; return 0 ;;
-          6) echo "trusttunnel"; return 0 ;;
+          1) echo "quic"; return 0 ;; 2) echo "xhttp"; return 0 ;; 3) echo "rawtcp"; return 0 ;;
+          4) echo "faketcp"; return 0 ;; 5) echo "masque"; return 0 ;; 6) echo "trusttunnel"; return 0 ;;
           *) ui_print "${C_YELLOW}Invalid carrier choice. Please select 1-6.${C_RESET}" ;;
         esac
       done ;;
@@ -442,23 +563,9 @@ wizard_carrier(){
   esac
 }
 
-wizard_connectivity(){
-  ui_section "Connectivity Model"
-  ui_print "  1) Agent -> Gateway (classic)"
-  ui_print "     Agent dials gateway listener."
-  ui_print "  2) Reverse-connect"
-  ui_print "     Gateway dials agent-side listener (useful behind NAT/firewalls)."
-  while true; do
-    case "$(read_input "Model number" "1")" in
-      1) echo normal; return 0 ;;
-      2) echo reverse; return 0 ;;
-      *) ui_print "${C_YELLOW}Invalid model choice. Please select 1-2.${C_RESET}" ;;
-    esac
-  done
-}
-
-wizard_overlays(){
-  ui_section "Optional Behavior Overlays"
+wizard_custom_overlays(){
+  ui_print ""
+  ui_print "${C_BOLD}${C_CYAN}═══ Behavior Overlays ═══${C_RESET}"
   ui_print "Space-separated numbers (example: 1 4 6), or 7 for none:"
   ui_print "  1) ech       2) reality   3) shadowtls"
   ui_print "  4) tlsfrag   5) obfs4     6) awg"
@@ -468,132 +575,463 @@ wizard_overlays(){
   printf "%s" "${o}"
 }
 
-generate_behavior_yaml(){ local overlays="$1" yaml=""; local o; for o in ${overlays}; do yaml+="      ${o}:\n        enabled: true\n"; done; printf "%s" "${yaml}"; }
+# ── Mode-specific parameter prompts ──
+wizard_mode_4a_params(){
+  ui_print ""
+  ui_print "${C_BOLD}${C_CYAN}═══ HTTP+ Parameters ═══${C_RESET}"
+  ui_print "${C_DIM}XHTTP + Domain Fronting + ECH + Vision${C_RESET}"
+  ui_print ""
+  while true; do
+    W_DOMAIN="$(read_input "Domain name (real backend)" "${W_DOMAIN}")"
+    if [[ -z "${W_DOMAIN}" ]]; then ui_print "${C_YELLOW}Domain is required.${C_RESET}"; continue; fi
+    break
+  done
+  while true; do
+    W_FRONT_DOMAIN="$(read_input "Front domain (CDN)" "${W_FRONT_DOMAIN:-cdn.cloudflare.com}")"
+    if [[ -z "${W_FRONT_DOMAIN}" ]]; then ui_print "${C_YELLOW}Front domain is required.${C_RESET}"; continue; fi
+    break
+  done
+  W_ECH_PUBLIC_NAME="$(read_input "ECH public_name" "${W_ECH_PUBLIC_NAME:-${W_DOMAIN}}")"
+  if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+    W_SESSION_PLACEMENT="$(read_input "Session placement" "${W_SESSION_PLACEMENT:-header}")"
+    W_SESSION_KEY="$(read_input "Session key name" "${W_SESSION_KEY:-X-Session-ID}")"
+  else
+    W_SESSION_PLACEMENT="${W_SESSION_PLACEMENT:-header}"
+    W_SESSION_KEY="${W_SESSION_KEY:-X-Session-ID}"
+  fi
+}
 
-default_carrier_for_variant(){
-  case "${1:-4d}" in
-    4a) echo "xhttp" ;;
-    4b) echo "rawtcp" ;;
-    4c) echo "xhttp" ;;
-    4d) echo "quic" ;;
-    4e) echo "trusttunnel" ;;
-    *) echo "quic" ;;
+wizard_mode_4b_params(){
+  ui_print ""
+  ui_print "${C_BOLD}${C_CYAN}═══ TCP+ Parameters ═══${C_RESET}"
+  ui_print "${C_DIM}Raw TCP Camouflage${C_RESET}"
+  ui_print ""
+  local detected_iface detected_ipv4 detected_mac
+  detected_iface="$(detect_default_interface 2>/dev/null || true)"
+  detected_ipv4="$(detect_interface_ipv4 "${detected_iface}" 2>/dev/null || true)"
+  detected_mac="$(detect_router_mac 2>/dev/null || true)"
+  ui_print "  Auto-detected:"
+  if [[ -n "${detected_iface}" ]]; then ui_print "    ${C_GREEN}✓${C_RESET} Network interface:   ${detected_iface}"; else ui_print "    ${C_YELLOW}⚠${C_RESET} Network interface:   ${C_DIM}not detected${C_RESET}"; fi
+  if [[ -n "${detected_ipv4}" ]]; then ui_print "    ${C_GREEN}✓${C_RESET} Interface IPv4/CIDR: ${detected_ipv4}"; else ui_print "    ${C_YELLOW}⚠${C_RESET} Interface IPv4/CIDR: ${C_DIM}not detected${C_RESET}"; fi
+  if [[ -n "${detected_mac}" ]]; then ui_print "    ${C_GREEN}✓${C_RESET} Router MAC address:  ${detected_mac}"; else ui_print "    ${C_YELLOW}⚠${C_RESET} Router MAC address:  ${C_DIM}not detected${C_RESET}"; fi
+  ui_print ""
+  W_NET_IFACE="$(read_input "Network interface" "${W_NET_IFACE:-${detected_iface}}")"
+  W_IFACE_IPV4="$(read_input "Interface IPv4 CIDR" "${W_IFACE_IPV4:-${detected_ipv4}}")"
+  while true; do
+    W_ROUTER_MAC="$(read_input "Router/gateway MAC" "${W_ROUTER_MAC:-${detected_mac}}")"
+    if [[ -z "${W_ROUTER_MAC}" ]]; then ui_print "${C_YELLOW}Router MAC is required for TCP+ mode.${C_RESET}"; continue; fi
+    if ! validate_mac_address "${W_ROUTER_MAC}"; then ui_print "${C_YELLOW}Invalid MAC address format (expected xx:xx:xx:xx:xx:xx).${C_RESET}"; continue; fi
+    break
+  done
+  if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+    ui_print ""
+    ui_print "  TCP fingerprint profiles:"
+    ui_print "    1) chrome_win10   2) safari_macos   3) linux_default   4) android   5) random"
+    local fp_sel; fp_sel="$(read_input "Fingerprint" "${W_TCP_FINGERPRINT:-1}")"
+    case "${fp_sel}" in 1|chrome_win10) W_TCP_FINGERPRINT="chrome_win10";; 2|safari_macos) W_TCP_FINGERPRINT="safari_macos";; 3|linux_default) W_TCP_FINGERPRINT="linux_default";; 4|android) W_TCP_FINGERPRINT="android";; 5|random) W_TCP_FINGERPRINT="random";; *) W_TCP_FINGERPRINT="${fp_sel}";; esac
+    ui_print "  AEAD modes: 1) chacha20poly1305  2) aesgcm  3) off"
+    local aead_sel; aead_sel="$(read_input "AEAD mode" "${W_AEAD_MODE:-1}")"
+    case "${aead_sel}" in 1|chacha20poly1305) W_AEAD_MODE="chacha20poly1305";; 2|aesgcm) W_AEAD_MODE="aesgcm";; 3|off) W_AEAD_MODE="off";; *) W_AEAD_MODE="${aead_sel}";; esac
+    ui_print "  BPF filter: 1) basic  2) strict  3) stealth"
+    local bpf_sel; bpf_sel="$(read_input "BPF filter" "${W_BPF_FILTER:-3}")"
+    case "${bpf_sel}" in 1|basic) W_BPF_FILTER="basic";; 2|strict) W_BPF_FILTER="strict";; 3|stealth) W_BPF_FILTER="stealth";; *) W_BPF_FILTER="${bpf_sel}";; esac
+  else
+    W_TCP_FINGERPRINT="${W_TCP_FINGERPRINT:-chrome_win10}"
+    W_AEAD_MODE="${W_AEAD_MODE:-chacha20poly1305}"
+    W_BPF_FILTER="${W_BPF_FILTER:-stealth}"
+  fi
+}
+
+wizard_mode_4c_params(){
+  ui_print ""
+  ui_print "${C_BOLD}${C_CYAN}═══ TLS+ Parameters ═══${C_RESET}"
+  ui_print "${C_DIM}TLS Look-Alike + REALITY/AnyTLS${C_RESET}"
+  ui_print ""
+  ui_print "  TLS camouflage engine:"
+  ui_print "    ${C_GREEN}1)${C_RESET} REALITY  ${C_YELLOW}⭐ Recommended${C_RESET}"
+  ui_print "    ${C_GREEN}2)${C_RESET} AnyTLS"
+  while true; do
+    local eng_sel; eng_sel="$(read_input "Engine" "${W_TLS_ENGINE:-1}")"
+    case "${eng_sel}" in
+      1|reality|REALITY) W_TLS_ENGINE="reality"; break ;;
+      2|anytls|AnyTLS) W_TLS_ENGINE="anytls"; break ;;
+      *) ui_print "${C_YELLOW}Select 1 or 2.${C_RESET}" ;;
+    esac
+  done
+  if [[ "${W_TLS_ENGINE}" == "reality" ]]; then
+    while true; do
+      W_REALITY_DEST="$(read_input "Destination domain (spider URL)" "${W_REALITY_DEST:-www.microsoft.com:443}")"
+      if [[ -z "${W_REALITY_DEST}" ]]; then ui_print "${C_YELLOW}Destination domain is required for REALITY.${C_RESET}"; continue; fi
+      break
+    done
+    W_REALITY_SHORT_ID="$(read_input "Short-ID" "${W_REALITY_SHORT_ID:-$(openssl rand -hex 4 2>/dev/null || head -c 4 /dev/urandom | xxd -p -c 8)}")"
+  else
+    while true; do
+      W_ANYTLS_PASSWORD="$(read_input "AnyTLS password" "${W_ANYTLS_PASSWORD}")"
+      if [[ -z "${W_ANYTLS_PASSWORD}" ]]; then ui_print "${C_YELLOW}Password is required for AnyTLS.${C_RESET}"; continue; fi
+      break
+    done
+  fi
+  if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+    ui_print "  Padding scheme: 1) random  2) fixed  3) adaptive"
+    local pad_sel; pad_sel="$(read_input "Padding" "${W_PADDING_SCHEME:-3}")"
+    case "${pad_sel}" in 1|random) W_PADDING_SCHEME="random";; 2|fixed) W_PADDING_SCHEME="fixed";; 3|adaptive) W_PADDING_SCHEME="adaptive";; *) W_PADDING_SCHEME="${pad_sel}";; esac
+    W_CONN_ROTATION="$(read_input "Connection rotation interval" "${W_CONN_ROTATION:-30m}")"
+  else
+    W_PADDING_SCHEME="${W_PADDING_SCHEME:-adaptive}"
+    W_CONN_ROTATION="${W_CONN_ROTATION:-30m}"
+  fi
+}
+
+wizard_mode_4d_params(){
+  ui_print ""
+  ui_print "${C_BOLD}${C_CYAN}═══ UDP+ Parameters ═══${C_RESET}"
+  ui_print "${C_DIM}QUIC + Brutal CC${C_RESET}"
+  ui_print ""
+  W_BANDWIDTH="$(read_input "Bandwidth estimate (Mbps)" "${W_BANDWIDTH:-100}")"
+  if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+    if read_yesno "Enable FEC (Forward Error Correction)?" "${W_FEC_ENABLED:-y}"; then
+      W_FEC_ENABLED="true"
+      W_FEC_DATA="$(read_input "FEC data shards" "${W_FEC_DATA:-10}")"
+      W_FEC_PARITY="$(read_input "FEC parity shards" "${W_FEC_PARITY:-3}")"
+    else
+      W_FEC_ENABLED="false"
+    fi
+    ui_print "  Obfuscation: 1) salamander  2) adaptive  3) none"
+    local obfs_sel; obfs_sel="$(read_input "Obfuscation" "${W_OBFUSCATION:-1}")"
+    case "${obfs_sel}" in 1|salamander) W_OBFUSCATION="salamander";; 2|adaptive) W_OBFUSCATION="adaptive";; 3|none) W_OBFUSCATION="none";; *) W_OBFUSCATION="${obfs_sel}";; esac
+    ui_print "  Congestion algo: 1) bbr  2) brutal  3) cubic"
+    local cc_sel; cc_sel="$(read_input "Congestion" "${W_CONGESTION:-2}")"
+    case "${cc_sel}" in 1|bbr) W_CONGESTION="bbr";; 2|brutal) W_CONGESTION="brutal";; 3|cubic) W_CONGESTION="cubic";; *) W_CONGESTION="${cc_sel}";; esac
+  else
+    W_FEC_ENABLED="${W_FEC_ENABLED:-true}"
+    W_FEC_DATA="${W_FEC_DATA:-10}"
+    W_FEC_PARITY="${W_FEC_PARITY:-3}"
+    W_OBFUSCATION="${W_OBFUSCATION:-salamander}"
+    W_CONGESTION="${W_CONGESTION:-brutal}"
+  fi
+}
+
+wizard_mode_4e_params(){
+  ui_print ""
+  ui_print "${C_BOLD}${C_CYAN}═══ TLS Parameters ═══${C_RESET}"
+  ui_print "${C_DIM}Enterprise TLS Tunnel${C_RESET}"
+  ui_print ""
+  while true; do
+    W_TLS_DOMAIN="$(read_input "Domain name for TLS cert" "${W_TLS_DOMAIN}")"
+    if [[ -z "${W_TLS_DOMAIN}" ]]; then ui_print "${C_YELLOW}Domain is required.${C_RESET}"; continue; fi
+    break
+  done
+  ui_print "  TLS certificate handling:"
+  ui_print "    ${C_GREEN}1)${C_RESET} Auto-generate self-signed  ${C_YELLOW}⭐ Default${C_RESET}"
+  ui_print "    ${C_GREEN}2)${C_RESET} Provide cert+key paths"
+  ui_print "    ${C_GREEN}3)${C_RESET} Use ACME/Let's Encrypt"
+  while true; do
+    local cert_sel; cert_sel="$(read_input "Certificate handling" "${W_TLS_CERT_MODE:-1}")"
+    case "${cert_sel}" in
+      1|self-signed) W_TLS_CERT_MODE="self-signed"; break ;;
+      2|provided)
+        W_TLS_CERT_MODE="provided"
+        W_TLS_CERT="$(read_input "Certificate path" "${W_TLS_CERT}")"
+        W_TLS_KEY="$(read_input "Private key path" "${W_TLS_KEY}")"
+        break ;;
+      3|acme) W_TLS_CERT_MODE="acme"; break ;;
+      *) ui_print "${C_YELLOW}Select 1-3.${C_RESET}" ;;
+    esac
+  done
+  if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+    ui_print "  HTTP version: 1) h2  2) h3"
+    local hv_sel; hv_sel="$(read_input "HTTP version" "${W_HTTP_VERSION:-1}")"
+    case "${hv_sel}" in 1|h2) W_HTTP_VERSION="h2";; 2|h3) W_HTTP_VERSION="h3";; *) W_HTTP_VERSION="${hv_sel}";; esac
+    W_CSTP_PATH="$(read_input "CSTP endpoint path" "${W_CSTP_PATH:-/tunnel}")"
+  else
+    W_HTTP_VERSION="${W_HTTP_VERSION:-h2}"
+    W_CSTP_PATH="${W_CSTP_PATH:-/tunnel}"
+  fi
+}
+
+# ── Per-mode YAML generators ──
+generate_mode_4a_yaml(){
+  cat <<EOF
+    carrier:
+      type: xhttp
+      xhttp:
+        domain: "${W_DOMAIN}"
+        session_placement: "${W_SESSION_PLACEMENT:-header}"
+        session_key: "${W_SESSION_KEY:-X-Session-ID}"
+    behaviors:
+      ech:
+        enabled: true
+        public_name: "${W_ECH_PUBLIC_NAME:-${W_DOMAIN}}"
+      vision:
+        enabled: true
+      tlsfrag:
+        enabled: true
+      domainfront:
+        enabled: true
+        front_domain: "${W_FRONT_DOMAIN}"
+EOF
+}
+
+generate_mode_4b_yaml(){
+  cat <<EOF
+    carrier:
+      type: rawtcp
+      rawtcp:
+        interface: "${W_NET_IFACE}"
+        interface_ip: "${W_IFACE_IPV4}"
+        router_mac: "${W_ROUTER_MAC}"
+        tcp_fingerprint: "${W_TCP_FINGERPRINT:-chrome_win10}"
+        aead: "${W_AEAD_MODE:-chacha20poly1305}"
+        bpf_filter: "${W_BPF_FILTER:-stealth}"
+    behaviors:
+      obfs4:
+        enabled: true
+      awg:
+        enabled: true
+EOF
+}
+
+generate_mode_4c_yaml(){
+  local engine_yaml=""
+  if [[ "${W_TLS_ENGINE}" == "reality" ]]; then
+    engine_yaml="      reality:
+        enabled: true
+        dest: \"${W_REALITY_DEST}\"
+        short_id: \"${W_REALITY_SHORT_ID}\""
+  else
+    engine_yaml="      shadowtls:
+        enabled: true
+        password: \"${W_ANYTLS_PASSWORD}\""
+  fi
+  cat <<EOF
+    carrier:
+      type: xhttp
+      xhttp:
+        padding_scheme: "${W_PADDING_SCHEME:-adaptive}"
+        connection_rotation: "${W_CONN_ROTATION:-30m}"
+    behaviors:
+      vision:
+        enabled: true
+      tlsfrag:
+        enabled: true
+      tlsmirror:
+        enabled: true
+${engine_yaml}
+EOF
+}
+
+generate_mode_4d_yaml(){
+  local fec_yaml=""
+  if [[ "${W_FEC_ENABLED:-true}" == "true" ]]; then
+    fec_yaml="        fec:
+          enabled: true
+          data_shards: ${W_FEC_DATA:-10}
+          parity_shards: ${W_FEC_PARITY:-3}"
+  fi
+  cat <<EOF
+    carrier:
+      type: quic
+      quic:
+        congestion: "${W_CONGESTION:-brutal}"
+        bandwidth: ${W_BANDWIDTH:-100}
+        obfuscation: "${W_OBFUSCATION:-salamander}"
+${fec_yaml}
+    behaviors:
+      awg:
+        enabled: true
+EOF
+}
+
+generate_mode_4e_yaml(){
+  local cert_yaml=""
+  case "${W_TLS_CERT_MODE:-self-signed}" in
+    self-signed) cert_yaml="        tls_cert_mode: self-signed" ;;
+    provided) cert_yaml="        tls_cert_mode: provided
+        tls_cert: \"${W_TLS_CERT}\"
+        tls_key: \"${W_TLS_KEY}\"" ;;
+    acme) cert_yaml="        tls_cert_mode: acme
+        acme_domain: \"${W_TLS_DOMAIN}\"" ;;
+  esac
+  cat <<EOF
+    carrier:
+      type: trusttunnel
+      trusttunnel:
+        domain: "${W_TLS_DOMAIN}"
+        http_version: "${W_HTTP_VERSION:-h2}"
+        cstp_path: "${W_CSTP_PATH:-/tunnel}"
+${cert_yaml}
+    behaviors:
+      cstp:
+        enabled: true
+EOF
+}
+
+generate_mode_custom_yaml(){
+  local carrier="$1" overlays="$2"
+  local behavior_yaml=""
+  [[ -n "${overlays}" ]] && behavior_yaml="$(generate_behavior_yaml "${overlays}")"
+  printf "    carrier:\n      type: %s\n" "${carrier}"
+  [[ -n "${behavior_yaml}" ]] && printf "    behaviors:\n%s" "${behavior_yaml}"
+}
+
+generate_reverse_yaml(){
+  local role="$1" reverse_auth="$2" agent_listen="$3" agent_public="$4"
+  if [[ "${role}" == "gateway" ]]; then
+    cat <<EOF
+    reverse:
+      enabled: true
+      auth_token: "${reverse_auth}"
+      client_address: "${agent_public}"
+EOF
+  else
+    cat <<EOF
+    reverse:
+      enabled: true
+      auth_token: "${reverse_auth}"
+      server_address: "${agent_listen}"
+EOF
+  fi
+}
+
+generate_warp_dialer_yaml(){
+  local warp_required="${1:-true}"
+  cat <<EOF
+  dialer: warp
+  warp_dialer:
+    mode: consumer
+    engine: builtin
+    required: ${warp_required}
+    failure_policy: $([[ "${warp_required}" == "true" ]] && echo fail-closed || echo fail-open)
+EOF
+}
+
+generate_warp_section_yaml(){
+  local warp_required="${1:-true}"
+  cat <<EOF
+warp:
+  enabled: true
+  required: ${warp_required}
+  mode: builtin
+  endpoint: "engage.cloudflareclient.com:2408"
+  routing_mode: vpn_only
+  keepalive: 25s
+EOF
+}
+
+generate_vpn_yaml(){
+  local iface="$1" vip="$2" peer="$3" mtu="$4" routes_yaml="$5" dns_yaml="$6"
+  cat <<EOF
+vpn:
+  enabled: true
+  mode: tun
+  name: "${iface}"
+  interface_ip: "${vip}"
+  peer_ip: "${peer}"
+  mtu: ${mtu}
+EOF
+  [[ -n "${routes_yaml}" ]] && printf "  routes:\n%s" "${routes_yaml}"
+  [[ -n "${dns_yaml}" ]] && printf "  dns:\n%s" "${dns_yaml}"
+}
+
+generate_services_yaml(){
+  local iface="$1" mtu="$2"
+  cat <<EOF
+services:
+  - name: "vpnlink"
+    protocol: "tun"
+    tun:
+      name: "${iface}"
+      mode: "tun"
+      mtu: ${mtu}
+      transport: auto
+EOF
+}
+
+assemble_config(){
+  local role="$1" variant="$2" mode_yaml="$3" reverse_yaml="$4" dialer_yaml="$5" warp_yaml="$6"
+  local services_yaml="$7" vpn_yaml="$8"
+  # Build the uqsp block: mode_yaml + optional reverse + optional dialer
+  local uqsp_block="${mode_yaml}"
+  [[ -n "${reverse_yaml}" ]] && uqsp_block+=$'\n'"${reverse_yaml}"
+  local transport_extra=""
+  [[ -n "${dialer_yaml}" ]] && transport_extra=$'\n'"${dialer_yaml}"
+  # role-specific header
+  if [[ "${role}" == "gateway" ]]; then
+    shift 8
+    local gw_listen="$1"
+    cat <<EOF
+# StealthLink Gateway — generated by wizard v${SCRIPT_VERSION}
+role: gateway
+variant: "${variant}"
+gateway:
+  listen: "${gw_listen}"
+transport:
+  type: uqsp
+  uqsp:
+${uqsp_block}${transport_extra}
+security:
+  shared_key: "${W_SHARED_KEY}"
+${services_yaml}
+${vpn_yaml}
+metrics:
+  listen: "127.0.0.1:9091"
+${warp_yaml}
+EOF
+  else
+    shift 8
+    local agent_id="$1" gw_addr="$2" allow_loopback="$3"
+    cat <<EOF
+# StealthLink Agent — generated by wizard v${SCRIPT_VERSION}
+role: agent
+variant: "${variant}"
+agent:
+  id: "${agent_id}"
+  gateway_addr: "${gw_addr}"
+  allow_loopback_gateway_addr: ${allow_loopback}
+  reconnect_backoff: "3s"
+transport:
+  type: uqsp
+  uqsp:
+${uqsp_block}${transport_extra}
+security:
+  shared_key: "${W_SHARED_KEY}"
+${services_yaml}
+${vpn_yaml}
+metrics:
+  listen: "127.0.0.1:9092"
+${warp_yaml}
+EOF
+  fi
+}
+
+default_mtu_for_variant(){
+  case "${1:-UDP+}" in
+    UDP+) echo "1450" ;;
+    TLS) echo "1380" ;;
+    *) echo "1400" ;;
   esac
 }
 
-wizard_pair_auto(){
-  local mode="${1:-pair}" variant="${2:-4d}" carrier="${3:-}" connectivity="${4:-normal}" shared_key="${5:-}"
-  local gw_listen="${6:-0.0.0.0:8443}" gw_addr="${7:-127.0.0.1:8443}" agent_id="${8:-agent-1}" iface="${9:-sl0}" mtu="${10:-1400}"
-  local gw_vip="${11:-10.77.0.1/30}" agent_vip="${12:-10.77.0.2/30}" warp_enabled="${13:-false}" warp_required="${14:-true}" overlays="${15:-}"
-  ensure_dirs
-  [[ -z "${carrier}" ]] && carrier="$(default_carrier_for_variant "${variant}")"
-  [[ -z "${shared_key}" ]] && shared_key="$(gen_secret)"
-  local behavior_yaml="" reverse_enabled="false" reverse_auth="" dialer_yaml="" warp_yaml=""
-  local gw_peer="${agent_vip%%/*}" agent_peer="${gw_vip%%/*}"
-  if [[ "${connectivity}" == "reverse" ]]; then
-    reverse_enabled="true"
-    reverse_auth="$(gen_token)"
-  fi
-  [[ -n "${overlays}" ]] && behavior_yaml="$(generate_behavior_yaml "${overlays}")"
-  local transport_yaml="transport:\n  type: uqsp\n  uqsp:\n    carrier:\n      type: ${carrier}\n"
-  [[ -n "${behavior_yaml}" ]] && transport_yaml+="    behaviors:\n${behavior_yaml}"
-  [[ "${reverse_enabled}" == "true" ]] && transport_yaml+="    reverse:\n      enabled: true\n      auth_token: \"${reverse_auth}\"\n"
-  if [[ "${warp_enabled}" == "true" ]]; then
-    dialer_yaml="transport:\n  dialer: warp\n  warp_dialer:\n    mode: consumer\n    engine: builtin\n    required: ${warp_required}\n    failure_policy: $([[ "${warp_required}" == "true" ]] && echo fail-closed || echo fail-open)\n"
-    warp_yaml="warp:\n  enabled: true\n  required: ${warp_required}\n  mode: builtin\n  endpoint: \"engage.cloudflareclient.com:2408\"\n  routing_mode: vpn_only\n  keepalive: 25s\n"
-  fi
-  local gw_cfg="# StealthLink Gateway\nrole: gateway\nvariant: \"${variant}\"\ngateway:\n  listen: \"${gw_listen}\"\n${transport_yaml}${dialer_yaml}security:\n  shared_key: \"${shared_key}\"\nvpn:\n  enabled: true\n  mode: tun\n  name: \"${iface}\"\n  interface_ip: \"${gw_vip}\"\n  peer_ip: \"${gw_peer}\"\n  mtu: ${mtu}\nmetrics:\n  listen: \"127.0.0.1:9091\"\n${warp_yaml}"
-  local agent_cfg="# StealthLink Agent\nrole: agent\nvariant: \"${variant}\"\nagent:\n  id: \"${agent_id}\"\n  gateway_addr: \"${gw_addr}\"\n  reconnect_backoff: \"3s\"\n${transport_yaml}${dialer_yaml}security:\n  shared_key: \"${shared_key}\"\nvpn:\n  enabled: true\n  mode: tun\n  name: \"${iface}\"\n  interface_ip: \"${agent_vip}\"\n  peer_ip: \"${agent_peer}\"\n  mtu: ${mtu}\nmetrics:\n  listen: \"127.0.0.1:9092\"\n${warp_yaml}"
-  case "${mode}" in
-    gateway) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; log_ok "Wrote ${GATEWAY_CFG}" ;;
-    agent) write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${AGENT_CFG}" ;;
-    *) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${GATEWAY_CFG} and ${AGENT_CFG}" ;;
-  esac
-  local key_hash; key_hash="$(sha256_text "${shared_key}")"
-  cat >"${LIB_DIR}/pairing.txt" <<TXT
+# ── Pairing bundle generation ──
+generate_pairing_bundle(){
+  local gw_cfg_content="$1" agent_cfg_content="$2" variant="$3" carrier="$4"
+  local connectivity="$5" gw_listen="$6" gw_vip="$7" agent_vip="$8" gw_addr="$9"
+  shift 9
+  local agent_id="$1" warp_enabled="$2" warp_required="$3"
+  local bundle_dir="${LIB_DIR}/pairing"
+  mkdir -p "${bundle_dir}"
+  local key_hash; key_hash="$(sha256_text "${W_SHARED_KEY}")"
+  # Write configs
+  printf "%s\n" "${gw_cfg_content}" >"${bundle_dir}/gateway.yaml"
+  chmod 0600 "${bundle_dir}/gateway.yaml"
+  printf "%s\n" "${agent_cfg_content}" >"${bundle_dir}/agent.yaml"
+  chmod 0600 "${bundle_dir}/agent.yaml"
+  # Pairing summary
+  cat >"${bundle_dir}/pairing.txt" <<TXT
 StealthLink Pairing Information
 Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-Variant: ${variant}
-Carrier: ${carrier}
-Connectivity: ${connectivity}
-Shared Key SHA256: ${key_hash}
-Gateway Listen: ${gw_listen}
-Gateway Virtual IP: ${gw_vip}
-Agent Address: ${gw_addr}
-Agent Virtual IP: ${agent_vip}
-WARP: ${warp_enabled} (required: ${warp_required})
-TXT
-  chmod 0600 "${LIB_DIR}/pairing.txt" 2>/dev/null || true
-  log_ok "Pairing note: ${LIB_DIR}/pairing.txt"
-}
-
-wizard_pair(){
-  local mode="${1:-pair}"
-  ensure_dirs
-  ui_section "StealthLink Configuration Wizard"
-  ui_print "Target output: ${mode} (gateway, agent, or pair)"
-  local variant profile_name profile_desc carrier connectivity shared_key gw_listen gw_addr agent_id iface mtu gw_vip agent_vip gw_peer agent_peer
-  variant="$(wizard_variant)"
-  profile_name="${WIZARD_PROFILE_NAME:-Custom}"
-  profile_desc="${WIZARD_PROFILE_DESC:-}"
-  carrier="$(wizard_carrier "${variant}")"
-  connectivity="$(wizard_connectivity)"
-  ui_section "Security"
-  if read_yesno "Generate new shared key?" "y"; then shared_key="$(gen_secret)"; else shared_key="$(read_password "Shared key")"; fi
-  ui_section "Endpoint and Tunnel Parameters"
-  gw_listen="$(read_input "Gateway listen address" "0.0.0.0:8443")"
-  gw_addr="$(read_input "Gateway public address (for agent)" "127.0.0.1:8443")"
-  agent_id="$(read_input "Agent ID" "agent-1")"
-  iface="$(read_input "Virtual interface name" "sl0")"
-  mtu="$(read_input "MTU" "1400")"
-  gw_vip="$(read_input "Gateway virtual IP (CIDR)" "10.77.0.1/30")"
-  agent_vip="$(read_input "Agent virtual IP (CIDR)" "10.77.0.2/30")"
-  gw_peer="${agent_vip%%/*}"; agent_peer="${gw_vip%%/*}"
-
-  local reverse_enabled="false" reverse_auth=""
-  if [[ "${connectivity}" == "reverse" ]]; then reverse_enabled="true"; reverse_auth="$(gen_token)"; fi
-  local warp_enabled="false" warp_required="true"
-  ui_section "Underlay and Obfuscation"
-  if read_yesno "Enable WARP underlay?" "n"; then warp_enabled="true"; read_yesno "WARP required/fail-closed?" "y" || warp_required="false"; fi
-
-  local overlays="" behavior_yaml=""
-  if read_yesno "Configure overlays/behaviors?" "n"; then overlays="$(wizard_overlays)"; fi
-  [[ -n "${overlays}" ]] && behavior_yaml="$(generate_behavior_yaml "${overlays}")"
-
-  local transport_yaml="transport:\n  type: uqsp\n  uqsp:\n    carrier:\n      type: ${carrier}\n"
-  [[ -n "${behavior_yaml}" ]] && transport_yaml+="    behaviors:\n${behavior_yaml}"
-  [[ "${reverse_enabled}" == "true" ]] && transport_yaml+="    reverse:\n      enabled: true\n      auth_token: \"${reverse_auth}\"\n"
-
-  local dialer_yaml="" warp_yaml=""
-  if [[ "${warp_enabled}" == "true" ]]; then
-    dialer_yaml="transport:\n  dialer: warp\n  warp_dialer:\n    mode: consumer\n    engine: builtin\n    required: ${warp_required}\n"
-    warp_yaml="warp:\n  enabled: true\n  mode: builtin\n  endpoint: \"engage.cloudflareclient.com:2408\"\n  routing_mode: vpn_only\n  keepalive: 25s\n"
-  fi
-
-  local gw_cfg="# StealthLink Gateway\nrole: gateway\nvariant: \"${variant}\"\ngateway:\n  listen: \"${gw_listen}\"\n${transport_yaml}${dialer_yaml}security:\n  shared_key: \"${shared_key}\"\nvpn:\n  enabled: true\n  mode: tun\n  name: \"${iface}\"\n  interface_ip: \"${gw_vip}\"\n  peer_ip: \"${gw_peer}\"\n  mtu: ${mtu}\nmetrics:\n  listen: \"127.0.0.1:9091\"\n${warp_yaml}"
-  local agent_cfg="# StealthLink Agent\nrole: agent\nvariant: \"${variant}\"\nagent:\n  id: \"${agent_id}\"\n  gateway_addr: \"${gw_addr}\"\n  reconnect_backoff: \"3s\"\n${transport_yaml}${dialer_yaml}security:\n  shared_key: \"${shared_key}\"\nvpn:\n  enabled: true\n  mode: tun\n  name: \"${iface}\"\n  interface_ip: \"${agent_vip}\"\n  peer_ip: \"${agent_peer}\"\n  mtu: ${mtu}\nmetrics:\n  listen: \"127.0.0.1:9092\"\n${warp_yaml}"
-
-  local key_hash; key_hash="$(sha256_text "${shared_key}")"
-  ui_section "Configuration Summary"
-  ui_print "Profile:      ${profile_name} (${variant})"
-  [[ -n "${profile_desc}" ]] && ui_print "Description:  ${profile_desc}"
-  ui_print "Carrier:      ${carrier}"
-  ui_print "Connectivity: ${connectivity}"
-  ui_print "Gateway VIP:  ${gw_vip}"
-  ui_print "Agent VIP:    ${agent_vip}"
-  ui_print "WARP:         ${warp_enabled} (required=${warp_required})"
-  if ! read_yesno "Write configuration files now?" "y"; then
-    log_w "Skipped writing configuration files."
-    return 0
-  fi
-  case "${mode}" in gateway) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; log_ok "Wrote ${GATEWAY_CFG}";; agent) write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${AGENT_CFG}";; *) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${GATEWAY_CFG} and ${AGENT_CFG}";; esac
-
-  cat >"${LIB_DIR}/pairing.txt" <<TXT
-StealthLink Pairing Information
-Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
-
-Profile: ${profile_name}
 Variant: ${variant}
 Carrier: ${carrier}
 Connectivity: ${connectivity}
@@ -601,27 +1039,825 @@ Shared Key SHA256: ${key_hash}
 
 Gateway:
   Listen: ${gw_listen}
-  Virtual IP: ${gw_vip} (peer ${gw_peer})
-  Config: ${GATEWAY_CFG}
+  Virtual IP: ${gw_vip}
+  Config: gateway.yaml
 
 Agent:
   ID: ${agent_id}
   Gateway Address: ${gw_addr}
-  Virtual IP: ${agent_vip} (peer ${agent_peer})
-  Config: ${AGENT_CFG}
+  Virtual IP: ${agent_vip}
+  Config: agent.yaml
 
 WARP: ${warp_enabled} (required: ${warp_required})
-
-Apply on peer:
-  1) Copy matching config to peer host.
-  2) Run network setup (ip_forward/rp_filter) on both peers when routing traffic.
-  3) Run firewall apply on both peers.
-  4) Start services:
-     - stealthlink-ctl service gateway start
-     - stealthlink-ctl service agent start
 TXT
-  chmod 0600 "${LIB_DIR}/pairing.txt" 2>/dev/null || true
-  log_ok "Pairing note: ${LIB_DIR}/pairing.txt"
+  chmod 0600 "${bundle_dir}/pairing.txt"
+  # Deploy helper: gateway
+  cat >"${bundle_dir}/deploy-gateway.sh" <<'DEPLOY_GW'
+#!/usr/bin/env bash
+# Deploy StealthLink gateway config to remote VPS
+# Usage: ./deploy-gateway.sh user@gateway-ip
+set -euo pipefail
+HOST="${1:?Usage: $0 user@host}"
+scp "$(dirname "$0")/gateway.yaml" "${HOST}:/tmp/sl-gateway.yaml"
+ssh "${HOST}" 'sudo mkdir -p /etc/stealthlink && sudo mv /tmp/sl-gateway.yaml /etc/stealthlink/gateway.yaml && sudo chmod 600 /etc/stealthlink/gateway.yaml && echo "Done. Run: sudo stealthlink-ctl service gateway start"'
+DEPLOY_GW
+  chmod 0755 "${bundle_dir}/deploy-gateway.sh"
+  # Deploy helper: agent
+  cat >"${bundle_dir}/deploy-agent.sh" <<'DEPLOY_AG'
+#!/usr/bin/env bash
+# Deploy StealthLink agent config to remote VPS
+# Usage: ./deploy-agent.sh user@agent-ip
+set -euo pipefail
+HOST="${1:?Usage: $0 user@host}"
+scp "$(dirname "$0")/agent.yaml" "${HOST}:/tmp/sl-agent.yaml"
+ssh "${HOST}" 'sudo mkdir -p /etc/stealthlink && sudo mv /tmp/sl-agent.yaml /etc/stealthlink/agent.yaml && sudo chmod 600 /etc/stealthlink/agent.yaml && echo "Done. Run: sudo stealthlink-ctl service agent start"'
+DEPLOY_AG
+  chmod 0755 "${bundle_dir}/deploy-agent.sh"
+  log_ok "Pairing bundle: ${bundle_dir}/"
+}
+
+csv_trim(){
+  local s="${1:-}" out=""
+  # shellcheck disable=SC2206
+  local parts=(${s//,/ })
+  for p in "${parts[@]}"; do
+    p="$(echo "${p}" | xargs)"
+    [[ -z "${p}" ]] && continue
+    out+="${p},"
+  done
+  printf "%s" "${out%,}"
+}
+
+yaml_routes_from_csv(){
+  local csv="${1:-}" indent="${2:-  }"
+  csv="$(csv_trim "${csv}")"
+  [[ -z "${csv}" ]] && return 0
+  local out="" item
+  IFS=',' read -r -a items <<<"${csv}"
+  for item in "${items[@]}"; do
+    item="$(echo "${item}" | xargs)"
+    [[ -z "${item}" ]] && continue
+    out+="${indent}- destination: \"${item}\""$'\n'
+  done
+  printf "%s" "${out}"
+}
+
+routes_has_default(){
+  local csv="${1:-}" item
+  csv="$(csv_trim "${csv}")"
+  [[ -z "${csv}" ]] && return 1
+  IFS=',' read -r -a items <<<"${csv}"
+  for item in "${items[@]}"; do
+    item="$(echo "${item}" | xargs)"
+    [[ -z "${item}" ]] && continue
+    case "${item}" in
+      0.0.0.0/0|::/0) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+routes_validate_no_default(){
+  local csv="${1:-}" allow_default="${2:-false}"
+  if routes_has_default "${csv}"; then
+    if [[ "${allow_default}" == "true" || "${STEALTHLINK_ALLOW_DEFAULT_ROUTE:-0}" == "1" ]]; then
+      return 0
+    fi
+    die "Refusing to add default-route (0.0.0.0/0 or ::/0). StealthLink setup only supports explicit routed CIDRs by default. Pass --allow-default-route true to override."
+  fi
+}
+
+yaml_list_from_csv(){
+  local csv="${1:-}" indent="${2:-  }"
+  csv="$(csv_trim "${csv}")"
+  [[ -z "${csv}" ]] && return 0
+  local out="" item
+  IFS=',' read -r -a items <<<"${csv}"
+  for item in "${items[@]}"; do
+    item="$(echo "${item}" | xargs)"
+    [[ -z "${item}" ]] && continue
+    out+="${indent}- \"${item}\""$'\n'
+  done
+  printf "%s" "${out}"
+}
+
+default_carrier_for_variant(){
+  case "${1:-UDP+}" in
+    HTTP+) echo "xhttp" ;;
+    TCP+) echo "rawtcp" ;;
+    TLS+) echo "xhttp" ;;
+    UDP+) echo "quic" ;;
+    TLS) echo "trusttunnel" ;;
+    *) echo "quic" ;;
+  esac
+}
+
+parse_listen_port(){
+  local addr="${1:-}" port=""
+  # Accept ":8443", "0.0.0.0:8443", "[::]:8443".
+  if [[ "${addr}" =~ ^:([0-9]{1,5})$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  elif [[ "${addr}" =~ ^\[[^\]]+\]:([0-9]{1,5})$ ]]; then
+    port="${addr##*:}"
+  elif [[ "${addr}" =~ ^[^:]+:([0-9]{1,5})$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  else
+    die "Invalid listen address (expected host:port, :port, or [ipv6]:port): ${addr}"
+  fi
+  [[ "${port}" -ge 1 && "${port}" -le 65535 ]] || die "Invalid port in listen address: ${addr}"
+  echo "${port}"
+}
+
+split_hostport_strict(){
+  local addr="${1:-}"
+  # Return: "<host> <port>".
+  if [[ "${addr}" =~ ^\[([^\]]+)\]:([0-9]{1,5})$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    return 0
+  fi
+  if [[ "${addr}" =~ ^([^:]+):([0-9]{1,5})$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+format_hostport(){
+  local host="${1:-}" port="${2:-}"
+  if [[ -z "${host}" || -z "${port}" ]]; then
+    echo ""
+    return 0
+  fi
+  if [[ "${host}" == *:* && "${host}" != \[*\] ]]; then
+    echo "[${host}]:${port}"
+  else
+    echo "${host}:${port}"
+  fi
+}
+
+ipv4_is_public(){
+  local ip="${1:-}" o1 o2 o3 o4 o
+  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r o1 o2 o3 o4 <<<"${ip}"
+  for o in "${o1}" "${o2}" "${o3}" "${o4}"; do
+    [[ "${o}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${o}" -ge 0 && "${o}" -le 255 ]] || return 1
+  done
+  [[ "${o1}" -eq 0 ]] && return 1
+  [[ "${o1}" -eq 10 ]] && return 1
+  [[ "${o1}" -eq 127 ]] && return 1
+  [[ "${o1}" -eq 169 && "${o2}" -eq 254 ]] && return 1
+  [[ "${o1}" -eq 192 && "${o2}" -eq 168 ]] && return 1
+  if [[ "${o1}" -eq 172 && "${o2}" -ge 16 && "${o2}" -le 31 ]]; then
+    return 1
+  fi
+  if [[ "${o1}" -eq 100 && "${o2}" -ge 64 && "${o2}" -le 127 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+ipv6_is_public(){
+  local ip
+  ip="$(echo "${1:-}" | tr 'A-F' 'a-f')"
+  [[ -z "${ip}" ]] && return 1
+  [[ "${ip}" == "::" || "${ip}" == "::1" ]] && return 1
+  [[ "${ip}" == fe8* || "${ip}" == fe9* || "${ip}" == fea* || "${ip}" == feb* ]] && return 1
+  [[ "${ip}" == fc* || "${ip}" == fd* ]] && return 1
+  return 0
+}
+
+detect_public_ip(){
+  local ip
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
+    if ipv4_is_public "${ip}"; then
+      echo "${ip}"
+      return 0
+    fi
+    ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
+    if ipv6_is_public "${ip}"; then
+      echo "${ip}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Auto-detection helpers (v6 wizard)
+# ---------------------------------------------------------------------------
+detect_default_interface(){
+  local iface=""
+  if command -v ip >/dev/null 2>&1; then
+    iface="$(ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+  fi
+  [[ -n "${iface}" ]] && echo "${iface}" || return 1
+}
+
+detect_interface_ipv4(){
+  local iface="${1:-}"
+  [[ -z "${iface}" ]] && iface="$(detect_default_interface 2>/dev/null)" || true
+  [[ -z "${iface}" ]] && return 1
+  local addr=""
+  if command -v ip >/dev/null 2>&1; then
+    addr="$(ip -4 addr show dev "${iface}" 2>/dev/null | awk '/inet /{print $2; exit}')"
+  fi
+  [[ -n "${addr}" ]] && echo "${addr}" || return 1
+}
+
+detect_interface_ipv6(){
+  local iface="${1:-}"
+  [[ -z "${iface}" ]] && iface="$(detect_default_interface 2>/dev/null)" || true
+  [[ -z "${iface}" ]] && return 1
+  local addr=""
+  if command -v ip >/dev/null 2>&1; then
+    addr="$(ip -6 addr show dev "${iface}" scope global 2>/dev/null | awk '/inet6/{print $2; exit}')"
+  fi
+  [[ -n "${addr}" ]] && echo "${addr}" || return 1
+}
+
+detect_default_gateway_ip(){
+  local gw=""
+  if command -v ip >/dev/null 2>&1; then
+    gw="$(ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')"
+  fi
+  [[ -n "${gw}" ]] && echo "${gw}" || return 1
+}
+
+detect_router_mac(){
+  local gw_ip=""
+  gw_ip="$(detect_default_gateway_ip 2>/dev/null)" || return 1
+  local mac=""
+  if command -v ip >/dev/null 2>&1; then
+    mac="$(ip neigh show "${gw_ip}" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") {print $(i+1); exit}}')"
+  fi
+  [[ -n "${mac}" ]] && echo "${mac}" || return 1
+}
+
+validate_mac_address(){
+  local mac="${1:-}"
+  [[ "${mac}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]
+}
+
+validate_domain(){
+  local domain="${1:-}"
+  [[ -z "${domain}" ]] && return 1
+  [[ "${domain}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || return 1
+  return 0
+}
+
+validate_cidr(){
+  local cidr="${1:-}" ip mask
+  [[ "${cidr}" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+  ip="${BASH_REMATCH[1]}"; mask="${BASH_REMATCH[2]}"
+  [[ "${mask}" -ge 0 && "${mask}" -le 32 ]] || return 1
+  local IFS='.'; read -r o1 o2 o3 o4 <<<"${ip}"
+  for o in "${o1}" "${o2}" "${o3}" "${o4}"; do
+    [[ "${o}" =~ ^[0-9]+$ && "${o}" -ge 0 && "${o}" -le 255 ]] || return 1
+  done
+  return 0
+}
+
+validate_port(){
+  local p="${1:-}"
+  [[ "${p}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${p}" -ge 1 && "${p}" -le 65535 ]]
+}
+
+validate_hostport(){
+  local addr="${1:-}"
+  split_hostport_strict "${addr}" >/dev/null 2>&1 || return 1
+  local hp port
+  hp="$(split_hostport_strict "${addr}")"
+  port="${hp##* }"
+  validate_port "${port}"
+}
+
+validate_mtu(){
+  local mtu="${1:-}"
+  [[ "${mtu}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${mtu}" -ge 1280 && "${mtu}" -le 9000 ]]
+}
+
+derive_gateway_addr_default(){
+  local gw_listen="${1:-}" port host
+  port="$(parse_listen_port "${gw_listen}")" || return 1
+  host="$(detect_public_ip 2>/dev/null || true)"
+  [[ -n "${host}" ]] || return 1
+  format_hostport "${host}" "${port}"
+}
+
+is_loopback_host(){
+  local host
+  host="$(echo "${1:-}" | tr 'A-F' 'a-f')"
+  case "${host}" in
+    localhost|127.0.0.1|::1) return 0 ;;
+  esac
+  return 1
+}
+
+validate_gateway_addr_strict(){
+  local addr="${1:-}" allow_loopback="${2:-false}" host port hp
+  [[ -n "${addr}" ]] || die "agent.gateway_addr is required (must be the gateway's reachable host:port)"
+  if ! hp="$(split_hostport_strict "${addr}")"; then
+    if [[ "${addr}" == *:* && "${addr}" != \[*\] ]]; then
+      die "agent.gateway_addr must be in host:port form. For IPv6, use [ipv6]:port (example: [2001:db8::1]:8443). Got: ${addr}"
+    fi
+    die "agent.gateway_addr must be in host:port form. Got: ${addr}"
+  fi
+  read -r host port <<<"${hp}"
+  [[ "${port}" -ge 1 && "${port}" -le 65535 ]] || die "agent.gateway_addr has invalid port: ${addr}"
+  case "${host}" in
+    ""|0.0.0.0|::) die "agent.gateway_addr must not be 0.0.0.0 or :: (not dialable): ${addr}" ;;
+  esac
+  if is_loopback_host "${host}" && [[ "${allow_loopback}" != "true" && "${STEALTHLINK_ALLOW_LOOPBACK_GATEWAY_ADDR:-0}" != "1" ]]; then
+    die "Refusing agent.gateway_addr=${addr} (loopback). For two-host pairing, this must be the gateway's public IP/DNS. Set agent.allow_loopback_gateway_addr=true for same-host testing."
+  fi
+}
+
+# ── Non-interactive wizard (CLI flags) ──
+wizard_pair_auto(){
+  local mode="${1:-pair}" variant="${2:-UDP+}" carrier="${3:-}" connectivity="${4:-reverse}" shared_key="${5:-}"
+  local gw_listen="${6:-0.0.0.0:8443}" gw_addr="${7:-}" agent_id="${8:-agent-1}" iface="${9:-sl0}" mtu="${10:-1400}"
+  local gw_vip="${11:-10.77.0.1/30}" agent_vip="${12:-10.77.0.2/30}" warp_enabled="${13:-false}" warp_required="${14:-true}" overlays="${15:-}"
+  local routed_cidrs="${16:-}" dns_servers="${17:-}" allow_default_route="${18:-false}"
+  local allow_loopback_gateway_addr="${19:-false}"
+  # Mode-specific flags (passed via env or CLI)
+  local p_domain="${STEALTHLINK_DOMAIN:-${WIZ_DOMAIN:-}}"
+  local p_front_domain="${STEALTHLINK_FRONT_DOMAIN:-${WIZ_FRONT_DOMAIN:-cdn.cloudflare.com}}"
+  local p_ech_public_name="${STEALTHLINK_ECH_PUBLIC_NAME:-${WIZ_ECH_PUBLIC_NAME:-}}"
+  local p_interface="${STEALTHLINK_INTERFACE:-${WIZ_INTERFACE:-}}"
+  local p_router_mac="${STEALTHLINK_ROUTER_MAC:-${WIZ_ROUTER_MAC:-}}"
+  local p_interface_ip="${STEALTHLINK_INTERFACE_IP:-${WIZ_INTERFACE_IP:-}}"
+  local p_tcp_fingerprint="${STEALTHLINK_TCP_FINGERPRINT:-${WIZ_TCP_FINGERPRINT:-chrome_win10}}"
+  local p_aead="${STEALTHLINK_AEAD:-${WIZ_AEAD:-chacha20poly1305}}"
+  local p_tls_mode="${STEALTHLINK_TLS_MODE:-${WIZ_TLS_MODE:-reality}}"
+  local p_reality_dest="${STEALTHLINK_REALITY_DEST:-${WIZ_REALITY_DEST:-www.microsoft.com:443}}"
+  local p_anytls_password="${STEALTHLINK_ANYTLS_PASSWORD:-${WIZ_ANYTLS_PASSWORD:-}}"
+  local p_bandwidth="${STEALTHLINK_BANDWIDTH:-${WIZ_BANDWIDTH:-100}}"
+  local p_fec_enabled="${STEALTHLINK_FEC_ENABLED:-${WIZ_FEC_ENABLED:-true}}"
+  local p_http_version="${STEALTHLINK_HTTP_VERSION:-${WIZ_HTTP_VERSION:-h2}}"
+  local p_tls_cert="${STEALTHLINK_TLS_CERT:-${WIZ_TLS_CERT:-}}"
+  local p_tls_key="${STEALTHLINK_TLS_KEY:-${WIZ_TLS_KEY:-}}"
+  local p_tls_domain="${STEALTHLINK_TLS_DOMAIN:-${WIZ_TLS_DOMAIN:-}}"
+  local p_reverse_enabled="${STEALTHLINK_REVERSE_ENABLED:-${WIZ_REVERSE_ENABLED:-}}"
+  local p_agent_listen="${STEALTHLINK_AGENT_LISTEN:-${WIZ_AGENT_LISTEN:-0.0.0.0:9443}}"
+  local p_agent_public_addr="${STEALTHLINK_AGENT_PUBLIC_ADDR:-${WIZ_AGENT_PUBLIC_ADDR:-}}"
+
+  ensure_dirs
+  [[ -z "${carrier}" ]] && carrier="$(default_carrier_for_variant "${variant}")"
+  [[ -z "${shared_key}" ]] && shared_key="$(gen_secret)"
+  [[ -z "${mtu}" ]] && mtu="$(default_mtu_for_variant "${variant}")"
+  routes_validate_no_default "${routed_cidrs}" "${allow_default_route}"
+
+  if [[ "${mode}" != "gateway" ]]; then
+    if [[ -z "${gw_addr}" ]]; then
+      if [[ "${mode}" == "pair" ]]; then
+        gw_addr="$(derive_gateway_addr_default "${gw_listen}" 2>/dev/null || true)"
+      fi
+    fi
+    validate_gateway_addr_strict "${gw_addr}" "${allow_loopback_gateway_addr}"
+  fi
+
+  # Set mode-specific variables
+  W_SHARED_KEY="${shared_key}"
+  case "${variant}" in
+    HTTP+)
+      W_DOMAIN="${p_domain}"; W_FRONT_DOMAIN="${p_front_domain}"
+      W_ECH_PUBLIC_NAME="${p_ech_public_name:-${p_domain}}"
+      W_SESSION_PLACEMENT="header"; W_SESSION_KEY="X-Session-ID"
+      ;;
+    TCP+)
+      W_NET_IFACE="${p_interface:-$(detect_default_interface 2>/dev/null || true)}"
+      W_IFACE_IPV4="${p_interface_ip:-$(detect_interface_ipv4 "${W_NET_IFACE}" 2>/dev/null || true)}"
+      W_ROUTER_MAC="${p_router_mac:-$(detect_router_mac 2>/dev/null || true)}"
+      W_TCP_FINGERPRINT="${p_tcp_fingerprint}"; W_AEAD_MODE="${p_aead}"; W_BPF_FILTER="stealth"
+      ;;
+    TLS+)
+      W_TLS_ENGINE="${p_tls_mode}"; W_REALITY_DEST="${p_reality_dest}"
+      W_REALITY_SHORT_ID="$(openssl rand -hex 4 2>/dev/null || head -c 4 /dev/urandom | xxd -p -c 8)"
+      W_ANYTLS_PASSWORD="${p_anytls_password}"; W_PADDING_SCHEME="adaptive"; W_CONN_ROTATION="30m"
+      ;;
+    UDP+)
+      W_BANDWIDTH="${p_bandwidth}"; W_FEC_ENABLED="${p_fec_enabled}"
+      W_FEC_DATA="10"; W_FEC_PARITY="3"; W_OBFUSCATION="salamander"; W_CONGESTION="brutal"
+      ;;
+    TLS)
+      W_TLS_DOMAIN="${p_tls_domain}"; W_HTTP_VERSION="${p_http_version}"
+      W_TLS_CERT="${p_tls_cert}"; W_TLS_KEY="${p_tls_key}"; W_CSTP_PATH="/tunnel"
+      if [[ -n "${W_TLS_CERT}" && -n "${W_TLS_KEY}" ]]; then W_TLS_CERT_MODE="provided"
+      else W_TLS_CERT_MODE="self-signed"; fi
+      ;;
+  esac
+
+  # Generate mode-specific YAML
+  local mode_yaml=""
+  case "${variant}" in
+    HTTP+) mode_yaml="$(generate_mode_4a_yaml)" ;;
+    TCP+) mode_yaml="$(generate_mode_4b_yaml)" ;;
+    TLS+) mode_yaml="$(generate_mode_4c_yaml)" ;;
+    UDP+) mode_yaml="$(generate_mode_4d_yaml)" ;;
+    TLS) mode_yaml="$(generate_mode_4e_yaml)" ;;
+    *) mode_yaml="$(generate_mode_custom_yaml "${carrier}" "${overlays}")" ;;
+  esac
+
+  # Reverse connectivity
+  local reverse_enabled="false" reverse_auth="" agent_listen="" agent_public=""
+  if [[ "${p_reverse_enabled}" == "true" || "${connectivity}" == "reverse" ]]; then
+    reverse_enabled="true"
+    reverse_auth="$(gen_token)"
+    agent_listen="${p_agent_listen}"
+    agent_public="${p_agent_public_addr}"
+  fi
+
+  local gw_reverse_yaml="" agent_reverse_yaml=""
+  if [[ "${reverse_enabled}" == "true" ]]; then
+    gw_reverse_yaml="$(generate_reverse_yaml gateway "${reverse_auth}" "${agent_listen}" "${agent_public}")"
+    agent_reverse_yaml="$(generate_reverse_yaml agent "${reverse_auth}" "${agent_listen}" "${agent_public}")"
+  fi
+
+  local dialer_yaml="" warp_yaml=""
+  if [[ "${warp_enabled}" == "true" ]]; then
+    dialer_yaml="$(generate_warp_dialer_yaml "${warp_required}")"
+    warp_yaml="$(generate_warp_section_yaml "${warp_required}")"
+  fi
+
+  local gw_peer="${agent_vip%%/*}" agent_peer="${gw_vip%%/*}"
+  local routes_yaml dns_yaml
+  routes_yaml="$(yaml_routes_from_csv "${routed_cidrs}" "    ")"
+  dns_yaml="$(yaml_list_from_csv "${dns_servers}" "    ")"
+  local services_yaml; services_yaml="$(generate_services_yaml "${iface}" "${mtu}")"
+  local vpn_gw_yaml; vpn_gw_yaml="$(generate_vpn_yaml "${iface}" "${gw_vip}" "${gw_peer}" "${mtu}" "${routes_yaml}" "${dns_yaml}")"
+  local vpn_agent_yaml; vpn_agent_yaml="$(generate_vpn_yaml "${iface}" "${agent_vip}" "${agent_peer}" "${mtu}" "${routes_yaml}" "${dns_yaml}")"
+
+  local gw_cfg agent_cfg
+  gw_cfg="$(assemble_config gateway "${variant}" "${mode_yaml}" "${gw_reverse_yaml}" "${dialer_yaml}" "${warp_yaml}" "${services_yaml}" "${vpn_gw_yaml}" "${gw_listen}")"
+  agent_cfg="$(assemble_config agent "${variant}" "${mode_yaml}" "${agent_reverse_yaml}" "${dialer_yaml}" "${warp_yaml}" "${services_yaml}" "${vpn_agent_yaml}" "${agent_id}" "${gw_addr}" "${allow_loopback_gateway_addr}")"
+
+  case "${mode}" in
+    gateway) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; log_ok "Wrote ${GATEWAY_CFG}" ;;
+    agent) write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${AGENT_CFG}" ;;
+    *) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${GATEWAY_CFG} and ${AGENT_CFG}" ;;
+  esac
+
+  generate_pairing_bundle "${gw_cfg}" "${agent_cfg}" "${variant}" "${carrier}" \
+    "${connectivity}" "${gw_listen}" "${gw_vip}" "${agent_vip}" "${gw_addr}" \
+    "${agent_id}" "${warp_enabled}" "${warp_required}"
+}
+
+# ── Interactive wizard with state machine and back navigation ──
+wizard_pair(){
+  local mode="${1:-pair}"
+  ensure_dirs
+
+  # State machine variables
+  local variant="" carrier="" connectivity="" W_SHARED_KEY="" gw_listen="" gw_addr=""
+  local agent_id="" iface="" mtu="" gw_vip="" agent_vip="" gw_peer="" agent_peer=""
+  local allow_loopback_gateway_addr="false"
+  local routed_cidrs="" dns_servers=""
+  local reverse_enabled="false" reverse_auth="" agent_listen="" agent_public=""
+  local warp_enabled="false" warp_required="true"
+  local overlays="" custom_carrier=""
+  local profile_name="" profile_desc=""
+  local state="S0"
+
+  while true; do
+    case "${state}" in
+    # ── S0: Quick vs Expert ──
+    S0)
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}╔════════════════════════════════════════════════╗${C_RESET}"
+      ui_print "${C_BOLD}${C_CYAN}║       StealthLink Setup Wizard v${SCRIPT_VERSION}          ║${C_RESET}"
+      ui_print "${C_BOLD}${C_CYAN}╚════════════════════════════════════════════════╝${C_RESET}"
+      ui_print ""
+      ui_print "  ${C_GREEN}1)${C_RESET} ${C_BOLD}Quick Setup${C_RESET} (Recommended)"
+      ui_print "     ${C_DIM}Guided flow with smart defaults — fewest questions.${C_RESET}"
+      ui_print "  ${C_GREEN}2)${C_RESET} ${C_BOLD}Expert Setup${C_RESET}"
+      ui_print "     ${C_DIM}Full control over every parameter.${C_RESET}"
+      ui_print "  ${C_DIM}0) Back to main menu${C_RESET}"
+      local setup_sel; setup_sel="$(read_input "Select" "1")"
+      case "${setup_sel}" in
+        1) WIZARD_EXPERT=0; state="S1" ;;
+        2) WIZARD_EXPERT=1; state="S1" ;;
+        0) return 0 ;;
+        *) ui_print "${C_YELLOW}Invalid selection.${C_RESET}" ;;
+      esac ;;
+
+    # ── S1: Role ──
+    S1)
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}═══ Role ═══${C_RESET}"
+      ui_print "  ${C_GREEN}1)${C_RESET} Gateway"
+      ui_print "  ${C_GREEN}2)${C_RESET} Agent"
+      ui_print "  ${C_GREEN}3)${C_RESET} Pair (generate both)  ${C_YELLOW}⭐ Recommended${C_RESET}"
+      ui_print "  ${C_DIM}0) Back${C_RESET}"
+      local role_sel; role_sel="$(read_input "Role" "3")"
+      case "${role_sel}" in
+        1) mode="gateway"; state="S2" ;;
+        2) mode="agent"; state="S2" ;;
+        3) mode="pair"; state="S2" ;;
+        0) state="S0" ;;
+        *) ui_print "${C_YELLOW}Invalid selection.${C_RESET}" ;;
+      esac ;;
+
+    # ── S2: Mode ──
+    S2)
+      variant="$(wizard_variant)"
+      if [[ "${variant}" == "BACK" ]]; then state="S1"; continue; fi
+      profile_name="${WIZARD_PROFILE_NAME:-Custom}"
+      profile_desc="${WIZARD_PROFILE_DESC:-}"
+      carrier="$(wizard_carrier "${variant}")"
+      if [[ "${variant}" == "custom" ]]; then custom_carrier="${carrier}"; fi
+      mtu="$(default_mtu_for_variant "${variant}")"
+      state="S3" ;;
+
+    # ── S3: Mode-specific parameters ──
+    S3)
+      case "${variant}" in
+        HTTP+) wizard_mode_4a_params ;;
+        TCP+) wizard_mode_4b_params ;;
+        TLS+) wizard_mode_4c_params ;;
+        UDP+) wizard_mode_4d_params ;;
+        TLS) wizard_mode_4e_params ;;
+        custom)
+          if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+            overlays="$(wizard_custom_overlays)"
+          fi ;;
+      esac
+      state="S4" ;;
+
+    # ── S4: Connectivity + WARP ──
+    S4)
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}═══ Connectivity ═══${C_RESET}"
+      ui_print ""
+      ui_print "  Direction:"
+      ui_print "    ${C_GREEN}1)${C_RESET} Normal: Agent → Gateway (agent initiates)  ${C_YELLOW}⭐ Default${C_RESET}"
+      ui_print "    ${C_GREEN}2)${C_RESET} Reverse: Gateway → Agent (server pushes to client)"
+      ui_print "       ${C_DIM}Useful when the gateway is behind NAT or the agent IP is more stable.${C_RESET}"
+      ui_print "  ${C_DIM}0) Back${C_RESET}"
+      local conn_sel; conn_sel="$(read_input "Direction" "1")"
+      case "${conn_sel}" in
+        0) state="S2"; continue ;;
+        2) connectivity="reverse" ;;
+        *) connectivity="normal" ;;
+      esac
+      if [[ "${connectivity}" == "reverse" ]]; then
+        reverse_enabled="true"
+        reverse_auth="$(gen_token)"
+        agent_listen="$(read_input "Agent listen address (bind)" "${agent_listen:-0.0.0.0:9443}")"
+        while true; do
+          agent_public="$(read_input "Agent public address (reachable)" "${agent_public}")"
+          if [[ -z "${agent_public}" ]]; then ui_print "${C_YELLOW}Agent public address is required for reverse mode.${C_RESET}"; continue; fi
+          break
+        done
+      else
+        reverse_enabled="false"
+      fi
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}═══ IP Masking ═══${C_RESET}"
+      if read_yesno "Enable WARP underlay (hide gateway's real IP via Cloudflare WARP)?" "n"; then
+        warp_enabled="true"
+        if read_yesno "Require WARP (fail if unavailable)?" "y"; then warp_required="true"; else warp_required="false"; fi
+      else
+        warp_enabled="false"
+      fi
+      state="S5" ;;
+
+    # ── S5: Security ──
+    S5)
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}═══ Security ═══${C_RESET}"
+      ui_print "  ${C_DIM}0) Back${C_RESET}"
+      if read_yesno "Generate new shared key?" "y"; then
+        W_SHARED_KEY="$(gen_secret)"
+      else
+        W_SHARED_KEY="$(read_password "Shared key (hex)")"
+        if [[ -z "${W_SHARED_KEY}" ]]; then
+          ui_print "${C_YELLOW}Empty key — generating one.${C_RESET}"
+          W_SHARED_KEY="$(gen_secret)"
+        fi
+      fi
+      state="S6" ;;
+
+    # ── S6: Endpoints & VPN ──
+    S6)
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}═══ Network Configuration ═══${C_RESET}"
+      local detected_ip; detected_ip="$(detect_public_ip 2>/dev/null || true)"
+      if [[ -n "${detected_ip}" ]]; then
+        ui_print "  Auto-detected:"
+        ui_print "    ${C_GREEN}✓${C_RESET} Public IP: ${detected_ip}"
+        ui_print ""
+      fi
+      ui_print "  ${C_DIM}0) Back${C_RESET}"
+      gw_listen="$(read_input "Gateway listen address" "${gw_listen:-0.0.0.0:8443}")"
+      if [[ "${gw_listen}" == "0" ]]; then state="S4"; continue; fi
+      local gw_addr_default=""
+      if [[ "${mode}" != "agent" ]]; then
+        gw_addr_default="$(derive_gateway_addr_default "${gw_listen}" 2>/dev/null || true)"
+        if [[ -z "${gw_addr_default}" ]]; then
+          ui_print "${C_YELLOW}Could not auto-detect a public gateway address.${C_RESET}"
+        fi
+      fi
+      while true; do
+        gw_addr="$(read_input "Gateway public address (for agent)" "${gw_addr:-${gw_addr_default}}")"
+        if [[ "${gw_addr}" == "0" ]]; then state="S4"; break; fi
+        if [[ -z "${gw_addr}" ]]; then
+          if [[ "${mode}" == "gateway" ]]; then break; fi
+          ui_print "${C_YELLOW}Gateway address is required.${C_RESET}"; continue
+        fi
+        if ! split_hostport_strict "${gw_addr}" >/dev/null 2>&1; then
+          ui_print "${C_YELLOW}Invalid format. Expected host:port (IPv6: [ip]:port).${C_RESET}"; continue
+        fi
+        local hp host port; hp="$(split_hostport_strict "${gw_addr}")"; read -r host port <<<"${hp}"
+        if is_loopback_host "${host}"; then
+          ui_print "${C_YELLOW}Loopback address — only for same-host testing.${C_RESET}"
+          if read_yesno "Allow loopback?" "n"; then allow_loopback_gateway_addr="true"; break; fi
+          continue
+        fi
+        break
+      done
+      [[ "${gw_addr}" == "0" ]] && continue
+      agent_id="$(read_input "Agent ID" "${agent_id:-agent-1}")"
+      iface="$(read_input "TUN interface name" "${iface:-sl0}")"
+      if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+        while true; do
+          mtu="$(read_input "MTU" "${mtu}")"
+          if validate_mtu "${mtu}"; then break; fi
+          ui_print "${C_YELLOW}MTU must be 1280-9000.${C_RESET}"
+        done
+      fi
+      gw_vip="$(read_input "Gateway virtual IP (CIDR)" "${gw_vip:-10.77.0.1/30}")"
+      agent_vip="$(read_input "Agent virtual IP (CIDR)" "${agent_vip:-10.77.0.2/30}")"
+      state="S7" ;;
+
+    # ── S7: Routing & DNS ──
+    S7)
+      if [[ "${WIZARD_EXPERT}" == "1" ]]; then
+        ui_print ""
+        ui_print "${C_BOLD}${C_CYAN}═══ Routing & DNS ═══${C_RESET}"
+        ui_print "  ${C_DIM}0) Back${C_RESET}"
+        while true; do
+          routed_cidrs="$(read_input "Routed CIDRs (comma-separated, blank=none)" "${routed_cidrs}")"
+          if [[ "${routed_cidrs}" == "0" ]]; then state="S6"; break; fi
+          if routes_has_default "${routed_cidrs}"; then
+            ui_print "${C_YELLOW}Default route not allowed in guided setup.${C_RESET}"
+            routed_cidrs=""; continue
+          fi
+          break
+        done
+        [[ "${routed_cidrs}" == "0" ]] && { routed_cidrs=""; continue; }
+        dns_servers="$(read_input "DNS servers (comma-separated, blank=none)" "${dns_servers}")"
+      fi
+      state="S8" ;;
+
+    # ── S8: Summary & Confirm ──
+    S8)
+      gw_peer="${agent_vip%%/*}"; agent_peer="${gw_vip%%/*}"
+      local key_hash; key_hash="$(sha256_text "${W_SHARED_KEY}" | head -c 16)..."
+      local conn_label="Normal (Agent → Gateway)"
+      [[ "${connectivity}" == "reverse" ]] && conn_label="Reverse (Gateway → Agent)"
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}╔════════════════════════════════════════════════════╗${C_RESET}"
+      ui_print "${C_BOLD}${C_CYAN}║              Configuration Summary                  ║${C_RESET}"
+      ui_print "${C_BOLD}${C_CYAN}╠════════════════════════════════════════════════════╣${C_RESET}"
+      ui_print "  Mode:         ${C_BOLD}${profile_name}${C_RESET} (${variant})"
+      ui_print "  Carrier:      ${carrier}"
+      ui_print "  Connectivity: ${conn_label}"
+      ui_print "  WARP:         $([[ "${warp_enabled}" == "true" ]] && echo "Enabled (required=${warp_required})" || echo "Disabled")"
+      ui_print ""
+      ui_print "  Gateway:      ${gw_listen} → ${gw_addr:-N/A}"
+      ui_print "  Gateway VIP:  ${gw_vip}"
+      ui_print "  Agent VIP:    ${agent_vip}"
+      ui_print "  MTU:          ${mtu}"
+      ui_print "  TUN:          ${iface}"
+      # Mode-specific summary
+      case "${variant}" in
+        HTTP+) ui_print ""; ui_print "  Domain:       ${W_DOMAIN}"; ui_print "  Front domain: ${W_FRONT_DOMAIN}"; ui_print "  ECH:          ${W_ECH_PUBLIC_NAME}" ;;
+        TCP+) ui_print ""; ui_print "  Interface:    ${W_NET_IFACE}"; ui_print "  Router MAC:   ${W_ROUTER_MAC}"; ui_print "  Fingerprint:  ${W_TCP_FINGERPRINT}" ;;
+        TLS+) ui_print ""; ui_print "  TLS engine:   ${W_TLS_ENGINE}"; [[ "${W_TLS_ENGINE}" == "reality" ]] && ui_print "  REALITY dest: ${W_REALITY_DEST}" || ui_print "  AnyTLS pwd:   ****" ;;
+        UDP+) ui_print ""; ui_print "  Bandwidth:    ${W_BANDWIDTH} Mbps (${W_CONGESTION:-brutal} CC)"; ui_print "  FEC:          ${W_FEC_DATA:-10}/${W_FEC_PARITY:-3} (data/parity)"; ui_print "  Obfuscation:  ${W_OBFUSCATION:-salamander}" ;;
+        TLS) ui_print ""; ui_print "  TLS domain:   ${W_TLS_DOMAIN}"; ui_print "  Cert mode:    ${W_TLS_CERT_MODE}"; ui_print "  HTTP version: ${W_HTTP_VERSION}" ;;
+      esac
+      [[ -n "${routed_cidrs}" ]] && ui_print "  Routes:       ${routed_cidrs}"
+      [[ -n "${dns_servers}" ]] && ui_print "  DNS:          ${dns_servers}"
+      ui_print "${C_BOLD}${C_CYAN}╠════════════════════════════════════════════════════╣${C_RESET}"
+      ui_print "  ${C_GREEN}1)${C_RESET} Confirm and write configs"
+      ui_print "  ${C_GREEN}2)${C_RESET} Edit a section (go back)"
+      ui_print "  ${C_GREEN}3)${C_RESET} Cancel"
+      ui_print "${C_BOLD}${C_CYAN}╚════════════════════════════════════════════════════╝${C_RESET}"
+      local confirm_sel; confirm_sel="$(read_input "Select" "1")"
+      case "${confirm_sel}" in
+        1) state="S9" ;;
+        2)
+          ui_print "  Go back to:"
+          ui_print "    1) Mode selection       2) Mode parameters"
+          ui_print "    3) Connectivity/WARP    4) Security"
+          ui_print "    5) Network config       6) Routing/DNS"
+          local back_sel; back_sel="$(read_input "Section" "5")"
+          case "${back_sel}" in 1) state="S2";; 2) state="S3";; 3) state="S4";; 4) state="S5";; 5) state="S6";; 6) state="S7";; *) state="S6";; esac ;;
+        3) log_w "Wizard cancelled."; return 0 ;;
+        *) ui_print "${C_YELLOW}Invalid selection.${C_RESET}" ;;
+      esac ;;
+
+    # ── S9: Generate configs + pairing bundle ──
+    S9)
+      # Generate mode YAML
+      local mode_yaml=""
+      case "${variant}" in
+        HTTP+) mode_yaml="$(generate_mode_4a_yaml)" ;;
+        TCP+) mode_yaml="$(generate_mode_4b_yaml)" ;;
+        TLS+) mode_yaml="$(generate_mode_4c_yaml)" ;;
+        UDP+) mode_yaml="$(generate_mode_4d_yaml)" ;;
+        TLS) mode_yaml="$(generate_mode_4e_yaml)" ;;
+        *) mode_yaml="$(generate_mode_custom_yaml "${carrier}" "${overlays}")" ;;
+      esac
+
+      local gw_reverse_yaml="" agent_reverse_yaml=""
+      if [[ "${reverse_enabled}" == "true" ]]; then
+        gw_reverse_yaml="$(generate_reverse_yaml gateway "${reverse_auth}" "${agent_listen}" "${agent_public}")"
+        agent_reverse_yaml="$(generate_reverse_yaml agent "${reverse_auth}" "${agent_listen}" "${agent_public}")"
+      fi
+
+      local dialer_yaml="" warp_yaml=""
+      if [[ "${warp_enabled}" == "true" ]]; then
+        dialer_yaml="$(generate_warp_dialer_yaml "${warp_required}")"
+        warp_yaml="$(generate_warp_section_yaml "${warp_required}")"
+      fi
+
+      local routes_yaml dns_yaml
+      routes_yaml="$(yaml_routes_from_csv "${routed_cidrs}" "    ")"
+      dns_yaml="$(yaml_list_from_csv "${dns_servers}" "    ")"
+      local services_yaml; services_yaml="$(generate_services_yaml "${iface}" "${mtu}")"
+      local vpn_gw_yaml; vpn_gw_yaml="$(generate_vpn_yaml "${iface}" "${gw_vip}" "${gw_peer}" "${mtu}" "${routes_yaml}" "${dns_yaml}")"
+      local vpn_agent_yaml; vpn_agent_yaml="$(generate_vpn_yaml "${iface}" "${agent_vip}" "${agent_peer}" "${mtu}" "${routes_yaml}" "${dns_yaml}")"
+
+      local gw_cfg agent_cfg
+      gw_cfg="$(assemble_config gateway "${variant}" "${mode_yaml}" "${gw_reverse_yaml}" "${dialer_yaml}" "${warp_yaml}" "${services_yaml}" "${vpn_gw_yaml}" "${gw_listen}")"
+      agent_cfg="$(assemble_config agent "${variant}" "${mode_yaml}" "${agent_reverse_yaml}" "${dialer_yaml}" "${warp_yaml}" "${services_yaml}" "${vpn_agent_yaml}" "${agent_id}" "${gw_addr}" "${allow_loopback_gateway_addr}")"
+
+      case "${mode}" in
+        gateway) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; log_ok "Wrote ${GATEWAY_CFG}" ;;
+        agent) write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${AGENT_CFG}" ;;
+        *) write_yaml "${GATEWAY_CFG}" "${gw_cfg}"; write_yaml "${AGENT_CFG}" "${agent_cfg}"; log_ok "Wrote ${GATEWAY_CFG} and ${AGENT_CFG}" ;;
+      esac
+
+      generate_pairing_bundle "${gw_cfg}" "${agent_cfg}" "${variant}" "${carrier}" \
+        "${connectivity}" "${gw_listen}" "${gw_vip}" "${agent_vip}" "${gw_addr:-N/A}" \
+        "${agent_id}" "${warp_enabled}" "${warp_required}"
+
+      state="S10" ;;
+
+    # ── S10: Post-setup ──
+    S10)
+      ui_print ""
+      ui_print "${C_BOLD}${C_CYAN}═══════════════════════════════════════════════════════${C_RESET}"
+      ui_print "  ${C_GREEN}✓${C_RESET} StealthLink Pairing Complete"
+      ui_print "${C_BOLD}${C_CYAN}═══════════════════════════════════════════════════════${C_RESET}"
+      ui_print ""
+      ui_print "  Configs written:"
+      [[ "${mode}" == "gateway" || "${mode}" == "pair" ]] && ui_print "    ${GATEWAY_CFG}"
+      [[ "${mode}" == "agent" || "${mode}" == "pair" ]] && ui_print "    ${AGENT_CFG}"
+      ui_print ""
+      ui_print "  Pairing bundle: ${LIB_DIR}/pairing/"
+      ui_print ""
+      ui_print "  Next steps:"
+      ui_print "    1. Copy the peer config to the other VPS:"
+      ui_print "       scp ${LIB_DIR}/pairing/agent.yaml user@agent-ip:/etc/stealthlink/"
+      ui_print ""
+      ui_print "    2. On BOTH VPSes, run:"
+      ui_print "       sudo stealthlink-ctl network setup"
+      ui_print "       sudo stealthlink-ctl firewall apply <role>"
+      ui_print "       sudo stealthlink-ctl service <role> start"
+      ui_print ""
+      ui_print "    3. Verify connectivity:"
+      ui_print "       ping ${agent_vip%%/*}  (from gateway)"
+      ui_print "       ping ${gw_vip%%/*}  (from agent)"
+      ui_print ""
+      ui_print "  Or use the deploy helpers:"
+      ui_print "    cd ${LIB_DIR}/pairing/"
+      ui_print "    ./deploy-agent.sh root@<agent-ip>"
+      ui_print "${C_BOLD}${C_CYAN}═══════════════════════════════════════════════════════${C_RESET}"
+      ui_print ""
+      if read_yesno "Apply network tuning and start services now?" "y"; then
+        network_setup_auto
+        if [[ "${mode}" == "gateway" || "${mode}" == "pair" ]]; then
+          apply_firewall_role gateway auto 2>/dev/null || log_w "Firewall apply failed for gateway"
+          service_op gateway enable 2>/dev/null || true
+          service_op gateway restart 2>/dev/null || service_op gateway start 2>/dev/null || true
+        fi
+        if [[ "${mode}" == "agent" || "${mode}" == "pair" ]]; then
+          apply_firewall_role agent auto 2>/dev/null || log_w "Firewall apply failed for agent"
+          service_op agent enable 2>/dev/null || true
+          service_op agent restart 2>/dev/null || service_op agent start 2>/dev/null || true
+        fi
+        log_ok "Services started."
+      fi
+      return 0 ;;
+    esac
+  done
 }
 
 network_setup(){
@@ -705,7 +1941,7 @@ apply_tuning(){
   ensure_dirs
   if [[ -x "${BIN_DIR}/${TOOLS_BIN}" ]]; then
     if out="$(${BIN_DIR}/${TOOLS_BIN} host-optimize "${profile}" --apply 2>&1)"; then
-      token="$(printf '%s\n' "${out}" | grep -Eo 'token[=: ]+[A-Za-z0-9._-]+' | tail -1 | sed -E 's/.*[=: ]+//')"
+      token="$(printf '%s\n' "${out}" | grep -Eo 'token[=: ]+[A-Za-z0-9._-]+' | tail -1 | sed -E 's/.*[=: ]+//' || true)"
       if [[ -n "${token}" ]]; then printf "%s\n" "${token}" >"${HOSTOPT_TOKEN_FILE}"; chmod 0600 "${HOSTOPT_TOKEN_FILE}" || true; fi
       log_ok "Applied host-optimize profile: ${profile}"
       [[ -n "${token}" ]] && log_ok "Rollback token stored: ${HOSTOPT_TOKEN_FILE}"
@@ -729,9 +1965,14 @@ rollback_tuning(){
 }
 
 extract_port(){ local cfg="$1" p; p=$(grep -Eo 'listen:[[:space:]]*"?[0-9a-zA-Z\.:_-]+:[0-9]{2,5}"?' "${cfg}" 2>/dev/null | head -1 | grep -Eo '[0-9]{2,5}$' || true); [[ -n "${p}" ]] && echo "${p}" || echo "8443"; }
-extract_carrier(){ local cfg="$1"; grep -Eo 'type:[[:space:]]*(rawtcp|faketcp|quic|xhttp|masque|trusttunnel)' "${cfg}" 2>/dev/null | head -1 | awk -F: '{gsub(/ /,"",$2);print $2}'; }
+extract_carrier(){
+  local cfg="$1" carrier=""
+  carrier="$(grep -Eo 'type:[[:space:]]*(rawtcp|faketcp|quic|xhttp|masque|trusttunnel)' "${cfg}" 2>/dev/null | head -1 | awk -F: '{gsub(/ /,"",$2);print $2}' || true)"
+  [[ -n "${carrier}" ]] && echo "${carrier}" || echo "unknown"
+}
 
 detect_firewall_backend(){ if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then echo nft; elif command -v iptables >/dev/null 2>&1; then echo iptables; else echo none; fi; }
+firewall_state_file(){ local role="$1"; echo "${FIREWALL_STATE_DIR}/${role}.json"; }
 
 apply_firewall_role(){
   local role="$1" backend="${2:-auto}" cfg
@@ -768,7 +2009,8 @@ apply_firewall_role(){
   fi
 
   mkdir -p "${FIREWALL_STATE_DIR}"
-  cat >"${FIREWALL_STATE_FILE}" <<JSON
+  local state_file; state_file="$(firewall_state_file "${role}")"
+  cat >"${state_file}" <<JSON
 {
   "backend": "${backend}",
   "role": "${role}",
@@ -783,22 +2025,28 @@ JSON
 
 remove_firewall_role(){
   local role="${1:-}" backend="" port="" raw="false"
-  if [[ -f "${FIREWALL_STATE_FILE}" ]]; then
+  local state_file=""
+  [[ -n "${role}" ]] && state_file="$(firewall_state_file "${role}")"
+  # Backward compatibility: older installs used a single state file.
+  if [[ -z "${state_file}" && -f "${FIREWALL_STATE_DIR}/state.json" ]]; then
+    state_file="${FIREWALL_STATE_DIR}/state.json"
+  fi
+  if [[ -n "${state_file}" && -f "${state_file}" ]]; then
     backend="$(python3 - <<PY
 import json
-s=json.load(open('${FIREWALL_STATE_FILE}'))
+s=json.load(open('${state_file}'))
 print(s.get('backend',''))
 PY
 )"
     port="$(python3 - <<PY
 import json
-s=json.load(open('${FIREWALL_STATE_FILE}'))
+s=json.load(open('${state_file}'))
 print(s.get('port',''))
 PY
 )"
     raw="$(python3 - <<PY
 import json
-s=json.load(open('${FIREWALL_STATE_FILE}'))
+s=json.load(open('${state_file}'))
 print(str(s.get('raw_hardening',False)).lower())
 PY
 )"
@@ -824,8 +2072,39 @@ PY
     iptables -D OUTPUT -p tcp --sport "${port}" --tcp-flags RST RST -j DROP 2>/dev/null || true
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
   fi
-  rm -f "${FIREWALL_STATE_FILE}"
+  [[ -n "${state_file}" ]] && rm -f "${state_file}"
   log_ok "Firewall rules removed"
+}
+
+firewall_mss_enable(){
+  local iface="${1:-sl0}" backend="${2:-auto}"
+  [[ "${backend}" == "auto" ]] && backend="$(detect_firewall_backend)"
+  if ! command -v iptables >/dev/null 2>&1; then
+    log_w "iptables not found; MSS clamping currently requires iptables"
+    return 0
+  fi
+  # Clamp MSS to PMTU for TCP SYN packets crossing the tunnel interface.
+  iptables -t mangle -C FORWARD -o "${iface}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+    || iptables -t mangle -I FORWARD -o "${iface}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  iptables -t mangle -C FORWARD -i "${iface}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+    || iptables -t mangle -I FORWARD -i "${iface}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  printf '{"iface":"%s","backend":"%s"}\n' "${iface}" "${backend}" >"${MSS_STATE_FILE}"
+  log_ok "Enabled MSS clamping on ${iface} (state: ${MSS_STATE_FILE})"
+}
+
+firewall_mss_disable(){
+  local iface="${1:-}" backend="${2:-auto}"
+  if [[ -z "${iface}" && -f "${MSS_STATE_FILE}" ]]; then
+    iface="$(python3 -c 'import json;print(json.load(open("'"${MSS_STATE_FILE}"'")).get("iface",""))' 2>/dev/null || true)"
+  fi
+  [[ -z "${iface}" ]] && iface="sl0"
+  [[ "${backend}" == "auto" ]] && backend="$(detect_firewall_backend)"
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -t mangle -D FORWARD -o "${iface}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    iptables -t mangle -D FORWARD -i "${iface}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  fi
+  rm -f "${MSS_STATE_FILE}" 2>/dev/null || true
+  log_ok "Disabled MSS clamping on ${iface}"
 }
 
 firewall_hooks(){
@@ -873,9 +2152,35 @@ warp_status(){
     cfg=$([[ "${role}" == "gateway" ]] && echo "${GATEWAY_CFG}" || echo "${AGENT_CFG}")
     if [[ -f "${cfg}" ]]; then
       echo "${role}:"
-      grep -E 'warp:|enabled:|required:|dialer:' "${cfg}" | sed 's/^/  /' | head -20 || true
+      if grep -qsE 'dialer:\s*warp' "${cfg}"; then
+        log_ok "  WARP dialer: configured"
+        if grep -qsE 'required:\s*true' "${cfg}"; then
+          log_ok "  Fail-closed: yes"
+        else
+          log_w "  Fail-closed: no (connection may leak without WARP)"
+        fi
+        if grep -qsE 'enabled:\s*true' "${cfg}"; then
+          log_ok "  Enabled: true"
+        else
+          log_w "  Enabled: false"
+        fi
+      else
+        echo "  WARP dialer: not configured"
+      fi
+      grep -E 'warp:|enabled:|required:|dialer:|mode:|endpoint:' "${cfg}" | sed 's/^/  /' | head -20 || true
     else
       echo "${role}: config missing (${cfg})"
+    fi
+  done
+  # Check runtime state if systemd units are active
+  for unit in "${GATEWAY_UNIT}" "${AGENT_UNIT}"; do
+    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+      local recent
+      recent=$(journalctl -u "${unit}" -n 20 --no-pager 2>/dev/null | grep -i "warp" | tail -3 || true)
+      if [[ -n "${recent}" ]]; then
+        echo "  Recent WARP log (${unit}):"
+        echo "${recent}" | sed 's/^/    /'
+      fi
     fi
   done
 }
@@ -897,6 +2202,12 @@ validate_config(){
   log_ok "Config valid: ${role}"
 }
 
+assert_config_role(){
+  local cfg="$1" role="$2"
+  [[ -f "${cfg}" ]] || die "Config not found: ${cfg}"
+  grep -qsE "^role:[[:space:]]*\"?${role}\"?[[:space:]]*$" "${cfg}" || die "Config ${cfg} missing required role: ${role} (wizard output invalid)"
+}
+
 service_op(){
   local role="$1" op="$2" unit
   case "${role}" in gateway) unit="${GATEWAY_UNIT}";; agent) unit="${AGENT_UNIT}";; *) die "Invalid role: ${role}";; esac
@@ -915,15 +2226,15 @@ monitor_menu(){
         local cfg m
         cfg=$([[ "${act}" == "metrics_gateway" ]] && echo "${GATEWAY_CFG}" || echo "${AGENT_CFG}")
         [[ -f "${cfg}" ]] || { log_w "Missing config: ${cfg}"; press_enter; continue; }
-        m=$(grep -E 'listen:[[:space:]]*"?[0-9\.]+:[0-9]+"?' "${cfg}" | tail -1 | awk -F'"' '{print $2}')
+        m=$(grep -E 'listen:[[:space:]]*"?[0-9\.]+:[0-9]+"?' "${cfg}" 2>/dev/null | tail -1 | awk -F'"' '{print $2}' || true)
         [[ -z "${m}" ]] && m="127.0.0.1:9091"
         curl -fsS "http://${m}/metrics" | head -40 || log_w "Unable to fetch metrics from ${m}"
         press_enter ;;
       status) systemctl status "${GATEWAY_UNIT}" "${AGENT_UNIT}" --no-pager || true; press_enter ;;
       ping)
         local peer
-        peer=$(grep -E 'peer_ip:' "${AGENT_CFG}" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
-        [[ -z "${peer}" ]] && peer=$(grep -E 'peer_ip:' "${GATEWAY_CFG}" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+        peer=$(grep -E 'peer_ip:' "${AGENT_CFG}" 2>/dev/null | head -1 | awk -F'"' '{print $2}' || true)
+        [[ -z "${peer}" ]] && peer=$(grep -E 'peer_ip:' "${GATEWAY_CFG}" 2>/dev/null | head -1 | awk -F'"' '{print $2}' || true)
         [[ -z "${peer}" ]] && { log_w "No peer_ip found"; press_enter; continue; }
         ping -c 4 "${peer}" || true
         press_enter ;;
@@ -983,10 +2294,7 @@ main_menu(){
         role=$(select_menu "Role" "gateway" "Gateway" "agent" "Agent" "both" "Both")
         offline=0; read_yesno "Offline mode?" "n" && offline=1
         install_binaries "${bundle}" "${role}" "${offline}"; press_enter ;;
-      2)
-        local mode
-        mode=$(select_menu "Wizard target" "gateway" "Generate gateway.yaml" "agent" "Generate agent.yaml" "pair" "Generate both")
-        wizard_pair "${mode}"; press_enter ;;
+      2) wizard_pair "pair"; press_enter ;;
       3) network_setup; press_enter ;;
       4)
         local fact
@@ -1033,20 +2341,153 @@ main_menu(){
   done
 }
 
+# ---------------------------------------------------------------------------
+# Diagnose: pre-flight checks for WARP underlay, policy routing, connectivity.
+# ---------------------------------------------------------------------------
+diagnose(){
+  local check_warp=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --warp) check_warp=1; shift ;; *) shift ;; esac
+  done
+
+  local failures=0
+
+  # 1. Check binaries
+  ui_section "Binary checks"
+  for b in "${GATEWAY_BIN}" "${AGENT_BIN}" "${TOOLS_BIN}"; do
+    if [[ -x "${BIN_DIR}/${b}" ]]; then
+      log_ok "${b} found: ${BIN_DIR}/${b}"
+    else
+      log_e "${b} NOT found at ${BIN_DIR}/${b}"; ((failures++)) || true
+    fi
+  done
+
+  # 2. Check configs
+  ui_section "Configuration checks"
+  for cfg_path in "${GATEWAY_CFG}" "${AGENT_CFG}"; do
+    if [[ -f "${cfg_path}" ]]; then
+      log_ok "Config present: ${cfg_path}"
+    else
+      log_w "Config missing: ${cfg_path}"
+    fi
+  done
+
+  # 3. Check systemd units
+  ui_section "Systemd service checks"
+  for unit in "${GATEWAY_UNIT}" "${AGENT_UNIT}"; do
+    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+      log_ok "${unit}: active"
+    elif systemctl is-enabled --quiet "${unit}" 2>/dev/null; then
+      log_w "${unit}: enabled but not running"
+    else
+      log_w "${unit}: not enabled"
+    fi
+  done
+
+  # 4. Check TUN device
+  ui_section "TUN device checks"
+  if [[ -c /dev/net/tun ]]; then
+    log_ok "/dev/net/tun available"
+  else
+    log_e "/dev/net/tun NOT available (TUN kernel module may not be loaded)"; ((failures++)) || true
+  fi
+
+  # 5. Check iproute2
+  if command -v ip >/dev/null 2>&1; then
+    log_ok "iproute2 (ip) available"
+  else
+    log_e "iproute2 (ip) not found — required for interface setup"; ((failures++)) || true
+  fi
+
+  # 6. Check iptables/nftables
+  if command -v nft >/dev/null 2>&1; then
+    log_ok "nftables (nft) available"
+  elif command -v iptables >/dev/null 2>&1; then
+    log_ok "iptables available"
+  else
+    log_w "Neither nft nor iptables found — firewall rules cannot be applied"
+  fi
+
+  # 7. WARP-specific checks
+  if [[ "${check_warp}" -eq 1 ]] || grep -qsE 'dialer:\s*warp' "${GATEWAY_CFG}" "${AGENT_CFG}" 2>/dev/null; then
+    ui_section "WARP underlay diagnostics"
+
+    # Check ip rule for fwmark
+    local mark="${WARP_FWMARK:-51888}"
+    local table="${WARP_TABLE:-51888}"
+    if ip rule show 2>/dev/null | grep -q "fwmark.*${mark}"; then
+      log_ok "Policy rule for fwmark ${mark} found"
+    else
+      log_e "Policy rule for fwmark ${mark} NOT found — run: ip rule add fwmark ${mark} table ${table}"; ((failures++)) || true
+    fi
+
+    # Check routing table exists
+    if ip route show table "${table}" 2>/dev/null | grep -q .; then
+      log_ok "Routing table ${table} has routes"
+    else
+      log_e "Routing table ${table} is empty — WARP traffic will not be routed"; ((failures++)) || true
+    fi
+
+    # Check CAP_NET_ADMIN capability
+    if [[ "$(id -u)" -eq 0 ]]; then
+      log_ok "Running as root (CAP_NET_ADMIN available)"
+    else
+      log_w "Not running as root — policy routing changes require CAP_NET_ADMIN"
+    fi
+
+    # Check WARP config in configs
+    for role in gateway agent; do
+      local cfg
+      cfg=$([[ "${role}" == "gateway" ]] && echo "${GATEWAY_CFG}" || echo "${AGENT_CFG}")
+      if [[ -f "${cfg}" ]]; then
+        if grep -qsE 'dialer:\s*warp' "${cfg}"; then
+          log_ok "${role}: WARP dialer configured"
+          if grep -qsE 'required:\s*true' "${cfg}"; then
+            log_ok "${role}: WARP required=true (fail-closed)"
+          else
+            log_w "${role}: WARP required!=true (fail-open — connection may leak without WARP)"
+          fi
+        else
+          log_ok "${role}: WARP dialer not configured (OK if not using WARP)"
+        fi
+      fi
+    done
+
+    # Check WARP endpoint reachability
+    if command -v timeout >/dev/null 2>&1; then
+      if timeout 5 bash -c 'echo >/dev/tcp/engage.cloudflareclient.com/2408' 2>/dev/null; then
+        log_ok "WARP endpoint engage.cloudflareclient.com:2408 reachable"
+      else
+        log_w "WARP endpoint engage.cloudflareclient.com:2408 not reachable (may be blocked)"
+      fi
+    fi
+  fi
+
+  ui_section "Diagnosis complete"
+  if [[ "${failures}" -gt 0 ]]; then
+    log_e "${failures} issue(s) found — fix above errors before running StealthLink"
+    return 1
+  else
+    log_ok "All checks passed"
+    return 0
+  fi
+}
+
 usage(){
   cat <<USAGE
 stealthlink-ctl v${SCRIPT_VERSION}
 
 Usage:
-  stealthlink-ctl
-  stealthlink-ctl setup
+  stealthlink-ctl                        Interactive main menu
+  stealthlink-ctl setup                  One-shot guided install + wizard + services
   stealthlink-ctl install [--bundle PATH_OR_URL] [--role gateway|agent|both] [--offline]
-  stealthlink-ctl install --latest [--repo owner/repo] [--os linux] [--arch amd64] [--role gateway|agent|both] [--offline]
-  stealthlink-ctl wizard gateway|agent|pair [--non-interactive --variant 4a|4b|4c|4d|4e ...]
+                          [--latest] [--repo owner/repo] [--os linux] [--arch amd64]
+                          [--skip-checksum] [--non-interactive]
+  stealthlink-ctl wizard gateway|agent|pair [OPTIONS]
   stealthlink-ctl deps install|check [--offline]
-  stealthlink-ctl tuning apply [balanced|latency|throughput]
-  stealthlink-ctl tuning rollback
+  stealthlink-ctl tuning apply [balanced|latency|throughput] | rollback
   stealthlink-ctl firewall apply|remove [gateway|agent] [--backend auto|nft|iptables]
+  stealthlink-ctl firewall mss enable|disable [--iface sl0] [--backend auto|nft|iptables]
   stealthlink-ctl firewall hooks enable|disable
   stealthlink-ctl warp enable|disable|register|status [gateway|agent|both] [--required true|false]
   stealthlink-ctl service <gateway|agent> <start|stop|restart|enable|disable|status|logs>
@@ -1054,14 +2495,55 @@ Usage:
   stealthlink-ctl network setup
   stealthlink-ctl monitor
   stealthlink-ctl uninstall [--purge]
+  stealthlink-ctl diagnose [--warp]
   stealthlink-ctl secret
+
+Wizard options (for 'wizard' and 'setup --non-interactive'):
+  --non-interactive           Non-interactive mode (requires all flags)
+  --variant HTTP+|TCP+|TLS+|UDP+|TLS   Connection mode
+  --carrier <type>            Carrier override (quic, xhttp, rawtcp, etc.)
+  --connectivity normal|reverse
+  --shared-key <hex>          Pre-shared key (hex)
+  --gw-listen <addr>          Gateway listen address     [0.0.0.0:8443]
+  --gw-addr <addr>            Gateway public address (for agent)
+  --agent-id <id>             Agent identifier            [agent-1]
+  --iface <name>              TUN interface name          [sl0]
+  --mtu <n>                   MTU                         [mode-dependent]
+  --gw-vip <cidr>             Gateway virtual IP          [10.77.0.1/30]
+  --agent-vip <cidr>          Agent virtual IP             [10.77.0.2/30]
+  --warp-enabled true|false   Enable WARP underlay        [false]
+  --warp-required true|false  Require WARP (fail-closed)  [true]
+
+  Mode-specific (only relevant flags are used):
+    --domain <domain>           4a: real backend domain
+    --front-domain <domain>     4a: CDN front domain
+    --ech-public-name <name>    4a: ECH SNI
+    --interface <iface>         4b: network interface
+    --router-mac <mac>          4b: gateway MAC
+    --interface-ip <cidr>       4b: interface address
+    --tcp-fingerprint <profile> 4b: fingerprint
+    --aead <mode>               4b: encryption
+    --tls-mode <reality|anytls> 4c: camouflage engine
+    --reality-dest <host:port>  4c: REALITY destination
+    --anytls-password <pw>      4c: AnyTLS password
+    --bandwidth <mbps>          4d: Brutal CC bandwidth
+    --fec-enabled <bool>        4d: FEC toggle
+    --http-version <h2|h3>      4e: HTTP version
+    --tls-cert <path>           4e: certificate
+    --tls-key <path>            4e: private key
+    --tls-domain <domain>       4e: TLS domain
+    --reverse-enabled <bool>    reverse toggle
+    --agent-listen <addr>       reverse: agent bind
+    --agent-public-addr <addr>  reverse: agent reachable
+
+  Env var overrides: STEALTHLINK_MODE, STEALTHLINK_BANDWIDTH, etc.
 USAGE
 }
 
 main(){
   local cmd="${1:-}"
   case "${cmd}" in
-    ""|setup|wizard|monitor|network) reattach_tty "$@" ;;
+    ""|install|setup|wizard|monitor|network) reattach_tty "$@" ;;
   esac
   case "${cmd}" in
     "")
@@ -1072,34 +2554,45 @@ main(){
     install)
       shift
       require_root install
-      local bundle="" role="both" offline=0 latest=0 repo="${DEFAULT_RELEASE_REPO}" target_os="" target_arch=""
+      local bundle="" role="both" offline=0 latest=0 repo="${DEFAULT_RELEASE_REPO}" target_os="" target_arch="" non_interactive=0
+      SKIP_CHECKSUM=0
+      BUNDLE_CHECKSUMS_URL=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --bundle) bundle="${2:-}"; shift 2 ;;
           --role) role="${2:-both}"; shift 2 ;;
           --offline) offline=1; shift ;;
+          --skip-checksum) SKIP_CHECKSUM=1; shift ;;
           --latest) latest=1; shift ;;
           --repo) repo="${2:-}"; shift 2 ;;
           --os) target_os="${2:-}"; shift 2 ;;
           --arch) target_arch="${2:-}"; shift 2 ;;
+          --non-interactive) non_interactive=1; shift ;;
           *) shift ;;
         esac
       done
+      if [[ "${non_interactive}" == "1" ]]; then
+        NON_INTERACTIVE=1
+      fi
       if [[ "${latest}" == "1" ]]; then
         [[ -n "${bundle}" ]] && die "Use either --bundle or --latest, not both"
         [[ -z "${repo}" ]] && die "--repo is required with --latest (or set STEALTHLINK_RELEASE_REPO)"
         [[ -z "${target_os}" ]] && target_os="$(detect_target_os)"
         [[ -z "${target_arch}" ]] && target_arch="$(detect_target_arch)"
         bundle="$(resolve_latest_bundle_url "${repo}" "${target_os}" "${target_arch}")" || die "Failed to resolve latest release ZIP for ${repo} (${target_os}/${target_arch})"
+        if [[ "${SKIP_CHECKSUM}" != "1" ]]; then
+          BUNDLE_CHECKSUMS_URL="$(resolve_latest_checksums_url "${repo}")" || die "Failed to resolve SHA256SUMS asset for ${repo} latest release"
+        fi
         log_i "Resolved latest bundle URL: ${bundle}"
       fi
       install_binaries "${bundle}" "${role}" "${offline}" ;;
     wizard)
       shift
       require_root wizard
-      local mode="${1:-pair}" non_interactive=0 variant="" carrier="" connectivity="normal" shared_key=""
-      local gw_listen="0.0.0.0:8443" gw_addr="127.0.0.1:8443" agent_id="agent-1" iface="sl0" mtu="1400" gw_vip="10.77.0.1/30" agent_vip="10.77.0.2/30"
-      local warp_enabled="false" warp_required="true" overlays=""
+      local mode="${1:-pair}" non_interactive=0 variant="" carrier="" connectivity="reverse" shared_key=""
+      local gw_listen="0.0.0.0:8443" gw_addr="" agent_id="agent-1" iface="sl0" mtu="" gw_vip="10.77.0.1/30" agent_vip="10.77.0.2/30"
+      local warp_enabled="false" warp_required="true" overlays="" routed_cidrs="" dns_servers="" allow_default_route="false"
+      local allow_loopback_gateway_addr="false"
       if [[ "${mode}" != "gateway" && "${mode}" != "agent" && "${mode}" != "pair" ]]; then
         mode="pair"
       else
@@ -1112,23 +2605,49 @@ main(){
           --carrier) carrier="${2:-}"; shift 2 ;;
           --connectivity) connectivity="${2:-normal}"; shift 2 ;;
           --shared-key) shared_key="${2:-}"; shift 2 ;;
-          --gateway-listen) gw_listen="${2:-${gw_listen}}"; shift 2 ;;
-          --gateway-addr) gw_addr="${2:-${gw_addr}}"; shift 2 ;;
+          --gateway-listen|--gw-listen) gw_listen="${2:-${gw_listen}}"; shift 2 ;;
+          --gateway-addr|--gw-addr) gw_addr="${2:-${gw_addr}}"; shift 2 ;;
+          --allow-loopback-gateway-addr) allow_loopback_gateway_addr="$(parse_bool "${2:-}")" || die "--allow-loopback-gateway-addr expects true/false"; shift 2 ;;
           --agent-id) agent_id="${2:-${agent_id}}"; shift 2 ;;
           --iface) iface="${2:-${iface}}"; shift 2 ;;
           --mtu) mtu="${2:-${mtu}}"; shift 2 ;;
-          --gateway-vip) gw_vip="${2:-${gw_vip}}"; shift 2 ;;
+          --gateway-vip|--gw-vip) gw_vip="${2:-${gw_vip}}"; shift 2 ;;
           --agent-vip) agent_vip="${2:-${agent_vip}}"; shift 2 ;;
           --warp-enabled) warp_enabled="$(parse_bool "${2:-}")" || die "--warp-enabled expects true/false"; shift 2 ;;
           --warp-required) warp_required="$(parse_bool "${2:-}")" || die "--warp-required expects true/false"; shift 2 ;;
           --overlays) overlays="${2:-}"; shift 2 ;;
+          --routes) routed_cidrs="${2:-}"; shift 2 ;;
+          --dns) dns_servers="${2:-}"; shift 2 ;;
+          --allow-default-route) allow_default_route="$(parse_bool "${2:-}")" || die "--allow-default-route expects true/false"; shift 2 ;;
+          # Mode-specific flags
+          --domain) export WIZ_DOMAIN="${2:-}"; shift 2 ;;
+          --front-domain) export WIZ_FRONT_DOMAIN="${2:-}"; shift 2 ;;
+          --ech-public-name) export WIZ_ECH_PUBLIC_NAME="${2:-}"; shift 2 ;;
+          --interface) export WIZ_INTERFACE="${2:-}"; shift 2 ;;
+          --router-mac) export WIZ_ROUTER_MAC="${2:-}"; shift 2 ;;
+          --interface-ip) export WIZ_INTERFACE_IP="${2:-}"; shift 2 ;;
+          --tcp-fingerprint) export WIZ_TCP_FINGERPRINT="${2:-}"; shift 2 ;;
+          --aead) export WIZ_AEAD="${2:-}"; shift 2 ;;
+          --tls-mode) export WIZ_TLS_MODE="${2:-}"; shift 2 ;;
+          --reality-dest) export WIZ_REALITY_DEST="${2:-}"; shift 2 ;;
+          --anytls-password) export WIZ_ANYTLS_PASSWORD="${2:-}"; shift 2 ;;
+          --bandwidth) export WIZ_BANDWIDTH="${2:-}"; shift 2 ;;
+          --fec-enabled) export WIZ_FEC_ENABLED="${2:-}"; shift 2 ;;
+          --http-version) export WIZ_HTTP_VERSION="${2:-}"; shift 2 ;;
+          --tls-cert) export WIZ_TLS_CERT="${2:-}"; shift 2 ;;
+          --tls-key) export WIZ_TLS_KEY="${2:-}"; shift 2 ;;
+          --tls-domain) export WIZ_TLS_DOMAIN="${2:-}"; shift 2 ;;
+          --reverse-enabled) export WIZ_REVERSE_ENABLED="$(parse_bool "${2:-}")" || die "--reverse-enabled expects true/false"; shift 2 ;;
+          --agent-listen) export WIZ_AGENT_LISTEN="${2:-}"; shift 2 ;;
+          --agent-public-addr) export WIZ_AGENT_PUBLIC_ADDR="${2:-}"; shift 2 ;;
           *) shift ;;
         esac
       done
+      [[ -z "${mtu}" ]] && mtu="$(default_mtu_for_variant "${variant:-UDP+}")"
       if [[ "${non_interactive}" == "1" ]]; then
-        [[ -z "${variant}" ]] && variant="4d"
+        [[ -z "${variant}" ]] && variant="${STEALTHLINK_MODE:-UDP+}"
         overlays="${overlays//,/ }"
-        wizard_pair_auto "${mode}" "${variant}" "${carrier}" "${connectivity}" "${shared_key}" "${gw_listen}" "${gw_addr}" "${agent_id}" "${iface}" "${mtu}" "${gw_vip}" "${agent_vip}" "${warp_enabled}" "${warp_required}" "${overlays}"
+        wizard_pair_auto "${mode}" "${variant}" "${carrier}" "${connectivity}" "${shared_key}" "${gw_listen}" "${gw_addr}" "${agent_id}" "${iface}" "${mtu}" "${gw_vip}" "${agent_vip}" "${warp_enabled}" "${warp_required}" "${overlays}" "${routed_cidrs}" "${dns_servers}" "${allow_default_route}" "${allow_loopback_gateway_addr}"
       else
         wizard_pair "${mode}"
       fi ;;
@@ -1153,6 +2672,21 @@ main(){
       require_root firewall
       if [[ "${1:-}" == "hooks" ]]; then
         case "${2:-}" in enable|disable) firewall_hooks "${2}" ;; *) die "Usage: firewall hooks enable|disable" ;; esac
+      elif [[ "${1:-}" == "mss" ]]; then
+        local action="${2:-}" iface="sl0" backend="auto"
+        shift 2 2>/dev/null || true
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --iface) iface="${2:-sl0}"; shift 2 ;;
+            --backend) backend="${2:-auto}"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        case "${action}" in
+          enable) firewall_mss_enable "${iface}" "${backend}" ;;
+          disable) firewall_mss_disable "${iface}" "${backend}" ;;
+          *) die "Usage: firewall mss enable|disable [--iface sl0] [--backend auto|nft|iptables]" ;;
+        esac
       else
         local action="${1:-}" role="gateway" backend="auto"
         shift 1 2>/dev/null || true
@@ -1203,13 +2737,17 @@ main(){
       shift
       require_root setup
       local bundle="" role="both" offline=0 wizard_target="pair" tune_profile="balanced" non_interactive=0 latest=0 repo="${DEFAULT_RELEASE_REPO}" target_os="" target_arch=""
-      local variant="" carrier="" connectivity="normal" shared_key="" gw_listen="0.0.0.0:8443" gw_addr="127.0.0.1:8443" agent_id="agent-1" iface="sl0" mtu="1400" gw_vip="10.77.0.1/30" agent_vip="10.77.0.2/30"
-      local warp_enabled="false" warp_required="true" overlays="" apply_firewall="true" start_services="true"
+      SKIP_CHECKSUM=0
+      BUNDLE_CHECKSUMS_URL=""
+      local variant="" carrier="" connectivity="reverse" shared_key="" gw_listen="0.0.0.0:8443" gw_addr="" agent_id="agent-1" iface="sl0" mtu="" gw_vip="10.77.0.1/30" agent_vip="10.77.0.2/30"
+      local warp_enabled="false" warp_required="true" overlays="" routed_cidrs="" dns_servers="" apply_firewall="true" start_services="true" allow_default_route="false"
+      local allow_loopback_gateway_addr="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --bundle) bundle="${2:-}"; shift 2 ;;
           --role) role="${2:-both}"; shift 2 ;;
           --offline) offline=1; shift ;;
+          --skip-checksum) SKIP_CHECKSUM=1; shift ;;
           --latest) latest=1; shift ;;
           --repo) repo="${2:-}"; shift 2 ;;
           --os) target_os="${2:-}"; shift 2 ;;
@@ -1221,31 +2759,62 @@ main(){
           --carrier) carrier="${2:-}"; shift 2 ;;
           --connectivity) connectivity="${2:-normal}"; shift 2 ;;
           --shared-key) shared_key="${2:-}"; shift 2 ;;
-          --gateway-listen) gw_listen="${2:-${gw_listen}}"; shift 2 ;;
-          --gateway-addr) gw_addr="${2:-${gw_addr}}"; shift 2 ;;
+          --gateway-listen|--gw-listen) gw_listen="${2:-${gw_listen}}"; shift 2 ;;
+          --gateway-addr|--gw-addr) gw_addr="${2:-${gw_addr}}"; shift 2 ;;
+          --allow-loopback-gateway-addr) allow_loopback_gateway_addr="$(parse_bool "${2:-}")" || die "--allow-loopback-gateway-addr expects true/false"; shift 2 ;;
           --agent-id) agent_id="${2:-${agent_id}}"; shift 2 ;;
           --iface) iface="${2:-${iface}}"; shift 2 ;;
           --mtu) mtu="${2:-${mtu}}"; shift 2 ;;
-          --gateway-vip) gw_vip="${2:-${gw_vip}}"; shift 2 ;;
+          --gateway-vip|--gw-vip) gw_vip="${2:-${gw_vip}}"; shift 2 ;;
           --agent-vip) agent_vip="${2:-${agent_vip}}"; shift 2 ;;
           --warp-enabled) warp_enabled="$(parse_bool "${2:-}")" || die "--warp-enabled expects true/false"; shift 2 ;;
           --warp-required) warp_required="$(parse_bool "${2:-}")" || die "--warp-required expects true/false"; shift 2 ;;
           --overlays) overlays="${2:-}"; shift 2 ;;
+          --routes) routed_cidrs="${2:-}"; shift 2 ;;
+          --dns) dns_servers="${2:-}"; shift 2 ;;
+          --allow-default-route) allow_default_route="$(parse_bool "${2:-}")" || die "--allow-default-route expects true/false"; shift 2 ;;
           --apply-firewall) apply_firewall="$(parse_bool "${2:-}")" || die "--apply-firewall expects true/false"; shift 2 ;;
           --start-services) start_services="$(parse_bool "${2:-}")" || die "--start-services expects true/false"; shift 2 ;;
+          # Mode-specific flags
+          --domain) export WIZ_DOMAIN="${2:-}"; shift 2 ;;
+          --front-domain) export WIZ_FRONT_DOMAIN="${2:-}"; shift 2 ;;
+          --ech-public-name) export WIZ_ECH_PUBLIC_NAME="${2:-}"; shift 2 ;;
+          --interface) export WIZ_INTERFACE="${2:-}"; shift 2 ;;
+          --router-mac) export WIZ_ROUTER_MAC="${2:-}"; shift 2 ;;
+          --interface-ip) export WIZ_INTERFACE_IP="${2:-}"; shift 2 ;;
+          --tcp-fingerprint) export WIZ_TCP_FINGERPRINT="${2:-}"; shift 2 ;;
+          --aead) export WIZ_AEAD="${2:-}"; shift 2 ;;
+          --tls-mode) export WIZ_TLS_MODE="${2:-}"; shift 2 ;;
+          --reality-dest) export WIZ_REALITY_DEST="${2:-}"; shift 2 ;;
+          --anytls-password) export WIZ_ANYTLS_PASSWORD="${2:-}"; shift 2 ;;
+          --bandwidth) export WIZ_BANDWIDTH="${2:-}"; shift 2 ;;
+          --fec-enabled) export WIZ_FEC_ENABLED="${2:-}"; shift 2 ;;
+          --http-version) export WIZ_HTTP_VERSION="${2:-}"; shift 2 ;;
+          --tls-cert) export WIZ_TLS_CERT="${2:-}"; shift 2 ;;
+          --tls-key) export WIZ_TLS_KEY="${2:-}"; shift 2 ;;
+          --tls-domain) export WIZ_TLS_DOMAIN="${2:-}"; shift 2 ;;
+          --reverse-enabled) export WIZ_REVERSE_ENABLED="$(parse_bool "${2:-}")" || die "--reverse-enabled expects true/false"; shift 2 ;;
+          --agent-listen) export WIZ_AGENT_LISTEN="${2:-}"; shift 2 ;;
+          --agent-public-addr) export WIZ_AGENT_PUBLIC_ADDR="${2:-}"; shift 2 ;;
           *) shift ;;
         esac
       done
+      [[ -z "${mtu}" ]] && mtu="$(default_mtu_for_variant "${variant:-UDP+}")"
       if [[ "${latest}" == "1" ]]; then
         [[ -n "${bundle}" ]] && die "Use either --bundle or --latest, not both"
         [[ -z "${repo}" ]] && die "--repo is required with --latest (or set STEALTHLINK_RELEASE_REPO)"
         [[ -z "${target_os}" ]] && target_os="$(detect_target_os)"
         [[ -z "${target_arch}" ]] && target_arch="$(detect_target_arch)"
         bundle="$(resolve_latest_bundle_url "${repo}" "${target_os}" "${target_arch}")" || die "Failed to resolve latest release ZIP for ${repo} (${target_os}/${target_arch})"
+        if [[ "${SKIP_CHECKSUM}" != "1" ]]; then
+          BUNDLE_CHECKSUMS_URL="$(resolve_latest_checksums_url "${repo}")" || die "Failed to resolve SHA256SUMS asset for ${repo} latest release"
+        fi
       fi
       if [[ "${non_interactive}" == "1" ]]; then
+        NON_INTERACTIVE=1
         [[ -z "${bundle}" ]] && die "--bundle or --latest is required in --non-interactive mode"
-        [[ -z "${variant}" ]] && variant="4d"
+        [[ -z "${variant}" ]] && variant="UDP+"
+        routes_validate_no_default "${routed_cidrs}" "${allow_default_route}"
         case "${role}" in
           gateway) [[ "${wizard_target}" == "pair" ]] || wizard_target="gateway" ;;
           agent) [[ "${wizard_target}" == "pair" ]] || wizard_target="agent" ;;
@@ -1253,7 +2822,18 @@ main(){
         esac
         overlays="${overlays//,/ }"
         install_binaries "${bundle}" "${role}" "${offline}"
-        wizard_pair_auto "${wizard_target}" "${variant}" "${carrier}" "${connectivity}" "${shared_key}" "${gw_listen}" "${gw_addr}" "${agent_id}" "${iface}" "${mtu}" "${gw_vip}" "${agent_vip}" "${warp_enabled}" "${warp_required}" "${overlays}"
+        wizard_pair_auto "${wizard_target}" "${variant}" "${carrier}" "${connectivity}" "${shared_key}" "${gw_listen}" "${gw_addr}" "${agent_id}" "${iface}" "${mtu}" "${gw_vip}" "${agent_vip}" "${warp_enabled}" "${warp_required}" "${overlays}" "${routed_cidrs}" "${dns_servers}" "${allow_default_route}" "${allow_loopback_gateway_addr}"
+
+        # Fail fast on invalid wizard output before any host/network changes.
+        if [[ "${role}" == "gateway" || "${role}" == "both" ]]; then
+          assert_config_role "${GATEWAY_CFG}" gateway
+          validate_config gateway
+        fi
+        if [[ "${role}" == "agent" || "${role}" == "both" ]]; then
+          assert_config_role "${AGENT_CFG}" agent
+          validate_config agent
+        fi
+
         network_setup_auto
         [[ "${tune_profile}" != "skip" ]] && apply_tuning "${tune_profile}"
         if [[ "${apply_firewall}" == "true" ]]; then
@@ -1289,6 +2869,16 @@ main(){
         esac
         if [[ "${role}" != "both" ]] && read_yesno "Also generate both configs on this host?" "n"; then wizard_target="pair"; fi
         wizard_pair "${wizard_target}"
+
+        # Validate generated config(s) before touching sysctl/firewall/systemd.
+        if [[ "${role}" == "gateway" || "${role}" == "both" ]]; then
+          assert_config_role "${GATEWAY_CFG}" gateway
+          validate_config gateway
+        fi
+        if [[ "${role}" == "agent" || "${role}" == "both" ]]; then
+          assert_config_role "${AGENT_CFG}" agent
+          validate_config agent
+        fi
 
         ui_section "Step 3/6: Network & VPN Setup"
         network_setup
@@ -1327,6 +2917,10 @@ main(){
         ui_print "Check services: stealthlink-ctl service gateway status | stealthlink-ctl service agent status"
         log_ok "One-shot setup completed"
       fi ;;
+    diagnose)
+      shift
+      require_root diagnose
+      diagnose "$@" ;;
     secret) gen_secret ;;
     *) usage; die "Unknown command: ${cmd}" ;;
   esac

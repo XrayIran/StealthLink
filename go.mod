@@ -13,6 +13,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/quic-go/quic-go v0.59.0
 	github.com/refraction-networking/utls v1.8.2
+	github.com/sagernet/sing v0.6.1
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/stretchr/testify v1.11.1
 	github.com/xtaci/kcp-go/v5 v5.6.70
@@ -29,6 +30,7 @@ require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.6 // indirect
 	github.com/klauspost/reedsolomon v1.12.0 // indirect
@@ -40,7 +42,6 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/sagernet/sing v0.6.1 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/mod v0.31.0 // indirect
@@ -52,3 +53,5 @@ require (
 )
 
 replace github.com/xtaci/kcp-go/v5 => ./sources/kcp-go
+
+replace github.com/xtaci/smux => ./sources/smux

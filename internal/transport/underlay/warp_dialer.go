@@ -14,23 +14,20 @@ import (
 	"stealthlink/internal/warp"
 )
 
-// WARPDialer implements dialing through Cloudflare WARP
 type WARPDialer struct {
-	config config.WARPDialer
-	tunnel *warp.Tunnel
-	mu     sync.RWMutex
-	health string // "up" | "down"
+	config     config.WARPDialer
+	tunnel     *warp.Tunnel
+	mu         sync.RWMutex
+	health     string
+	policyCfg  warp.PolicyRoutingConfig
+	routingSet bool
 }
 
-// NewWARPDialer creates a new WARP dialer
 func NewWARPDialer(cfg config.WARPDialer) (*WARPDialer, error) {
-	// Test-only escape hatch: allow wiring/variant tests to validate that the
-	// "warp" dialer path is selectable without requiring privileged WARP setup.
-	//
-	// This does NOT provide WARP egress; it dials directly. Do not use in production.
 	if os.Getenv("STEALTHLINK_WARP_DIALER_MOCK") == "1" {
 		d := &WARPDialer{config: cfg, tunnel: nil, health: "up"}
 		metrics.SetWARPHealth("up")
+		metrics.SetUnderlaySelected("warp")
 		return d, nil
 	}
 
@@ -39,24 +36,31 @@ func NewWARPDialer(cfg config.WARPDialer) (*WARPDialer, error) {
 		engine = "builtin"
 	}
 
-	// Create WARP configuration
+	routingPolicy := strings.ToLower(strings.TrimSpace(cfg.RoutingPolicy))
+	if routingPolicy == "" {
+		routingPolicy = "socket_mark"
+	}
+
 	warpCfg := warp.Config{
 		Enabled:       true,
 		Required:      cfg.Required,
-		Mode:          engine, // internal engine selector: "builtin" | "wgquick"
+		Mode:          engine,
 		Endpoint:      "engage.cloudflareclient.com:2408",
-		RoutingMode:   "vpn_only", // Route only StealthLink traffic through WARP
+		RoutingMode:   "vpn_only",
 		InterfaceName: "warp0",
 		Keepalive:     25 * time.Second,
 	}
 
-	// Create WARP tunnel
 	tunnel, err := warp.NewTunnel(warpCfg)
 	if err != nil {
-		return nil, fmt.Errorf("create WARP tunnel: %w", err)
+		if cfg.Required {
+			return nil, fmt.Errorf("create WARP tunnel (required): %w", err)
+		}
+		d := &WARPDialer{config: cfg, health: "down"}
+		metrics.SetWARPHealth("down")
+		return d, nil
 	}
 
-	// Set device ID if provided
 	if cfg.DeviceID != "" {
 		device := tunnel.GetDevice()
 		if device == nil {
@@ -69,61 +73,80 @@ func NewWARPDialer(cfg config.WARPDialer) (*WARPDialer, error) {
 		config: cfg,
 		tunnel: tunnel,
 		health: "down",
+		policyCfg: warp.PolicyRoutingConfig{
+			Mark:         cfg.Mark,
+			Table:        cfg.Table,
+			RulePriority: cfg.RulePriority,
+			IfaceName:    warpCfg.InterfaceName,
+		},
 	}
 
-	// Start WARP tunnel
 	if err := tunnel.Start(); err != nil {
-		return nil, fmt.Errorf("start WARP tunnel: %w", err)
+		if cfg.Required {
+			return nil, fmt.Errorf("start WARP tunnel (required): %w", err)
+		}
+		metrics.SetWARPHealth("down")
+		return d, nil
+	}
+
+	if routingPolicy == "socket_mark" {
+		if err := warp.SetupPolicyRouting(d.policyCfg); err != nil {
+			tunnel.Close()
+			if cfg.Required {
+				return nil, fmt.Errorf("setup WARP policy routing (required): %w", err)
+			}
+			metrics.SetWARPHealth("down")
+			return d, nil
+		}
+		d.routingSet = true
 	}
 
 	d.health = "up"
-
-	// Update metrics
 	metrics.SetWARPHealth("up")
+	metrics.SetUnderlaySelected("warp")
 
 	return d, nil
 }
 
-// Dial establishes a connection through WARP
 func (d *WARPDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
+	health := d.health
+	d.mu.RUnlock()
 
-	if d.health != "up" {
+	if health != "up" {
 		return nil, fmt.Errorf("WARP tunnel is down")
 	}
 
-	// Use standard dialer but traffic will be routed through WARP
-	// due to routing configuration
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
+		Control:   d.socketControl,
 	}
 
 	return dialer.DialContext(ctx, network, address)
 }
 
-// Type returns the dialer type
 func (d *WARPDialer) Type() string {
 	return "warp"
 }
 
-// Health returns the WARP tunnel health status
 func (d *WARPDialer) Health() string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.health
 }
 
-// Close closes the WARP dialer and tunnel
 func (d *WARPDialer) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	d.health = "down"
-
-	// Update metrics
 	metrics.SetWARPHealth("down")
+
+	if d.routingSet {
+		warp.TeardownPolicyRouting(d.policyCfg)
+		d.routingSet = false
+	}
 
 	if d.tunnel != nil {
 		return d.tunnel.Close()

@@ -21,22 +21,12 @@ Directory Structure:
 
 Config files:
 
-Notes about `include` paths:
-
-- Relative paths (for example `config.d/*.dae`) are resolved relative to the directory of the *entry* config file (the file passed to `dae -c ...`), not relative to the current working directory.
-- Absolute paths (for example `/etc/dae/config.d/*.dae`) are used as-is.
-- For security reasons, dae only allows included files under the entry config directory.
-
 ```jsonc
 # config.dae
 
 # load all dae files placed in ./config.d/
 include {
-    # Relative path example:
     config.d/*.dae
-
-    # Absolute path example:
-    /etc/dae/config.d/*.dae
 }
 global {
     tproxy_port: 12345
@@ -54,6 +44,7 @@ global {
 
     dial_mode: domain
     disable_waiting_network: false
+    enable_local_tcp_fast_redirect: false
     auto_config_kernel_parameter: true
     sniffing_timeout: 100ms
 }

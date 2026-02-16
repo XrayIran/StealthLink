@@ -8,6 +8,8 @@ import (
 	"stealthlink/internal/transport/transportutil"
 )
 
+// UPSTREAM_WIRING: paqet
+
 func TestIsTransientBufferError(t *testing.T) {
 	cases := []struct {
 		name string

@@ -16,7 +16,7 @@ StealthLink is integrating techniques from multiple upstream projects (Xray-core
 
 **Option B: Technique Consolidation**
 - Extract best-of-breed techniques from upstream
-- Consolidate into five unified StealthLink modes (4a-4e)
+- Consolidate into five unified StealthLink modes (HTTP+-TLS)
 - Define StealthLink-native wire formats as canonical
 - Provide optional compatibility adapters when needed
 
@@ -24,15 +24,15 @@ StealthLink is integrating techniques from multiple upstream projects (Xray-core
 
 We choose **Option B: Technique Consolidation** with the following principles:
 
-### 1. Five Canonical Modes (4a-4e)
+### 1. Five Canonical Modes (HTTP+-TLS)
 
 StealthLink defines five protocol modes as the canonical wire formats:
 
-- **Mode 4a (XHTTP + Domain Fronting)**: HTTP/2 over TLS with flexible metadata placement
-- **Mode 4b (FakeTCP + Anti-DPI)**: UDP with TCP mimicry and directional encryption
-- **Mode 4c (TLS-Like + REALITY/AnyTLS)**: TLS 1.3 with fingerprint resistance
-- **Mode 4d (QUIC + Brutal CC)**: QUIC with fixed bandwidth congestion control
-- **Mode 4e (TrustTunnel + CSTP)**: HTTP CONNECT with ICMP multiplexing
+- **Mode HTTP+ (XHTTP + Domain Fronting)**: HTTP/2 over TLS with flexible metadata placement
+- **Mode TCP+ (FakeTCP + Anti-DPI)**: UDP with TCP mimicry and directional encryption
+- **Mode TLS+ (TLS-Like + REALITY/AnyTLS)**: TLS 1.3 with fingerprint resistance
+- **Mode UDP+ (QUIC + Brutal CC)**: QUIC with fixed bandwidth congestion control
+- **Mode TLS (TrustTunnel + CSTP)**: HTTP CONNECT with ICMP multiplexing
 
 Each mode consolidates techniques from multiple upstream projects into a cohesive protocol.
 
@@ -109,11 +109,11 @@ All modes use a common StealthLink frame format (16-byte header + padding + payl
 ```
 
 Each mode wraps this frame in mode-specific obfuscation:
-- Mode 4a: HTTP/2 DATA frame
-- Mode 4b: FakeTCP packet with TCP header
-- Mode 4c: TLS Application Data record
-- Mode 4d: QUIC STREAM frame
-- Mode 4e: HTTP/2 DATA frame with ICMP mux header
+- Mode HTTP+: HTTP/2 DATA frame
+- Mode TCP+: FakeTCP packet with TCP header
+- Mode TLS+: TLS Application Data record
+- Mode UDP+: QUIC STREAM frame
+- Mode TLS: HTTP/2 DATA frame with ICMP mux header
 
 ## Rationale
 
@@ -123,7 +123,7 @@ Each mode wraps this frame in mode-specific obfuscation:
 
 2. **Unified Configuration Surface**: Five modes with clear capability matrices are easier to configure than dozens of upstream protocol combinations.
 
-3. **Optimized Integration**: Consolidation allows us to optimize how techniques work together (e.g., batch I/O + FEC + hardware entropy in mode 4d).
+3. **Optimized Integration**: Consolidation allows us to optimize how techniques work together (e.g., batch I/O + FEC + hardware entropy in mode UDP+).
 
 4. **Reduced Complexity**: We don't need to maintain compatibility with every upstream protocol version and quirk.
 
@@ -167,7 +167,7 @@ Adapters should **not** be the default or primary mode of operation.
 ### Phase -1: Core Wire Format & Carrier Capability Model
 
 1. ✅ Define Carrier interface with capability flags
-2. ✅ Define 5 mode profiles (4a-4e) as canonical config surface
+2. ✅ Define 5 mode profiles (HTTP+-TLS) as canonical config surface
 3. ✅ Add upstream compatibility adapters as optional modules
 4. ✅ Update configuration schema to use mode-based profiles
 5. ⏳ Definition of Done verification
@@ -186,7 +186,7 @@ Adapters should **not** be the default or primary mode of operation.
 ```yaml
 transport:
   # Mode selection (canonical StealthLink modes)
-  mode: "4a"  # 4a | 4b | 4c | 4d | 4e
+  mode: "HTTP+"  # HTTP+ | TCP+ | TLS+ | UDP+ | TLS
   
   # Optional: upstream compatibility
   compat_mode: "none"  # none | xray | singbox

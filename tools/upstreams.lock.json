@@ -1,0 +1,381 @@
+{
+  "entries": [
+    {
+      "describe": "ubuntu24-335-g3167bf6",
+      "head": "3167bf61e00f1d54cfb24f333e8b80e95a388992",
+      "is_git": true,
+      "name": "6TO4-GRE-IPIP-SIT",
+      "origin": "https://github.com/Azumi67/6TO4-GRE-IPIP-SIT",
+      "path": "sources/6TO4-GRE-IPIP-SIT"
+    },
+    {
+      "describe": "v0.7.2",
+      "head": "df7966f8f725837a680ea7b90bd37ea52666c277",
+      "is_git": true,
+      "name": "Backhaul",
+      "origin": "https://github.com/Musixal/Backhaul",
+      "path": "sources/Backhaul"
+    },
+    {
+      "describe": "v2.5.0-45-gfe4e779",
+      "head": "fe4e77979de6cdc6eb5fad254a4188eefaa821e4",
+      "is_git": true,
+      "name": "EasyTier",
+      "origin": "https://github.com/EasyTier/EasyTier",
+      "path": "sources/EasyTier"
+    },
+    {
+      "describe": "FRP-2-geb0d50f",
+      "head": "eb0d50f2754a3ceb6043c9ba2ba23e531073f5e8",
+      "is_git": true,
+      "name": "FRP_Reverse_Loadbalance",
+      "origin": "https://github.com/Azumi67/FRP_Reverse_Loadbalance",
+      "path": "sources/FRP_Reverse_Loadbalance"
+    },
+    {
+      "describe": "v0.9.125",
+      "head": "88c34f33db458344460a4161c23fb590760aa945",
+      "is_git": true,
+      "name": "TrustTunnel",
+      "origin": "https://github.com/TrustTunnel/TrustTunnel/",
+      "path": "sources/TrustTunnel"
+    },
+    {
+      "describe": "stable-latest",
+      "head": "db8c0944c636d90aa2730af8df43ecffcd30b5a1",
+      "is_git": true,
+      "name": "Tunnel",
+      "origin": "https://github.com/changecoin938/Tunnel",
+      "path": "sources/Tunnel"
+    },
+    {
+      "describe": "v1.3.0",
+      "head": "d63b9a8a081f6ecb09ea52082289383a38ceff40",
+      "is_git": true,
+      "name": "VPS-Optimizer",
+      "origin": "https://github.com/opiran-club/VPS-Optimizer",
+      "path": "sources/VPS-Optimizer"
+    },
+    {
+      "describe": "1e81eb1",
+      "head": "1e81eb1f54e38d46fd99a462054f20c191cda91e",
+      "is_git": true,
+      "name": "VornaTunnel",
+      "origin": "https://github.com/iliya-Developer/VornaTunnel",
+      "path": "sources/VornaTunnel"
+    },
+    {
+      "describe": "v4.0.0",
+      "head": "78f2a4878b87e86e8e64f4f4c132d457cadf1142",
+      "is_git": true,
+      "name": "VortexL2",
+      "origin": "https://github.com/iliya-Developer/VortexL2",
+      "path": "sources/VortexL2"
+    },
+    {
+      "describe": "v2.2.2",
+      "head": "cdced3e5fa831858b69d0a35640c59d5638e9e18",
+      "is_git": true,
+      "name": "Vwarp",
+      "origin": "https://github.com/voidr3aper-anon/Vwarp",
+      "path": "sources/Vwarp"
+    },
+    {
+      "describe": "v1.41",
+      "head": "1ff7097a605ffb23fef7d20ae8613835071a11a0",
+      "is_git": true,
+      "name": "WaterWall",
+      "origin": "https://github.com/radkesvat/WaterWall",
+      "path": "sources/WaterWall"
+    },
+    {
+      "describe": "v1.260206.0",
+      "head": "12ee51e4bb1d02ece4ef4b7114efa2bcdc130995",
+      "is_git": true,
+      "name": "Xray-core",
+      "origin": "https://github.com/XTLS/Xray-core",
+      "path": "sources/Xray-core"
+    },
+    {
+      "describe": "4.8.12.9",
+      "head": "f73792844ce5e5bd26b6ba2fe93481d3d39243a6",
+      "is_git": true,
+      "name": "amnezia-client",
+      "origin": "https://github.com/amnezia-vpn/amnezia-client",
+      "path": "sources/amnezia-client"
+    },
+    {
+      "describe": "v0.0.12",
+      "head": "2012ef89768409f45437f1c06a7af5f6eea402ad",
+      "is_git": true,
+      "name": "anytls-go",
+      "origin": "https://github.com/anytls/anytls-go",
+      "path": "sources/anytls-go"
+    },
+    {
+      "describe": "0090962",
+      "head": "0090962226b82aa4a8fc38506f9b98de67d0781e",
+      "is_git": true,
+      "name": "conjure",
+      "origin": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/conjure",
+      "path": "sources/conjure"
+    },
+    {
+      "describe": "v1.0.0",
+      "head": "bc7e46422f6982b8d1bae09af21a4eb0a97487c9",
+      "is_git": true,
+      "name": "dae",
+      "origin": "https://github.com/daeuniverse/dae",
+      "path": "sources/dae"
+    },
+    {
+      "describe": "v.1.3.1",
+      "head": "4be74702d8f4d3a0eb96c6d6928a91e1322cbb66",
+      "is_git": true,
+      "name": "daggerConnect",
+      "origin": "https://github.com/itsFLoKi/daggerConnect",
+      "path": "sources/daggerConnect"
+    },
+    {
+      "describe": "f1faf32",
+      "head": "f1faf32f3c2b4ca0ba880239f6590c37a6c31442",
+      "is_git": true,
+      "name": "gfw_resist_HTTPS_proxy",
+      "origin": "https://github.com/GFW-knocker/gfw_resist_HTTPS_proxy",
+      "path": "sources/gfw_resist_HTTPS_proxy"
+    },
+    {
+      "describe": "cfdea99",
+      "head": "cfdea99fd435cb18a21aa5cf33deb03decb7b145",
+      "is_git": true,
+      "name": "gfw_resist_tcp_proxy",
+      "origin": "https://github.com/GFW-knocker/gfw_resist_tcp_proxy",
+      "path": "sources/gfw_resist_tcp_proxy"
+    },
+    {
+      "describe": "2a6ff72",
+      "head": "2a6ff722b14c34ade149cc5692d2bc962e2fd28b",
+      "is_git": true,
+      "name": "gfw_resist_tls_proxy",
+      "origin": "https://github.com/GFW-knocker/gfw_resist_tls_proxy",
+      "path": "sources/gfw_resist_tls_proxy"
+    },
+    {
+      "describe": "v3.2.7-nightly.20251122",
+      "head": "340ba32ef0bebc7293908007cc423dd5f33dd88c",
+      "is_git": true,
+      "name": "gost",
+      "origin": "https://github.com/go-gost/gost",
+      "path": "sources/gost"
+    },
+    {
+      "describe": "v1.1.14",
+      "head": "36b96c9a1f67feecd6ef85406bb22dc5d52b7bcf",
+      "is_git": true,
+      "name": "grasshopper",
+      "origin": "https://github.com/xtaci/grasshopper",
+      "path": "sources/grasshopper"
+    },
+    {
+      "describe": "v3.4-dev4-62-gcb63e899d",
+      "head": "cb63e899d906ad04c601ad54a21ee491854c6a79",
+      "is_git": true,
+      "name": "haproxy",
+      "origin": "https://github.com/haproxy/haproxy",
+      "path": "sources/haproxy"
+    },
+    {
+      "describe": "app/v1.3.5",
+      "head": "57c5164854d6cfe00bead730cce731da2babe406",
+      "is_git": true,
+      "name": "hysteria",
+      "origin": "https://github.com/apernet/hysteria",
+      "path": "sources/hysteria"
+    },
+    {
+      "describe": "v0.5.0",
+      "head": "88dbf4f8efc54d70caf319ec79d0b7f12d70faf1",
+      "is_git": true,
+      "name": "juicity",
+      "origin": "https://github.com/juicity/juicity",
+      "path": "sources/juicity"
+    },
+    {
+      "describe": "v5.6.70",
+      "head": "6d3de74039b2614b2bdab8f050f1eb2ecb8dfac9",
+      "is_git": true,
+      "name": "kcp-go",
+      "origin": "https://github.com/xtaci/kcp-go",
+      "path": "sources/kcp-go"
+    },
+    {
+      "describe": "v20210922",
+      "head": "94c9cacf4f87118e5e7716a7c1c41835f4fc04c9",
+      "is_git": true,
+      "name": "kcptun",
+      "origin": "https://github.com/dandycheung/kcptun",
+      "path": "sources/kcptun"
+    },
+    {
+      "describe": "v0.13.0",
+      "head": "ca7e81ceb3e7f81c8081c3844802776c1143ddec",
+      "is_git": true,
+      "name": "leaf",
+      "origin": "https://github.com/eycorsican/leaf",
+      "path": "sources/leaf"
+    },
+    {
+      "describe": "lyrebird-0.8.1",
+      "head": "0b10edbb61e0ca6fb70c7d57aeaabf315f1fade1",
+      "is_git": true,
+      "name": "lyrebird",
+      "origin": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird",
+      "path": "sources/lyrebird"
+    },
+    {
+      "describe": "v1.19.20",
+      "head": "97f25250a625117106490d62a5243156fde05dd9",
+      "is_git": true,
+      "name": "mihomo",
+      "origin": "https://github.com/MetaCubeX/mihomo.git",
+      "path": "sources/mihomo"
+    },
+    {
+      "describe": "1.4.0-35-g834d2fa0",
+      "head": "834d2fa0e84aa7e7d3f89d478c72f3078769b6b8",
+      "is_git": true,
+      "name": "ocserv",
+      "origin": "https://gitlab.com/openconnect/ocserv",
+      "path": "sources/ocserv"
+    },
+    {
+      "describe": "v9.12",
+      "head": "59f2e59eb3e436364ef82e630e5a2f88f32acd58",
+      "is_git": true,
+      "name": "openconnect",
+      "origin": "https://gitlab.com/openconnect/openconnect",
+      "path": "sources/openconnect"
+    },
+    {
+      "describe": "v1.0.0-alpha.13-47-g361235d",
+      "head": "361235daca4248c0228802dd05312ed46f547dcb",
+      "is_git": true,
+      "name": "paqctl",
+      "origin": "https://github.com/SamNet-dev/paqctl",
+      "path": "sources/paqctl"
+    },
+    {
+      "describe": "v1.0.0-alpha.16",
+      "head": "ccadb028fd15896228ae36645389888e0ebf486a",
+      "is_git": true,
+      "name": "paqet",
+      "origin": "https://github.com/hanselime/paqet",
+      "path": "sources/paqet"
+    },
+    {
+      "describe": "v0.0.14-beta-ios-2889-ga680f45b",
+      "head": "a680f45b13d87e0a0f83399de45dfaa8f7f25e53",
+      "is_git": true,
+      "name": "psiphon-tunnel-core",
+      "origin": "https://github.com/psiphon-labs/psiphon-tunnel-core/",
+      "path": "sources/psiphon-tunnel-core"
+    },
+    {
+      "describe": "v0.3.0",
+      "head": "e286260be2a1815493bf4c14d5dd0c156018d74b",
+      "is_git": true,
+      "name": "qtun",
+      "origin": "https://github.com/shadowsocks/qtun",
+      "path": "sources/qtun"
+    },
+    {
+      "describe": "v0.8.5",
+      "head": "75a19785bde45400a0a738940b19f6e7c3312441",
+      "is_git": true,
+      "name": "rust-tun",
+      "origin": "https://github.com/meh/rust-tun",
+      "path": "sources/rust-tun"
+    },
+    {
+      "describe": "v1.24.0-57-g9115c5b4",
+      "head": "9115c5b4b19a0788ae3a1b3813e285eeba6d443e",
+      "is_git": true,
+      "name": "shadowsocks-rust",
+      "origin": "https://github.com/shadowsocks/shadowsocks-rust",
+      "path": "sources/shadowsocks-rust"
+    },
+    {
+      "describe": "v1.13.0-rc.4",
+      "head": "804606042f75e593433db76cc43d31056823bbfc",
+      "is_git": true,
+      "name": "sing-box",
+      "origin": "https://github.com/SagerNet/sing-box",
+      "path": "sources/sing-box"
+    },
+    {
+      "describe": "v1.5.56-dirty",
+      "head": "cf75cc78903b8c1968f7afdb8ba49794cc6e8403",
+      "is_git": true,
+      "name": "smux",
+      "origin": "https://github.com/xtaci/smux",
+      "path": "sources/smux"
+    },
+    {
+      "describe": "v2.11.0-117-g18dacf4",
+      "head": "18dacf41dca88974be1d568d0bfd75b3f805f13b",
+      "is_git": true,
+      "name": "snowflake",
+      "origin": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake",
+      "path": "sources/snowflake"
+    },
+    {
+      "describe": "v1.6.8-5-g635856e",
+      "head": "635856e626aaa9ef4dfbc76a72c07204fea843aa",
+      "is_git": true,
+      "name": "tuic",
+      "origin": "https://github.com/Itsusinn/tuic",
+      "path": "sources/tuic"
+    },
+    {
+      "describe": "v0.7.19",
+      "head": "70c8d63e7a50874752864056395ef94aa8a7e35f",
+      "is_git": true,
+      "name": "tun2proxy",
+      "origin": "https://github.com/tun2proxy/tun2proxy",
+      "path": "sources/tun2proxy"
+    },
+    {
+      "describe": "v1.2",
+      "head": "9a94229066ed4e99da91e9ce8d653e562723706f",
+      "is_git": true,
+      "name": "udp_tun",
+      "origin": "https://github.com/Azumi67/udp_tun",
+      "path": "sources/udp_tun"
+    },
+    {
+      "describe": "v5.45.1",
+      "head": "268064bcbc2ef405269eac4c354a7bb67bdc0c3a",
+      "is_git": true,
+      "name": "v2ray-core",
+      "origin": "https://github.com/v2fly/v2ray-core",
+      "path": "sources/v2ray-core"
+    },
+    {
+      "describe": "v0.0.3-6-g9951f83",
+      "head": "9951f83866bc86a7da5ab25cf1527beab6c669cd",
+      "is_git": true,
+      "name": "webtunnel",
+      "origin": "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel",
+      "path": "sources/webtunnel"
+    }
+  ],
+  "generated_at": "2026-02-16T01:48:54Z",
+  "missing": [
+    "Layer2_TapTunnel"
+  ],
+  "notes": {
+    "mutations": "No repo is modified unless --update is used.",
+    "policy": "Prefer latest semver tag when updating; else origin/HEAD; else current branch."
+  },
+  "root": "/home/iman/StealthLink"
+}

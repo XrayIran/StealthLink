@@ -1,5 +1,5 @@
 role: agent
-variant: "4d"
+variant: "UDP+"
 
 agent:
   id: "agent-vpn-1"
@@ -37,10 +37,11 @@ vpn:
   interface_ip: "10.77.0.2/30"
   peer_ip: "10.77.0.1"
   mtu: 1400
-  routes:
-    - destination: "0.0.0.0/0"
-      gateway: "10.77.0.1"
-      metric: 100
+  # Explicit routes only (default route is intentionally unchanged).
+  # Add only the networks/hosts you want to reach over the tunnel.
+  # routes:
+  #   - destination: "10.88.0.0/16"
+  #     gateway: "10.77.0.1"
   dns:
     - "1.1.1.1"
     - "8.8.8.8"

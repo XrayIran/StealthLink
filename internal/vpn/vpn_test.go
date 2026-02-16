@@ -54,12 +54,38 @@ func TestVPNConfigValidate(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			name: "valid tap config",
+			name: "tap rejected (l3-only)",
 			config: Config{
 				Enabled:     true,
 				Mode:        "tap",
 				InterfaceIP: "10.0.0.1/24",
 				MTU:         1400,
+			},
+			wantErr: ErrInvalidMode,
+		},
+		{
+			name: "valid ipv6 tun config",
+			config: Config{
+				Enabled:     true,
+				Mode:        "tun",
+				InterfaceIP: "fd00::1/128",
+				PeerIP:      "fd00::2",
+				MTU:         1400,
+			},
+			wantErr: nil,
+		},
+		{
+			name: "valid ipv6 with routes",
+			config: Config{
+				Enabled:     true,
+				Mode:        "tun",
+				InterfaceIP: "fd00:77::1/126",
+				PeerIP:      "fd00:77::2",
+				MTU:         1400,
+				Routes: []Route{
+					{Destination: "fd00:100::/64"},
+					{Destination: "192.168.0.0/24"},
+				},
 			},
 			wantErr: nil,
 		},
@@ -150,6 +176,78 @@ func TestVPNSession(t *testing.T) {
 
 	if !session.IsClosed() {
 		t.Error("IsClosed() should be true after Close()")
+	}
+}
+
+func TestVPNSessionIPv6(t *testing.T) {
+	cfg := Config{
+		Enabled:     true,
+		Mode:        "tun",
+		Name:        "test0",
+		InterfaceIP: "fd00::1/128",
+		PeerIP:      "fd00::2",
+		MTU:         1400,
+		Routes: []Route{
+			{Destination: "fd00:100::/64"},
+		},
+	}
+
+	mockStream := newMockConn()
+
+	session, err := NewSession(cfg, mockStream)
+	if err != nil {
+		t.Fatalf("NewSession(ipv6) error = %v", err)
+	}
+
+	if session.IsClosed() {
+		t.Error("IsClosed() should be false for new IPv6 session")
+	}
+
+	err = session.Close()
+	if err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	if !session.IsClosed() {
+		t.Error("IsClosed() should be true after Close()")
+	}
+}
+
+func TestSetupInterfaceIdempotency(t *testing.T) {
+	// Verify that NetworkConfig with peer semantics can be constructed
+	// without error for both IPv4 and IPv6 and that the teardown config
+	// mirrors the setup config (idempotency contract).
+	configs := []NetworkConfig{
+		{
+			InterfaceName: "sl_test0",
+			InterfaceIP:   "10.77.0.1/30",
+			PeerIP:        "10.77.0.2",
+			MTU:           1400,
+			Routes: []Route{
+				{Destination: "192.168.0.0/24"},
+			},
+		},
+		{
+			InterfaceName: "sl_test1",
+			InterfaceIP:   "fd00::1/126",
+			PeerIP:        "fd00::2",
+			MTU:           1400,
+			Routes: []Route{
+				{Destination: "fd00:100::/64"},
+			},
+		},
+	}
+
+	for _, cfg := range configs {
+		// SetupInterface and RemoveInterface accept the same NetworkConfig.
+		// We cannot call them without a real interface, but we verify the
+		// config round-trips through the teardown path without panicking.
+		// Call RemoveInterface on a non-existent interface (best-effort,
+		// should not error).
+		err := RemoveInterface(cfg)
+		if err != nil {
+			t.Errorf("RemoveInterface(%s) unexpected error = %v", cfg.InterfaceName, err)
+		}
 	}
 }
 

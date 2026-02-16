@@ -18,12 +18,12 @@ import (
 // RuntimeSession wraps a single UnifiedProtocol connection (net.Conn) and
 // multiplexes it with smux to satisfy transport.Session.
 type RuntimeSession struct {
-	conn       net.Conn
-	smuxSess   *smux.Session
-	variant    ProtocolVariant
-	shaperCfg  mux.ShaperConfig
-	shaper     *mux.PriorityShaper
-	closed     atomic.Bool
+	conn      net.Conn
+	smuxSess  *smux.Session
+	variant   ProtocolVariant
+	shaperCfg mux.ShaperConfig
+	shaper    *mux.PriorityShaper
+	closed    atomic.Bool
 
 	// Optional callbacks
 	onStreamOpened func()

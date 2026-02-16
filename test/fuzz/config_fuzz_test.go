@@ -13,9 +13,9 @@ func FuzzConfigYAMLParse(f *testing.F) {
 	validConfig := `
 role: gateway
 listen: "0.0.0.0:8443"
-mode: "4a"
+mode: "HTTP+"
 transport:
-  mode: "4a"
+  mode: "HTTP+"
   xhttp:
     session_placement: header
     seq_placement: query
@@ -29,9 +29,9 @@ role: agent
 
 	mode4bConfig := `
 role: gateway
-mode: "4b"
+mode: "TCP+"
 transport:
-  mode: "4b"
+  mode: "TCP+"
   faketcp:
     aead_mode: "chacha20poly1305"
 `

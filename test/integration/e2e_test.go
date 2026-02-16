@@ -25,11 +25,11 @@ type e2eTestConfig struct {
 }
 
 var e2eTestMatrix = []e2eTestConfig{
-	{"4a", "xhttp", "gfwresist_tls", nil},
-	{"4b", "rawtcp", "gfwresist_tcp", nil},
-	{"4c", "xhttp", "tlsmirror", nil},
-	{"4d", "quic", "", nil},
-	{"4e", "trusttunnel", "cstp", nil},
+	{"HTTP+", "xhttp", "gfwresist_tls", nil},
+	{"TCP+", "rawtcp", "gfwresist_tcp", nil},
+	{"TLS+", "xhttp", "tlsmirror", nil},
+	{"UDP+", "quic", "", nil},
+	{"TLS", "trusttunnel", "cstp", nil},
 }
 
 func TestE2EAllVariantsBuild(t *testing.T) {
@@ -120,7 +120,7 @@ func TestE2EAllVariantsWithViolatedTCP(t *testing.T) {
 }
 
 func TestE2EDynamicChainRuntime(t *testing.T) {
-	cfg := newVariantConfig("4a", "xhttp")
+	cfg := newVariantConfig("HTTP+", "xhttp")
 	cfg.Transport.UQSP.Behaviors.QPP.Enabled = true
 	cfg.Transport.UQSP.Behaviors.QPP.Key = "chain-test-key-secure-32b"
 	cfg.Transport.UQSP.Behaviors.ViolatedTCP.Enabled = true
@@ -436,7 +436,7 @@ func TestE2EConfigValidation(t *testing.T) {
 			name: "valid 4a config",
 			cfg: &config.Config{
 				Role:    "agent",
-				Variant: "4a",
+				Variant: "HTTP+",
 				Transport: config.Transport{
 					Type: "uqsp",
 					UQSP: config.UQSPConfig{
@@ -563,7 +563,7 @@ func TestE2EAWGPacketObfsConnRoundTrip(t *testing.T) {
 
 func TestE2EXMUXManagerPooling(t *testing.T) {
 	// Test that XMUX config is accepted and carrier builds successfully
-	cfg := newVariantConfig("4a", "xhttp")
+	cfg := newVariantConfig("HTTP+", "xhttp")
 	cfg.Transport.UQSP.Carrier.XHTTP.XMux.Enabled = true
 	cfg.Transport.UQSP.Carrier.XHTTP.XMux.MaxConnections = 4
 	cfg.Transport.UQSP.Carrier.XHTTP.XMux.MaxConcurrency = 8

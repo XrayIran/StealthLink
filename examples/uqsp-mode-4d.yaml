@@ -1,8 +1,8 @@
 role: agent
-variant: "4d"
+variant: "UDP+"
 
 agent:
-  id: "agent-4d"
+  id: "agent-udp-plus"
   gateway_addr: "gateway.example.com:8443"
 
 transport:

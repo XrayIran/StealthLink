@@ -66,12 +66,7 @@ sudo ./stealthlink-ctl install --bundle=./stealthlink-<os>-<arch>-v<version>.zip
 
 ## One-line install (latest GitHub release)
 ```bash
-curl -fsSL https://github.com/XrayIran/StealthLink/releases/latest/download/stealthlink-ctl -o /tmp/stealthlink-ctl && chmod +x /tmp/stealthlink-ctl && sudo /tmp/stealthlink-ctl install --latest --role both
-```
-
-For unattended provisioning, use non-interactive setup:
-```bash
-sudo ./stealthlink-ctl setup --latest --repo XrayIran/StealthLink --role both --non-interactive --variant 4d --tune-profile balanced --apply-firewall true --start-services true
+curl -fsSL https://github.com/XrayIran/StealthLink/releases/latest/download/stealthlink-ctl -o /tmp/stealthlink-ctl && chmod +x /tmp/stealthlink-ctl && sudo /tmp/stealthlink-ctl setup --latest --role both
 ```
 
 ## Run (example)
@@ -90,7 +85,8 @@ Full VPS-to-VPS virtual IP tunnel examples:
 - `examples/uqsp-vpn-agent.yaml`
 
 ## Notes
-- `tun` requires OS‑level IP assignment and routing configuration (not handled by this repo).
+- `tun` interface IP assignment and route setup are handled by StealthLink when `vpn.enabled: true` is configured.
+- Default route is intentionally unchanged unless you explicitly configure `vpn.routes` to include `0.0.0.0/0` or `::/0`.
 - TUN MTU is set via OS tools (`ip` on Linux, `ifconfig` on macOS).
 - KCP requires `transport.kcp.key`.
 - `tlsmirror` is experimental and requires `transport.experimental: true`.
@@ -101,6 +97,16 @@ Full VPS-to-VPS virtual IP tunnel examples:
 - Use `stealthlink-ctl firewall apply <port>` on the host to add the required rules (remove with `remove`).
 - `transport.kcp.packet_guard` enables a lightweight pre‑decrypt filter on KCP packets.
 - Per‑service host overrides can set SNI/Host/Origin/Path for stealth transport shaping.
+
+## Upstream Pins (sources/)
+Capture current upstream pins into a reproducible lockfile:
+```bash
+make upstreams-lock
+```
+Attempt to update upstreams to latest stable tags/commits (best-effort, requires git remotes/network access):
+```bash
+make upstreams-update
+```
 
 ## New Config Surfaces
 
@@ -294,6 +300,14 @@ warp:
   vpn_subnet: "10.77.0.0/24"
   # license_key: "your-warp-plus-key"  # optional for WARP+
 ```
+
+## Post-v2.0.0 Roadmap
+
+- **Mesh networking** — Multi-node topology and peer discovery.
+- **L2/TAP mode** — Ethernet-level tunneling and bridge mode.
+- **IPv6/dual-stack** — Native IPv6 tunnel endpoints and dual-stack TUN.
+
+> These features are planned for future releases. Any related config fields present in v2.0.0 are ignored.
 
 ### VPN Quick-Start
 

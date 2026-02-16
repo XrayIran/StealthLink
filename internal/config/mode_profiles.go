@@ -25,14 +25,11 @@ type CarrierProfile struct {
 
 // ModeCapabilities defines what a mode supports
 type ModeCapabilities struct {
-	StreamOriented   bool
-	ZeroRTT          bool
-	ReplayProtection bool
-	PathMigration    bool
-	Multipath        bool
-	ServerInitiated  bool
-	Fronting         bool
-	CoverTraffic     bool
+	Streams        bool // supports multiplexed streams
+	Datagrams      bool // supports native datagrams (unreliable)
+	Capsules       bool // supports CONNECT-UDP / CONNECT-IP style capsules
+	ReverseConnect bool // supports reverse-connect topology
+	WARPUnderlay   bool // supports WARP underlay dialer (policy-controlled)
 }
 
 // ModeDefaults defines default configuration values for a mode
@@ -45,33 +42,30 @@ type ModeDefaults struct {
 	PaddingEnabled    bool
 }
 
-// Mode4aProfile defines the XHTTP + Domain Fronting profile
+// Mode4aProfile defines the HTTP-family profile (stream-first).
 var Mode4aProfile = ModeProfile{
-	Mode:        "4a",
-	Name:        "XHTTP + Domain Fronting",
-	Description: "HTTP/2 over TLS with flexible metadata placement and connection rotation",
+	Mode:        VariantHTTPPlus,
+	Name:        "HTTP-Family (XHTTP)",
+	Description: "Stream-first profile using XHTTP-style carrier defaults",
 	Carrier: CarrierProfile{
 		Type:              "xhttp",
 		Protocol:          "HTTP/2",
 		Handshake:         "TLS 1.3",
-		Obfuscation:       []string{"domain-fronting", "metadata-placement", "xmux-rotation"},
-		CongestionControl: "cubic",
+		Obfuscation:       []string{"rotation", "pooling"},
+		CongestionControl: "tcp",
 		Reliability:       "tcp",
-		Mux:               "smux",
+		Mux:               "smux (in-core)",
 	},
 	Capabilities: ModeCapabilities{
-		StreamOriented:   true,
-		ZeroRTT:          true, // via TLS 1.3
-		ReplayProtection: false,
-		PathMigration:    false,
-		Multipath:        false,
-		ServerInitiated:  true,
-		Fronting:         true,
-		CoverTraffic:     false,
+		Streams:        true,
+		Datagrams:      false,
+		Capsules:       false,
+		ReverseConnect: true,
+		WARPUnderlay:   true,
 	},
 	Defaults: ModeDefaults{
 		MTU:               1400, // 1500 - 100 (HTTP/2 + TLS overhead)
-		CongestionControl: "cubic",
+		CongestionControl: "tcp",
 		Reliability:       "tcp",
 		MuxEnabled:        true,
 		RotationEnabled:   true,
@@ -118,34 +112,31 @@ func DefaultMode4aConfig() Mode4aConfig {
 	}
 }
 
-// Mode4bProfile defines the FakeTCP + Anti-DPI profile
+// Mode4bProfile defines the raw TCP-family profile (stream-first).
 var Mode4bProfile = ModeProfile{
-	Mode:        "4b",
-	Name:        "FakeTCP + Anti-DPI",
-	Description: "UDP with TCP mimicry, directional encryption, and batch I/O",
+	Mode:        VariantTCPPlus,
+	Name:        "Raw TCP-Family",
+	Description: "Stream-first profile using rawtcp / faketcp / icmptun carriers",
 	Carrier: CarrierProfile{
-		Type:              "faketcp",
-		Protocol:          "UDP",
-		Handshake:         "Fake TCP 3-way",
-		Obfuscation:       []string{"tcp-fingerprint", "fake-http-preface", "directional-hkdf", "aead"},
-		CongestionControl: "none",
-		Reliability:       "faketcp",
-		Mux:               "smux",
+		Type:              "rawtcp",
+		Protocol:          "TCP",
+		Handshake:         "TCP",
+		Obfuscation:       []string{"tuning"},
+		CongestionControl: "tcp",
+		Reliability:       "tcp",
+		Mux:               "smux (in-core)",
 	},
 	Capabilities: ModeCapabilities{
-		StreamOriented:   false,
-		ZeroRTT:          false,
-		ReplayProtection: true, // via AEAD
-		PathMigration:    false,
-		Multipath:        false,
-		ServerInitiated:  true,
-		Fronting:         false,
-		CoverTraffic:     false,
+		Streams:        true,
+		Datagrams:      false,
+		Capsules:       false,
+		ReverseConnect: true,
+		WARPUnderlay:   true,
 	},
 	Defaults: ModeDefaults{
-		MTU:               1460, // 1500 - 24 (FakeTCP header) - 16 (AEAD tag)
-		CongestionControl: "none",
-		Reliability:       "faketcp",
+		MTU:               1400,
+		CongestionControl: "tcp",
+		Reliability:       "tcp",
 		MuxEnabled:        true,
 		RotationEnabled:   false,
 		PaddingEnabled:    false,
@@ -185,37 +176,34 @@ func DefaultMode4bConfig() Mode4bConfig {
 	}
 }
 
-// Mode4cProfile defines the TLS-Like + REALITY/AnyTLS profile
+// Mode4cProfile defines the TLS look-alike profile (stream-first).
 var Mode4cProfile = ModeProfile{
-	Mode:        "4c",
-	Name:        "TLS-Like + REALITY/AnyTLS",
-	Description: "TLS 1.3 with REALITY spider or AnyTLS padding for fingerprint resistance",
+	Mode:        VariantTLSPlus,
+	Name:        "TLS Look-Alike Family",
+	Description: "Stream-first profile using TLS look-alike overlays (Reality / ShadowTLS / AnyTLS)",
 	Carrier: CarrierProfile{
-		Type:              "tls-like",
-		Protocol:          "TLS 1.3",
-		Handshake:         "REALITY/AnyTLS",
-		Obfuscation:       []string{"reality-spider", "anytls-padding", "tls-fingerprint-variation"},
-		CongestionControl: "cubic",
+		Type:              "xhttp",
+		Protocol:          "TLS",
+		Handshake:         "TLS 1.3",
+		Obfuscation:       []string{"tuning"},
+		CongestionControl: "tcp",
 		Reliability:       "tcp",
-		Mux:               "smux",
+		Mux:               "smux (in-core)",
 	},
 	Capabilities: ModeCapabilities{
-		StreamOriented:   true,
-		ZeroRTT:          true, // via TLS 1.3
-		ReplayProtection: false,
-		PathMigration:    false,
-		Multipath:        false,
-		ServerInitiated:  true,
-		Fronting:         false,
-		CoverTraffic:     true, // via padding
+		Streams:        true,
+		Datagrams:      false,
+		Capsules:       false,
+		ReverseConnect: true,
+		WARPUnderlay:   true,
 	},
 	Defaults: ModeDefaults{
 		MTU:               1400, // 1500 - 100 (TLS + REALITY overhead)
-		CongestionControl: "cubic",
+		CongestionControl: "tcp",
 		Reliability:       "tcp",
 		MuxEnabled:        true,
 		RotationEnabled:   true,
-		PaddingEnabled:    true,
+		PaddingEnabled:    false,
 	},
 }
 
@@ -268,33 +256,30 @@ func DefaultMode4cConfig() Mode4cConfig {
 	}
 }
 
-// Mode4dProfile defines the QUIC + Brutal CC profile
+// Mode4dProfile defines the UDP/QUIC-family profile (datagram-first).
 var Mode4dProfile = ModeProfile{
-	Mode:        "4d",
-	Name:        "QUIC + Brutal CC",
-	Description: "QUIC with Brutal congestion control, FEC, hardware entropy, and batch I/O",
+	Mode:        VariantUDPPlus,
+	Name:        "UDP/QUIC Family",
+	Description: "Datagram-capable profile (QUIC DATAGRAM) with CONNECT-UDP/IP capsules enabled by default",
 	Carrier: CarrierProfile{
 		Type:              "quic",
 		Protocol:          "QUIC",
-		Handshake:         "QUIC 0-RTT",
-		Obfuscation:       []string{"awg-junk-packets", "brutal-cc"},
-		CongestionControl: "brutal",
+		Handshake:         "QUIC",
+		Obfuscation:       []string{"tuning"},
+		CongestionControl: "quic",
 		Reliability:       "quic",
-		Mux:               "quic-streams",
+		Mux:               "quic streams",
 	},
 	Capabilities: ModeCapabilities{
-		StreamOriented:   true,
-		ZeroRTT:          true, // via QUIC 0-RTT
-		ReplayProtection: true, // built into QUIC
-		PathMigration:    true,
-		Multipath:        true,
-		ServerInitiated:  true,
-		Fronting:         false,
-		CoverTraffic:     true, // via junk packets
+		Streams:        true,
+		Datagrams:      true,
+		Capsules:       true,
+		ReverseConnect: true,
+		WARPUnderlay:   true,
 	},
 	Defaults: ModeDefaults{
 		MTU:               1450, // 1500 - 50 (QUIC header + encryption)
-		CongestionControl: "brutal",
+		CongestionControl: "quic",
 		Reliability:       "quic",
 		MuxEnabled:        false, // QUIC has native streams
 		RotationEnabled:   false, // uses connection migration instead
@@ -351,33 +336,30 @@ func DefaultMode4dConfig() Mode4dConfig {
 	}
 }
 
-// Mode4eProfile defines the TrustTunnel + CSTP profile
+// Mode4eProfile defines the TLS-tunnel family profile (stream-first).
 var Mode4eProfile = ModeProfile{
-	Mode:        "4e",
-	Name:        "TrustTunnel + CSTP",
-	Description: "HTTP/2 or HTTP/3 CONNECT with ICMP multiplexing and session recovery",
+	Mode:        VariantTLS,
+	Name:        "TLS-Tunnel Family (TrustTunnel)",
+	Description: "Stream-first profile using trusttunnel-style carrier defaults",
 	Carrier: CarrierProfile{
 		Type:              "trusttunnel",
-		Protocol:          "HTTP/2 or HTTP/3",
-		Handshake:         "HTTP CONNECT + CSTP",
-		Obfuscation:       []string{"icmp-mux", "http-connect"},
-		CongestionControl: "cubic", // or QUIC if HTTP/3
-		Reliability:       "tcp",   // or QUIC if HTTP/3
-		Mux:               "trusttunnel-icmp",
+		Protocol:          "TLS tunnel",
+		Handshake:         "TLS",
+		Obfuscation:       []string{"tuning"},
+		CongestionControl: "tcp",
+		Reliability:       "tcp",
+		Mux:               "smux (in-core)",
 	},
 	Capabilities: ModeCapabilities{
-		StreamOriented:   true,
-		ZeroRTT:          true, // via HTTP/3
-		ReplayProtection: false,
-		PathMigration:    false,
-		Multipath:        false,
-		ServerInitiated:  true,
-		Fronting:         false,
-		CoverTraffic:     false,
+		Streams:        true,
+		Datagrams:      false,
+		Capsules:       false,
+		ReverseConnect: true,
+		WARPUnderlay:   true,
 	},
 	Defaults: ModeDefaults{
 		MTU:               1380, // 1500 - 120 (HTTP/2 + ICMP mux overhead)
-		CongestionControl: "cubic",
+		CongestionControl: "tcp",
 		Reliability:       "tcp",
 		MuxEnabled:        false, // uses ICMP mux instead
 		RotationEnabled:   false,
@@ -438,13 +420,17 @@ func AllModeProfiles() []ModeProfile {
 // GetModeProfile returns the profile for a given mode
 func GetModeProfile(mode string) (ModeProfile, bool) {
 	profiles := map[string]ModeProfile{
-		"4a": Mode4aProfile,
-		"4b": Mode4bProfile,
-		"4c": Mode4cProfile,
-		"4d": Mode4dProfile,
-		"4e": Mode4eProfile,
+		VariantHTTPPlus: Mode4aProfile,
+		VariantTCPPlus:  Mode4bProfile,
+		VariantTLSPlus:  Mode4cProfile,
+		VariantUDPPlus:  Mode4dProfile,
+		VariantTLS:      Mode4eProfile,
 	}
-	profile, ok := profiles[mode]
+	canonical, ok := canonicalVariantName(mode)
+	if !ok {
+		return ModeProfile{}, false
+	}
+	profile, ok := profiles[canonical]
 	return profile, ok
 }
 
@@ -468,68 +454,44 @@ func GetCapabilityMatrix() CapabilityMatrix {
 	return CapabilityMatrix{
 		Capabilities: []CapabilityRow{
 			{
-				Capability: "StreamOriented",
-				Mode4a:     Mode4aProfile.Capabilities.StreamOriented,
-				Mode4b:     Mode4bProfile.Capabilities.StreamOriented,
-				Mode4c:     Mode4cProfile.Capabilities.StreamOriented,
-				Mode4d:     Mode4dProfile.Capabilities.StreamOriented,
-				Mode4e:     Mode4eProfile.Capabilities.StreamOriented,
+				Capability: "Streams",
+				Mode4a:     Mode4aProfile.Capabilities.Streams,
+				Mode4b:     Mode4bProfile.Capabilities.Streams,
+				Mode4c:     Mode4cProfile.Capabilities.Streams,
+				Mode4d:     Mode4dProfile.Capabilities.Streams,
+				Mode4e:     Mode4eProfile.Capabilities.Streams,
 			},
 			{
-				Capability: "ZeroRTT",
-				Mode4a:     Mode4aProfile.Capabilities.ZeroRTT,
-				Mode4b:     Mode4bProfile.Capabilities.ZeroRTT,
-				Mode4c:     Mode4cProfile.Capabilities.ZeroRTT,
-				Mode4d:     Mode4dProfile.Capabilities.ZeroRTT,
-				Mode4e:     Mode4eProfile.Capabilities.ZeroRTT,
+				Capability: "Datagrams",
+				Mode4a:     Mode4aProfile.Capabilities.Datagrams,
+				Mode4b:     Mode4bProfile.Capabilities.Datagrams,
+				Mode4c:     Mode4cProfile.Capabilities.Datagrams,
+				Mode4d:     Mode4dProfile.Capabilities.Datagrams,
+				Mode4e:     Mode4eProfile.Capabilities.Datagrams,
 			},
 			{
-				Capability: "ReplayProtection",
-				Mode4a:     Mode4aProfile.Capabilities.ReplayProtection,
-				Mode4b:     Mode4bProfile.Capabilities.ReplayProtection,
-				Mode4c:     Mode4cProfile.Capabilities.ReplayProtection,
-				Mode4d:     Mode4dProfile.Capabilities.ReplayProtection,
-				Mode4e:     Mode4eProfile.Capabilities.ReplayProtection,
+				Capability: "Capsules",
+				Mode4a:     Mode4aProfile.Capabilities.Capsules,
+				Mode4b:     Mode4bProfile.Capabilities.Capsules,
+				Mode4c:     Mode4cProfile.Capabilities.Capsules,
+				Mode4d:     Mode4dProfile.Capabilities.Capsules,
+				Mode4e:     Mode4eProfile.Capabilities.Capsules,
 			},
 			{
-				Capability: "PathMigration",
-				Mode4a:     Mode4aProfile.Capabilities.PathMigration,
-				Mode4b:     Mode4bProfile.Capabilities.PathMigration,
-				Mode4c:     Mode4cProfile.Capabilities.PathMigration,
-				Mode4d:     Mode4dProfile.Capabilities.PathMigration,
-				Mode4e:     Mode4eProfile.Capabilities.PathMigration,
+				Capability: "ReverseConnect",
+				Mode4a:     Mode4aProfile.Capabilities.ReverseConnect,
+				Mode4b:     Mode4bProfile.Capabilities.ReverseConnect,
+				Mode4c:     Mode4cProfile.Capabilities.ReverseConnect,
+				Mode4d:     Mode4dProfile.Capabilities.ReverseConnect,
+				Mode4e:     Mode4eProfile.Capabilities.ReverseConnect,
 			},
 			{
-				Capability: "Multipath",
-				Mode4a:     Mode4aProfile.Capabilities.Multipath,
-				Mode4b:     Mode4bProfile.Capabilities.Multipath,
-				Mode4c:     Mode4cProfile.Capabilities.Multipath,
-				Mode4d:     Mode4dProfile.Capabilities.Multipath,
-				Mode4e:     Mode4eProfile.Capabilities.Multipath,
-			},
-			{
-				Capability: "ServerInitiated",
-				Mode4a:     Mode4aProfile.Capabilities.ServerInitiated,
-				Mode4b:     Mode4bProfile.Capabilities.ServerInitiated,
-				Mode4c:     Mode4cProfile.Capabilities.ServerInitiated,
-				Mode4d:     Mode4dProfile.Capabilities.ServerInitiated,
-				Mode4e:     Mode4eProfile.Capabilities.ServerInitiated,
-			},
-			{
-				Capability: "Fronting",
-				Mode4a:     Mode4aProfile.Capabilities.Fronting,
-				Mode4b:     Mode4bProfile.Capabilities.Fronting,
-				Mode4c:     Mode4cProfile.Capabilities.Fronting,
-				Mode4d:     Mode4dProfile.Capabilities.Fronting,
-				Mode4e:     Mode4eProfile.Capabilities.Fronting,
-			},
-			{
-				Capability: "CoverTraffic",
-				Mode4a:     Mode4aProfile.Capabilities.CoverTraffic,
-				Mode4b:     Mode4bProfile.Capabilities.CoverTraffic,
-				Mode4c:     Mode4cProfile.Capabilities.CoverTraffic,
-				Mode4d:     Mode4dProfile.Capabilities.CoverTraffic,
-				Mode4e:     Mode4eProfile.Capabilities.CoverTraffic,
+				Capability: "WARPUnderlay",
+				Mode4a:     Mode4aProfile.Capabilities.WARPUnderlay,
+				Mode4b:     Mode4bProfile.Capabilities.WARPUnderlay,
+				Mode4c:     Mode4cProfile.Capabilities.WARPUnderlay,
+				Mode4d:     Mode4dProfile.Capabilities.WARPUnderlay,
+				Mode4e:     Mode4eProfile.Capabilities.WARPUnderlay,
 			},
 		},
 	}

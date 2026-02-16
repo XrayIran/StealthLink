@@ -447,9 +447,14 @@ type frontContextKey struct{}
 // FrontDialOptions controls domain-fronting and CDN dial behavior through context.
 type FrontDialOptions struct {
 	Enabled       bool
+	PoolKey       string
 	FrontDomain   string
 	RealHost      string
 	ConnectIP     string
+	// ConnectIPCandidates provides additional connect-address candidates (IPs).
+	// When present, the dialer should try candidates in order (or health-sorted)
+	// before giving up. ConnectIP remains as the primary/legacy single-candidate field.
+	ConnectIPCandidates []string
 	CFWorker      string
 	FailoverHosts []string
 }

@@ -15,9 +15,9 @@ import (
 
 // Engine is the routing engine that manages routes and applies rules
 type Engine struct {
-	ruleSet    *RuleSet
-	routes     map[string]*Route
-	routesMu   sync.RWMutex
+	ruleSet  *RuleSet
+	routes   map[string]*Route
+	routesMu sync.RWMutex
 
 	// Health tracking
 	healthStates map[string]*HealthState
@@ -54,7 +54,7 @@ type Route struct {
 
 // HealthCheck configures health checking for a route
 type HealthCheck struct {
-	Method   string        // tcp, http, icmp
+	Method   string // tcp, http, icmp
 	Target   string
 	Interval time.Duration
 	Timeout  time.Duration
@@ -206,6 +206,41 @@ func (e *Engine) Route(target *Target) (*Route, *Action, error) {
 	}
 
 	return nil, nil, fmt.Errorf("unknown action type: %s", rule.Action.Type)
+}
+
+// RouteNoResolve determines the route for a target without performing DNS resolution.
+//
+// This is intended for policy-only decisions where DNS lookups would be undesirable
+// (performance, privacy, offline environments). CIDR/IP matchers will only match
+// when target.IP is already populated.
+func (e *Engine) RouteNoResolve(target *Target) (*Route, *Action, error) {
+	e.requestsTotal.Add(1)
+
+	// Match rules without resolving domain names.
+	rule, err := e.ruleSet.Match(target)
+	if err != nil {
+		return nil, nil, err
+	}
+	if rule == nil {
+		return nil, &Action{Type: ActionTypeDirect}, nil
+	}
+
+	e.requestsMatched.Add(1)
+
+	switch rule.Action.Type {
+	case ActionTypeBlock:
+		e.requestsBlocked.Add(1)
+		return nil, &rule.Action, nil
+	case ActionTypeDirect:
+		return nil, &rule.Action, nil
+	case ActionTypeChain, ActionTypeProxy:
+		route := e.getRoute(rule.Action.Chain)
+		// If no named route exists, still return the action. This allows using
+		// Action.Chain/Action.Proxy as generic selectors (e.g., dialer policy).
+		return route, &rule.Action, nil
+	default:
+		return nil, nil, fmt.Errorf("unknown action type: %s", rule.Action.Type)
+	}
 }
 
 // getRoute gets a route by name
@@ -467,9 +502,9 @@ func (n *RoutingNode) Process(ctx context.Context, pkt *graph.Packet) (*graph.Pa
 }
 
 // Placeholder methods for RoutingNode (full implementation would be in graph.Node interface)
-func (n *RoutingNode) Next() []string           { return nil }
-func (n *RoutingNode) SetNext(next []string)    {}
-func (n *RoutingNode) AddNext(name string)      {}
+func (n *RoutingNode) Next() []string        { return nil }
+func (n *RoutingNode) SetNext(next []string) {}
+func (n *RoutingNode) AddNext(name string)   {}
 
 // TargetFromAddr creates a Target from a network address
 func TargetFromAddr(addr net.Addr) *Target {

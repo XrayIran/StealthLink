@@ -6,10 +6,16 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+type PathPolicyLatencyQuantiles struct {
+	P50Ms float64 `json:"p50_ms"`
+	P95Ms float64 `json:"p95_ms"`
+}
 
 type Snapshot struct {
 	SessionsTotal             int64                              `json:"sessions_total"`
@@ -55,8 +61,12 @@ type Snapshot struct {
 	ReverseConnectionsActive      int64 `json:"reverse_connections_active"`
 
 	// Underlay dialer metrics
-	UnderlaySelected string `json:"underlay_selected"` // "direct" | "warp" | "socks"
-	WARPHealth       string `json:"warp_health"`       // "up" | "down"
+	UnderlaySelected                string                                `json:"underlay_selected"` // "direct" | "warp" | "socks"
+	ActivePathVariant               string                                `json:"active_path_variant"`
+	WARPHealth                      string                                `json:"warp_health"` // "up" | "down"
+	PathPolicyWinnerSelectionsTotal map[string]int64                      `json:"path_policy_winner_selections_total,omitempty"`
+	PathPolicyReracesTotal          int64                                 `json:"path_policy_reraces_total"`
+	PathPolicyDialLatencyMs         map[string]PathPolicyLatencyQuantiles `json:"path_policy_dial_latency_ms,omitempty"`
 
 	// Xmux metrics
 	XmuxConnectionReusesTotal    int64            `json:"xmux_connection_reuses_total"`
@@ -92,7 +102,13 @@ type Snapshot struct {
 	// Connection pool metrics
 	PoolSize             int64            `json:"pool_size"`
 	PoolUtilization      float64          `json:"pool_utilization"`
+	PoolWaitTimeMs       int64            `json:"pool_wait_time_ms"`
 	PoolAdjustmentsTotal map[string]int64 `json:"pool_adjustments_total"`
+
+	// Security/deprecation metrics
+	ReverseAuthRejectsTotal   int64 `json:"reverse_auth_rejects_total"`
+	HandshakeFailuresTotal    int64 `json:"handshake_failures_total"`
+	DeprecatedLegacyModeTotal int64 `json:"deprecated_legacy_mode_total"`
 }
 
 var (
@@ -135,8 +151,12 @@ var (
 	reverseConnectionsActive      atomic.Int64
 
 	// Underlay dialer metrics
-	underlaySelected atomic.Value // string: "direct" | "warp" | "socks"
-	warpHealth       atomic.Value // string: "up" | "down"
+	underlaySelected  atomic.Value // string: "direct" | "warp" | "socks"
+	activePathVariant atomic.Value // string: "HTTP+" | "TCP+" | "TLS+" | "UDP+" | "TLS" | "legacy"
+	warpHealth        atomic.Value // string: "up" | "down"
+	pathPolicyWinners sync.Map     // candidate -> *atomic.Int64
+	pathPolicyReraces atomic.Int64
+	pathPolicyLatency sync.Map // candidate -> *latencyWindow
 
 	// Xmux metrics
 	xmuxReuses            atomic.Int64
@@ -173,7 +193,12 @@ var (
 	// Connection pool metrics
 	poolSize        atomic.Int64
 	poolUtilization atomic.Uint64 // bit-cast float64
-	poolAdjustments sync.Map      // direction -> *atomic.Int64
+	poolWaitTimeMs  atomic.Int64
+	poolAdjustments sync.Map // direction -> *atomic.Int64
+
+	reverseAuthRejects   atomic.Int64
+	handshakeFailures    atomic.Int64
+	deprecatedLegacyMode atomic.Int64
 
 	// Mesh networking metrics
 	meshNodeActive       atomic.Bool
@@ -186,6 +211,11 @@ var (
 	meshHolePunchSuccess atomic.Int64
 	meshHolePunchFail    atomic.Int64
 )
+
+type latencyWindow struct {
+	mu      sync.Mutex
+	samples []float64
+}
 
 func IncSessions()               { sessionsTotal.Add(1); sessionsActive.Add(1); openSockets.Add(1) }
 func DecSessions()               { sessionsActive.Add(-1); openSockets.Add(-1) }
@@ -289,6 +319,21 @@ func SetUnderlaySelected(dialerType string) {
 	underlaySelected.Store(dialerType)
 }
 
+func SetActivePathVariant(variant string) {
+	if variant == "" {
+		return
+	}
+	activePathVariant.Store(variant)
+}
+
+func GetActivePathVariant() string {
+	v := activePathVariant.Load()
+	if v == nil {
+		return "unknown"
+	}
+	return v.(string)
+}
+
 func GetUnderlaySelected() string {
 	v := underlaySelected.Load()
 	if v == nil {
@@ -307,6 +352,70 @@ func GetWARPHealth() string {
 		return "down" // default
 	}
 	return v.(string)
+}
+
+func IncPathPolicyWinnerSelection(candidate string) {
+	if candidate == "" {
+		return
+	}
+	v, _ := pathPolicyWinners.LoadOrStore(candidate, &atomic.Int64{})
+	v.(*atomic.Int64).Add(1)
+}
+
+func IncPathPolicyRerace() { pathPolicyReraces.Add(1) }
+
+func ObservePathPolicyDialLatency(candidate string, d time.Duration) {
+	if candidate == "" || d <= 0 {
+		return
+	}
+	v, _ := pathPolicyLatency.LoadOrStore(candidate, &latencyWindow{})
+	w := v.(*latencyWindow)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Keep a bounded rolling window to limit memory while preserving recent behavior.
+	if len(w.samples) >= 256 {
+		copy(w.samples, w.samples[1:])
+		w.samples = w.samples[:255]
+	}
+	w.samples = append(w.samples, float64(d)/float64(time.Millisecond))
+}
+
+func pathPolicyLatencySnapshot() map[string]PathPolicyLatencyQuantiles {
+	out := make(map[string]PathPolicyLatencyQuantiles)
+	pathPolicyLatency.Range(func(k, v any) bool {
+		candidate, ok := k.(string)
+		if !ok || candidate == "" {
+			return true
+		}
+		w := v.(*latencyWindow)
+		w.mu.Lock()
+		samples := append([]float64(nil), w.samples...)
+		w.mu.Unlock()
+		if len(samples) == 0 {
+			return true
+		}
+		sort.Float64s(samples)
+		out[candidate] = PathPolicyLatencyQuantiles{
+			P50Ms: quantile(samples, 0.50),
+			P95Ms: quantile(samples, 0.95),
+		}
+		return true
+	})
+	return out
+}
+
+func quantile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return sorted[0]
+	}
+	if q >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	idx := int(float64(len(sorted)-1) * q)
+	return sorted[idx]
 }
 
 // Reverse mode metrics functions
@@ -395,6 +504,12 @@ func SetPoolSize(n int64) { poolSize.Store(n) }
 func SetPoolUtilization(u float64) {
 	poolUtilization.Store(uint64(u * 1e6)) // store as micros for precision
 }
+func ObservePoolWaitTime(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	poolWaitTimeMs.Store(d.Milliseconds())
+}
 func IncPoolAdjustment(direction string) {
 	if direction == "" {
 		return
@@ -402,6 +517,10 @@ func IncPoolAdjustment(direction string) {
 	v, _ := poolAdjustments.LoadOrStore(direction, &atomic.Int64{})
 	v.(*atomic.Int64).Add(1)
 }
+
+func IncReverseAuthRejects()   { reverseAuthRejects.Add(1) }
+func IncHandshakeFailure()     { handshakeFailures.Add(1) }
+func IncDeprecatedLegacyMode() { deprecatedLegacyMode.Add(1) }
 
 // Mesh networking metrics functions
 func SetMeshNodeActive(active bool) { meshNodeActive.Store(active) }
@@ -483,8 +602,19 @@ func SnapshotData() Snapshot {
 		ReverseReconnectReset:         reverseReconnectReset.Load(),
 		ReverseConnectionsActive:      reverseConnectionsActive.Load(),
 		// Underlay dialer metrics
-		UnderlaySelected: GetUnderlaySelected(),
-		WARPHealth:       GetWARPHealth(),
+		UnderlaySelected:  GetUnderlaySelected(),
+		ActivePathVariant: GetActivePathVariant(),
+		WARPHealth:        GetWARPHealth(),
+		PathPolicyWinnerSelectionsTotal: func() map[string]int64 {
+			m := make(map[string]int64)
+			pathPolicyWinners.Range(func(k, v any) bool {
+				m[k.(string)] = v.(*atomic.Int64).Load()
+				return true
+			})
+			return m
+		}(),
+		PathPolicyReracesTotal:  pathPolicyReraces.Load(),
+		PathPolicyDialLatencyMs: pathPolicyLatencySnapshot(),
 		// Xmux metrics
 		XmuxConnectionReusesTotal: xmuxReuses.Load(),
 		XmuxConnectionRotationsTotal: func() map[string]int64 {
@@ -547,6 +677,7 @@ func SnapshotData() Snapshot {
 		// Connection pool metrics
 		PoolSize:        poolSize.Load(),
 		PoolUtilization: float64(poolUtilization.Load()) / 1e6,
+		PoolWaitTimeMs:  poolWaitTimeMs.Load(),
 		PoolAdjustmentsTotal: func() map[string]int64 {
 			m := make(map[string]int64)
 			poolAdjustments.Range(func(k, v any) bool {
@@ -555,6 +686,9 @@ func SnapshotData() Snapshot {
 			})
 			return m
 		}(),
+		ReverseAuthRejectsTotal:   reverseAuthRejects.Load(),
+		HandshakeFailuresTotal:    handshakeFailures.Load(),
+		DeprecatedLegacyModeTotal: deprecatedLegacyMode.Load(),
 	}
 }
 

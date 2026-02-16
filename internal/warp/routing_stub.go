@@ -1,20 +1,21 @@
-//go:build !linux || !netlink
+//go:build !linux
 
 package warp
 
 import "fmt"
 
-// addDefaultRouteViaInterface is a stub for non-Linux platforms.
-func addDefaultRouteViaInterface(ifaceName string) error {
-	return fmt.Errorf("WARP routing requires Linux with netlink support")
+func SetupPolicyRouting(cfg PolicyRoutingConfig) error {
+	return fmt.Errorf("WARP policy routing requires Linux")
 }
 
-// addRouteViaInterface is a stub for non-Linux platforms.
-func addRouteViaInterface(ifaceName string, destination string, gateway string) error {
-	return fmt.Errorf("WARP routing requires Linux with netlink support")
+func TeardownPolicyRouting(cfg PolicyRoutingConfig) error {
+	return nil
 }
 
-// removeRoutesViaInterface is a stub for non-Linux platforms.
-func removeRoutesViaInterface(ifaceName string) error {
-	return nil // Nothing to do on non-Linux platforms
+func checkIPCommand() error {
+	return fmt.Errorf("WARP routing requires Linux")
+}
+
+func checkCapNetAdmin() bool {
+	return false
 }

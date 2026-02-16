@@ -191,11 +191,11 @@ func (s *SNIBlender) shuffleFragments(fragments [][]byte) [][]byte {
 // BlendingConn wraps a connection to blend TLS Client Hello.
 type BlendingConn struct {
 	net.Conn
-	config      SNIBlendConfig
+	config       SNIBlendConfig
 	handshakeBuf []byte
-	fragments   [][]byte
-	fragIndex   int
-	blendDone   bool
+	fragments    [][]byte
+	fragIndex    int
+	blendDone    bool
 }
 
 // NewBlendingConn creates a connection that blends TLS Client Hello.

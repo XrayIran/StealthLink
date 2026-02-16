@@ -1,0 +1,75 @@
+# Reverse-init example (Mode HTTP+)
+#
+# This file contains two YAML documents:
+# 1) Gateway (server) config: dials out to the agent's listener
+# 2) Agent (client) config: listens locally and accepts the reverse-init connection
+#
+# Note: Rendezvous broker support is technique-only; it exchanges addresses but does not
+# guarantee NAT traversal.
+---
+role: gateway
+
+gateway:
+  listen: "0.0.0.0:8443"
+
+transport:
+  type: uqsp
+  uqsp:
+    variant_profile: "HTTP+"
+    carrier:
+      type: xhttp
+      xhttp:
+        server: "agent.example.com:8443"
+        path: "/_sl"
+        tls_fingerprint: "chrome_auto"
+    behaviors:
+      domainfront:
+        enabled: true
+        front_domain: "cdn.cloudflare.com"
+        real_host: "agent.example.com"
+        phantom:
+          enabled: true
+          shared_secret: "base64-or-raw-secret"
+          pool_size: 64
+      ech:
+        enabled: false
+    reverse:
+      enabled: true
+      role: "rendezvous"
+      auth_token: "reverse-auth-token"
+      # Leave client_address empty to poll rendezvous broker (if enabled below).
+      client_address: ""
+      rendezvous:
+        enabled: false
+        broker_url: "https://broker.example.com/rv"
+        front_domain: "cdn.sstatic.net"
+        utls_fingerprint: "chrome_auto"
+---
+role: agent
+
+agent:
+  server: "0.0.0.0:0"
+
+transport:
+  type: uqsp
+  uqsp:
+    variant_profile: "HTTP+"
+    carrier:
+      type: xhttp
+      xhttp:
+        # Server is only used by dialers; in rendezvous listener role we listen below.
+        server: "0.0.0.0:0"
+        path: "/_sl"
+        tls_fingerprint: "chrome_auto"
+    reverse:
+      enabled: true
+      role: "rendezvous"
+      auth_token: "reverse-auth-token"
+      # Agent listens here and (optionally) registers this address to a broker.
+      server_address: "0.0.0.0:8443"
+      rendezvous:
+        enabled: false
+        broker_url: "https://broker.example.com/rv"
+        front_domain: "cdn.sstatic.net"
+        utls_fingerprint: "chrome_auto"
+

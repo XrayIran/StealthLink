@@ -35,6 +35,8 @@ func NewDialer(cfg *config.Transport) (Dialer, error) {
 	switch dialerType {
 	case "direct":
 		dialer = NewDirectDialer()
+	case "policy":
+		dialer, err = NewPolicyDialer(cfg)
 	case "warp":
 		dialer, err = NewWARPDialer(cfg.WARPDialer)
 	case "socks":

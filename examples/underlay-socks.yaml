@@ -8,8 +8,8 @@ agent:
   gateway_addr: gateway.example.com:443
 
 transport:
-  type: stealth
-  mode: "4a"  # XHTTP + Domain Fronting
+  type: uqsp
+  mode: "HTTP+"  # XHTTP + Domain Fronting
   
   # Underlay dialer configuration
   dialer: socks  # Route through SOCKS5 proxy
@@ -20,13 +20,12 @@ transport:
     username: ""                # Optional: SOCKS5 username
     password: ""                # Optional: SOCKS5 password
   
-  stealth:
+  uqsp:
     carrier:
-      kind: tcp
-    camouflage:
-      mode: tls
-      tls:
-        server_name: gateway.example.com
+      type: xhttp
+    behaviors:
+      ech:
+        enabled: true
 
 services:
   - name: web

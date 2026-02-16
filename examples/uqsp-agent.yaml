@@ -144,10 +144,10 @@ metrics:
   listen: "127.0.0.1:9091"
   auth_token: ""
 
-# VPN Configuration (TUN/TAP mode for full VPN tunneling)
+# VPN Configuration (TUN mode for full L3 VPN tunneling)
 vpn:
-  enabled: false          # Enable VPN mode for full TUN/TAP tunneling
-  mode: tun               # "tun" (layer 3, IP) or "tap" (layer 2, Ethernet)
+  enabled: false          # Enable VPN mode for full TUN tunneling (L3-only)
+  mode: tun               # "tun" (layer 3, IP)
   name: "stealth0"        # Interface name
   interface_ip: "10.0.0.2/24"  # Local VPN IP with CIDR
   peer_ip: "10.0.0.1"     # Remote peer VPN IP (point-to-point)
@@ -161,7 +161,7 @@ vpn:
   reverse:
     enabled: false        # Enable reverse proxy integration
 
-# XHTTP + Domain Fronting + ECH + Vision configuration (Method 4a)
+# XHTTP + Domain Fronting + ECH + Vision configuration (Method HTTP+)
 # Uncomment to enable the hardest-to-detect mode
 # transport:
 #   uqsp:
@@ -187,7 +187,7 @@ vpn:
 #         enabled: true
 #         strategy: sni_split
 
-# Raw TCP + obfs4 configuration (Method 4b)
+# Raw TCP + obfs4 configuration (Method TCP+)
 # transport:
 #   uqsp:
 #     carrier:
@@ -204,7 +204,7 @@ vpn:
 #         node_id: "base64-encoded-node-id"
 #         public_key: "base64-encoded-public-key"
 
-# TLS-based tunnel configuration (Method 4e - WebTunnel)
+# TLS-based tunnel configuration (Method TLS - WebTunnel)
 # transport:
 #   uqsp:
 #     carrier:
@@ -215,7 +215,7 @@ vpn:
 #         version: h2
 #         tls_fingerprint: "chrome"
 
-# TLS-based tunnel configuration (Method 4e - Chisel SSH-over-HTTP)
+# TLS-based tunnel configuration (Method TLS - Chisel SSH-over-HTTP)
 # transport:
 #   uqsp:
 #     carrier:
@@ -226,7 +226,7 @@ vpn:
 #         auth: "user:pass"
 #         tls_fingerprint: "chrome"
 
-# XHTTP + REALITY + Vision (Method 4c)
+# XHTTP + REALITY + Vision (Method TLS+)
 # transport:
 #   uqsp:
 #     carrier:
@@ -246,7 +246,7 @@ vpn:
 #     security:
 #       pq_kem: true  # ML-DSA-65 post-quantum signatures
 
-# UDP with Brutal CC + Salamander + AWG (Method 4d)
+# UDP with Brutal CC + Salamander + AWG (Method UDP+)
 # transport:
 #   uqsp:
 #     congestion:

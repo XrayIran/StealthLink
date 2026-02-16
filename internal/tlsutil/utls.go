@@ -107,55 +107,55 @@ type fingerprintInfo struct {
 // Weights are based on real-world browser usage statistics.
 var fingerprintDatabase = map[string]fingerprintInfo{
 	// Chrome variants (highest weight due to popularity)
-	"chrome":           {utls.HelloChrome_Auto, 30},
-	"chrome_auto":      {utls.HelloChrome_Auto, 30},
-	"chrome_120":       {utls.HelloChrome_120, 25},
-	"chrome_102":       {utls.HelloChrome_102, 10},
-	"chrome_100":       {utls.HelloChrome_100, 5},
-	"chrome_96":        {utls.HelloChrome_96, 3},
-	"chrome_87":        {utls.HelloChrome_102, 2}, // Fallback to available version
-	"chrome_83":        {utls.HelloChrome_102, 1}, // Fallback to available version
+	"chrome":      {utls.HelloChrome_Auto, 30},
+	"chrome_auto": {utls.HelloChrome_Auto, 30},
+	"chrome_120":  {utls.HelloChrome_120, 25},
+	"chrome_102":  {utls.HelloChrome_102, 10},
+	"chrome_100":  {utls.HelloChrome_100, 5},
+	"chrome_96":   {utls.HelloChrome_96, 3},
+	"chrome_87":   {utls.HelloChrome_102, 2}, // Fallback to available version
+	"chrome_83":   {utls.HelloChrome_102, 1}, // Fallback to available version
 
 	// Firefox variants
-	"firefox":          {utls.HelloFirefox_Auto, 15},
-	"ff":               {utls.HelloFirefox_Auto, 15},
-	"firefox_auto":     {utls.HelloFirefox_Auto, 15},
-	"firefox_105":      {utls.HelloFirefox_105, 10},
-	"firefox_102":      {utls.HelloFirefox_102, 8},
-	"firefox_99":       {utls.HelloFirefox_99, 3},
+	"firefox":      {utls.HelloFirefox_Auto, 15},
+	"ff":           {utls.HelloFirefox_Auto, 15},
+	"firefox_auto": {utls.HelloFirefox_Auto, 15},
+	"firefox_105":  {utls.HelloFirefox_105, 10},
+	"firefox_102":  {utls.HelloFirefox_102, 8},
+	"firefox_99":   {utls.HelloFirefox_99, 3},
 
 	// Safari variants
-	"safari":           {utls.HelloSafari_Auto, 12},
-	"safari_auto":      {utls.HelloSafari_Auto, 12},
-	"safari_16":        {utls.HelloSafari_16_0, 8},
-	"safari_16_0":      {utls.HelloSafari_16_0, 8},
+	"safari":      {utls.HelloSafari_Auto, 12},
+	"safari_auto": {utls.HelloSafari_Auto, 12},
+	"safari_16":   {utls.HelloSafari_16_0, 8},
+	"safari_16_0": {utls.HelloSafari_16_0, 8},
 
 	// iOS variants
-	"ios":              {utls.HelloIOS_Auto, 10},
-	"ios_auto":         {utls.HelloIOS_Auto, 10},
-	"ios_16":           {utls.HelloSafari_16_0, 6},
+	"ios":      {utls.HelloIOS_Auto, 10},
+	"ios_auto": {utls.HelloIOS_Auto, 10},
+	"ios_16":   {utls.HelloSafari_16_0, 6},
 
 	// Edge variants
-	"edge":             {utls.HelloEdge_Auto, 8},
-	"edge_auto":        {utls.HelloEdge_Auto, 8},
-	"edge_106":         {utls.HelloEdge_106, 5},
+	"edge":      {utls.HelloEdge_Auto, 8},
+	"edge_auto": {utls.HelloEdge_Auto, 8},
+	"edge_106":  {utls.HelloEdge_106, 5},
 
 	// 360 Browser (popular in China)
-	"360":              {utls.Hello360_Auto, 5},
-	"360_auto":         {utls.Hello360_Auto, 5},
-	"360_11_0":         {utls.Hello360_11_0, 3},
-	"360_7_5":          {utls.Hello360_7_5, 1},
+	"360":      {utls.Hello360_Auto, 5},
+	"360_auto": {utls.Hello360_Auto, 5},
+	"360_11_0": {utls.Hello360_11_0, 3},
+	"360_7_5":  {utls.Hello360_7_5, 1},
 
 	// QQ Browser (popular in China)
-	"qq":               {utls.HelloQQ_Auto, 4},
-	"qq_auto":          {utls.HelloQQ_Auto, 4},
+	"qq":      {utls.HelloQQ_Auto, 4},
+	"qq_auto": {utls.HelloQQ_Auto, 4},
 
 	// Special fingerprints
-	"random":           {utls.HelloRandomized, 1},
-	"randomized":       {utls.HelloRandomized, 1},
+	"random":            {utls.HelloRandomized, 1},
+	"randomized":        {utls.HelloRandomized, 1},
 	"randomized_noalpn": {utls.HelloRandomizedALPN, 1},
-	"golang":           {utls.HelloGolang, 1},
-	"hello_golang":     {utls.HelloGolang, 1},
+	"golang":            {utls.HelloGolang, 1},
+	"hello_golang":      {utls.HelloGolang, 1},
 }
 
 func helloID(name string) utls.ClientHelloID {
@@ -260,15 +260,15 @@ func EnsureServerName(cfg *tls.Config, addr string) (*tls.Config, error) {
 
 // RotatingFingerprint provides automatic rotation of TLS fingerprints.
 type RotatingFingerprint struct {
-	mu            sync.RWMutex
-	fingerprints  []string        // List of fingerprint names to rotate through
-	currentIndex  int             // Current position in the list
-	interval      time.Duration   // Rotation interval
-	maxUses       int             // Max uses before rotation
-	useCount      int             // Current use count
-	lastRotation  time.Time       // Last rotation timestamp
-	ticker        *time.Ticker    // Rotation ticker
-	stopCh        chan struct{}   // Stop signal
+	mu           sync.RWMutex
+	fingerprints []string      // List of fingerprint names to rotate through
+	currentIndex int           // Current position in the list
+	interval     time.Duration // Rotation interval
+	maxUses      int           // Max uses before rotation
+	useCount     int           // Current use count
+	lastRotation time.Time     // Last rotation timestamp
+	ticker       *time.Ticker  // Rotation ticker
+	stopCh       chan struct{} // Stop signal
 }
 
 // NewRotatingFingerprint creates a new rotating fingerprint manager.
@@ -535,8 +535,8 @@ func buildExtensions(serverName string) []byte {
 	ecPointFormats := []byte{
 		0x00, 0x0b, // Extension type
 		0x00, 0x02, // Length
-		0x01,       // Formats length
-		0x00,       // uncompressed
+		0x01, // Formats length
+		0x00, // uncompressed
 	}
 	extensions = append(extensions, ecPointFormats...)
 
@@ -578,8 +578,8 @@ func buildExtensions(serverName string) []byte {
 	pskModes := []byte{
 		0x00, 0x2d, // Extension type
 		0x00, 0x02, // Length
-		0x01,       // Modes length
-		0x01,       // PSK with (EC)DHE key establishment
+		0x01, // Modes length
+		0x01, // PSK with (EC)DHE key establishment
 	}
 	extensions = append(extensions, pskModes...)
 

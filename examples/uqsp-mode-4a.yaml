@@ -1,8 +1,8 @@
 role: agent
-variant: "4a"
+variant: "HTTP+"
 
 agent:
-  id: "agent-4a"
+  id: "agent-http-plus"
   gateway_addr: "gateway.example.com:8443"
 
 transport:
@@ -49,13 +49,13 @@ transport:
         strategy: sni_split
 
     # Per-variant WARP/reverse policy (overrides global warp.enabled).
-    # Keys: 4a, 4b, 4c, 4d, 4e
+    # Keys: HTTP+, TCP+, TLS+, UDP+, TLS
     variant_policy:
-      "4a":
+      "HTTP+":
         warp_enabled: true
 
 warp:
-  enabled: false  # global off; per-variant policy above enables for 4a only
+  enabled: false  # global off; per-variant policy above enables for HTTP+ only
 
 security:
   shared_key: "replace-with-secure-shared-key"

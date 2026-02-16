@@ -17,7 +17,7 @@ transport:
     enabled: true
     mode: xhttp  # SplitHTTP/XHTTP protocol
   
-  # UQSP configuration for Mode 4a (XHTTP + Domain Fronting)
+  # UQSP configuration for Mode HTTP+ (XHTTP + Domain Fronting)
   uqsp:
     carrier:
       type: xhttp

@@ -8,24 +8,25 @@ import (
 	"sync"
 
 	"github.com/songgao/water"
-	"stealthlink/internal/relay"
 	"stealthlink/internal/tun"
 )
 
 // Session represents a VPN session over a network connection.
 type Session struct {
-	config   Config
-	iface    *water.Interface
-	stream   net.Conn
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	mu       sync.RWMutex
-	closed   bool
-	onError  func(error)
+	config  Config
+	iface   *water.Interface
+	control net.Conn
+	packets PacketTransport
+	netcfg  NetworkConfig
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	mu      sync.RWMutex
+	closed  bool
+	onError func(error)
 }
 
-// NewSession creates a new VPN session.
+// NewSession creates a new VPN session using stream-framed packets.
 func NewSession(cfg Config, stream net.Conn) (*Session, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -34,13 +35,34 @@ func NewSession(cfg Config, stream net.Conn) (*Session, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Session{
-		config: cfg,
-		stream: stream,
-		ctx:    ctx,
-		cancel: cancel,
+		config:  cfg,
+		control: stream,
+		packets: NewStreamPacketTransport(stream),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 
 	return s, nil
+}
+
+// NewSessionWithPacketTransport creates a new VPN session using an explicit packet transport.
+// controlConn is kept open for the lifetime of the session (even if packet transport is datagram-based).
+func NewSessionWithPacketTransport(cfg Config, controlConn net.Conn, pt PacketTransport) (*Session, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if pt == nil {
+		return nil, fmt.Errorf("packet transport is required")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Session{
+		config:  cfg,
+		control: controlConn,
+		packets: pt,
+		ctx:     ctx,
+		cancel:  cancel,
+	}, nil
 }
 
 // SetErrorHandler sets a callback for error handling.
@@ -50,7 +72,7 @@ func (s *Session) SetErrorHandler(fn func(error)) {
 
 // Start initializes the VPN interface and starts bridging.
 func (s *Session) Start() error {
-	// Create TUN/TAP interface
+	// Create TUN interface (L3 only)
 	iface, err := tun.OpenWithMode(tun.Config{
 		Name: s.config.Name,
 		MTU:  s.config.MTU,
@@ -92,14 +114,15 @@ func (s *Session) setupNetwork() error {
 		DNS:           s.config.DNS,
 	}
 
+	s.netcfg = cfg
 	return SetupInterface(cfg)
 }
 
-// bridge forwards packets between TUN/TAP and the network stream.
+// bridge forwards packets between TUN and the packet transport.
 func (s *Session) bridge() error {
 	errCh := make(chan error, 2)
 
-	// TUN -> Stream
+	// TUN -> Peer
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -118,14 +141,14 @@ func (s *Session) bridge() error {
 				return
 			}
 
-			if err := relay.WriteFrame(s.stream, buf[:n]); err != nil {
+			if err := s.packets.SendPacket(buf[:n]); err != nil {
 				errCh <- err
 				return
 			}
 		}
 	}()
 
-	// Stream -> TUN
+	// Peer -> TUN
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -137,7 +160,7 @@ func (s *Session) bridge() error {
 			default:
 			}
 
-			pkt, err := relay.ReadFrame(s.stream)
+			pkt, err := s.packets.ReceivePacket()
 			if err != nil {
 				errCh <- err
 				return
@@ -165,8 +188,18 @@ func (s *Session) Close() error {
 
 	s.cancel()
 
-	if s.stream != nil {
-		_ = s.stream.Close()
+	// Unblock ReceivePacket() first.
+	if s.packets != nil {
+		_ = s.packets.Close()
+	}
+
+	// Best-effort rollback of host config (addresses/routes) for systemd restarts.
+	if s.netcfg.InterfaceName != "" {
+		_ = RemoveInterface(s.netcfg)
+	}
+
+	if s.control != nil {
+		_ = s.control.Close()
 	}
 
 	if s.iface != nil {
@@ -178,7 +211,7 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// InterfaceName returns the name of the TUN/TAP interface.
+// InterfaceName returns the name of the TUN interface.
 func (s *Session) InterfaceName() string {
 	if s.iface == nil {
 		return ""
@@ -193,10 +226,11 @@ func (s *Session) IsClosed() bool {
 	return s.closed
 }
 
-// Bridge is a standalone function that bridges a TUN/TAP interface with a stream.
+// Bridge is a standalone function that bridges a TUN interface with a stream.
 // This is a lower-level function for cases where Session management isn't needed.
 func Bridge(ctx context.Context, iface io.ReadWriteCloser, stream net.Conn) error {
 	errCh := make(chan error, 2)
+	pt := NewStreamPacketTransport(stream)
 
 	// Interface -> Stream
 	go func() {
@@ -207,7 +241,7 @@ func Bridge(ctx context.Context, iface io.ReadWriteCloser, stream net.Conn) erro
 				errCh <- err
 				return
 			}
-			if err := relay.WriteFrame(stream, buf[:n]); err != nil {
+			if err := pt.SendPacket(buf[:n]); err != nil {
 				errCh <- err
 				return
 			}
@@ -217,7 +251,7 @@ func Bridge(ctx context.Context, iface io.ReadWriteCloser, stream net.Conn) erro
 	// Stream -> Interface
 	go func() {
 		for {
-			pkt, err := relay.ReadFrame(stream)
+			pkt, err := pt.ReceivePacket()
 			if err != nil {
 				errCh <- err
 				return

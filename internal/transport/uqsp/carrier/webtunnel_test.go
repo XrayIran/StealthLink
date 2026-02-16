@@ -3,12 +3,15 @@ package carrier
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"net"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
 )
+
+// UPSTREAM_WIRING: webtunnel
 
 func TestSimpleHpackEncodeProducesDecodableHeaders(t *testing.T) {
 	c := &WebTunnelCarrier{}
@@ -159,5 +162,192 @@ func TestExtractDataPayloadPadded(t *testing.T) {
 	}
 	if string(got) != "abc" {
 		t.Fatalf("unexpected data payload=%q", string(got))
+	}
+}
+
+func TestHasUpgradeToken(t *testing.T) {
+	cases := []struct {
+		hdr  string
+		want bool
+	}{
+		{"stealthlink", true},
+		{"StealthLink", true},
+		{"stealthlink, h2c", true},
+		{"h2c, stealthlink", true},
+		{"h2c", false},
+		{"", false},
+		{"  stealthlink  ", true},
+		{"stealthlink h2c", true}, // tolerate space-separated values
+	}
+	for _, tc := range cases {
+		if got := hasUpgradeToken(tc.hdr, "stealthlink"); got != tc.want {
+			t.Fatalf("hasUpgradeToken(%q)= %v, want %v", tc.hdr, got, tc.want)
+		}
+	}
+}
+
+func TestH2ConnReadAcksPingAndReturnsData(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &h2Conn{Conn: client, streamID: 1}
+
+	srvErr := make(chan error, 1)
+	go func() {
+		// Send PING (no ACK).
+		if err := writeH2Frame(server, 0x06, 0x00, 0, []byte("12345678")); err != nil {
+			srvErr <- err
+			return
+		}
+
+		// Expect PING ACK.
+		ft, flags, sid, payload, err := readH2Frame(server)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		if ft != 0x06 || flags != 0x01 || sid != 0 || !bytes.Equal(payload, []byte("12345678")) {
+			srvErr <- io.ErrUnexpectedEOF
+			return
+		}
+
+		// Then send DATA on stream 1.
+		if err := writeH2Frame(server, 0x00, 0x00, 1, []byte("hello")); err != nil {
+			srvErr <- err
+			return
+		}
+		srvErr <- nil
+	}()
+
+	buf := make([]byte, 8)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("Read(): %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("unexpected payload=%q", string(buf[:n]))
+	}
+	if err := <-srvErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestH2ConnReadRejectsMalformedPing(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &h2Conn{Conn: client, streamID: 1}
+
+	done := make(chan error, 1)
+	go func() {
+		// Malformed PING payload length.
+		done <- writeH2Frame(server, 0x06, 0x00, 0, []byte("short!!"))
+	}()
+
+	buf := make([]byte, 1)
+	_, err := c.Read(buf)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server write: %v", err)
+	}
+}
+
+func TestH2ConnReadAcksSettingsAndReturnsData(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &h2Conn{Conn: client, streamID: 1}
+
+	srvErr := make(chan error, 1)
+	go func() {
+		// Send server SETTINGS with a valid (6-byte) payload.
+		payload := []byte{0x00, 0x02, 0x00, 0x00, 0x00, 0x00} // ENABLE_PUSH=0
+		if err := writeH2Frame(server, 0x04, 0x00, 0, payload); err != nil {
+			srvErr <- err
+			return
+		}
+
+		// Expect SETTINGS ACK.
+		ft, flags, sid, pl, err := readH2Frame(server)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		if ft != 0x04 || flags != 0x01 || sid != 0 || len(pl) != 0 {
+			srvErr <- io.ErrUnexpectedEOF
+			return
+		}
+
+		// Send DATA on stream 1.
+		srvErr <- writeH2Frame(server, 0x00, 0x00, 1, []byte("ok"))
+	}()
+
+	buf := make([]byte, 8)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("Read(): %v", err)
+	}
+	if string(buf[:n]) != "ok" {
+		t.Fatalf("unexpected payload=%q", string(buf[:n]))
+	}
+	if err := <-srvErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestAwaitInitialH2SettingsAcksNonEmptySettings(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		// Server sends SETTINGS with a non-empty (6-byte) payload, then reads ACK.
+		payload := []byte{0x00, 0x01, 0x00, 0x00, 0x10, 0x00} // HEADER_TABLE_SIZE=4096
+		if err := writeH2Frame(server, 0x04, 0x00, 0, payload); err != nil {
+			done <- err
+			return
+		}
+		ft, flags, sid, pl, err := readH2Frame(server)
+		if err != nil {
+			done <- err
+			return
+		}
+		if ft != 0x04 || flags != 0x01 || sid != 0 || len(pl) != 0 {
+			done <- io.ErrUnexpectedEOF
+			return
+		}
+		done <- nil
+	}()
+
+	if err := awaitInitialH2Settings(client); err != nil {
+		t.Fatalf("awaitInitialH2Settings: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestDecodeStatusFromHeaderBlockMissingStatus(t *testing.T) {
+	var b bytes.Buffer
+	enc := hpack.NewEncoder(&b)
+	if err := enc.WriteField(hpack.HeaderField{Name: "server", Value: "test"}); err != nil {
+		t.Fatalf("write server: %v", err)
+	}
+	if _, err := decodeStatusFromHeaderBlock(b.Bytes()); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestExtractHeaderBlockFragmentRejectsInvalidPadding(t *testing.T) {
+	// PADDED flag set but pad length exceeds payload.
+	_, err := extractHeaderBlockFragment([]byte{10, 1, 2, 3}, 0x08)
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }

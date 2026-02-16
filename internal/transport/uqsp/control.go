@@ -68,7 +68,7 @@ func (r *OpenStreamRequest) Decode(data []byte) error {
 
 // CloseStreamRequest is a request to close a stream
 type CloseStreamRequest struct {
-	StreamID uint32
+	StreamID  uint32
 	ErrorCode uint32
 }
 
@@ -92,8 +92,8 @@ func (r *CloseStreamRequest) Decode(data []byte) error {
 
 // WindowUpdateFrame is a flow control window update
 type WindowUpdateFrame struct {
-	StreamID      uint32
-	WindowDelta   uint32
+	StreamID    uint32
+	WindowDelta uint32
 }
 
 // Encode encodes the frame
@@ -116,8 +116,8 @@ func (w *WindowUpdateFrame) Decode(data []byte) error {
 
 // ErrorFrame is an error notification
 type ErrorFrame struct {
-	ErrorCode   ErrorCode
-	Message     string
+	ErrorCode ErrorCode
+	Message   string
 }
 
 // Encode encodes the frame

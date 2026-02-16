@@ -10,7 +10,7 @@ func TestAllModeProfiles(t *testing.T) {
 		t.Errorf("Expected 5 mode profiles, got %d", len(profiles))
 	}
 
-	expectedModes := []string{"4a", "4b", "4c", "4d", "4e"}
+	expectedModes := []string{VariantHTTPPlus, VariantTCPPlus, VariantTLSPlus, VariantUDPPlus, VariantTLS}
 	for i, profile := range profiles {
 		if profile.Mode != expectedModes[i] {
 			t.Errorf("Expected mode %s at index %d, got %s", expectedModes[i], i, profile.Mode)
@@ -23,11 +23,11 @@ func TestGetModeProfile(t *testing.T) {
 		mode        string
 		shouldExist bool
 	}{
-		{"4a", true},
-		{"4b", true},
-		{"4c", true},
-		{"4d", true},
-		{"4e", true},
+		{VariantHTTPPlus, true},
+		{VariantTCPPlus, true},
+		{VariantTLSPlus, true},
+		{VariantUDPPlus, true},
+		{VariantTLS, true},
 		{"4f", false},
 		{"invalid", false},
 	}
@@ -45,85 +45,70 @@ func TestGetModeProfile(t *testing.T) {
 	}
 }
 
-func TestMode4aProfile(t *testing.T) {
+func TestModeHTTPPlusProfile(t *testing.T) {
 	profile := Mode4aProfile
 
-	if profile.Mode != "4a" {
-		t.Errorf("Expected mode 4a, got %s", profile.Mode)
+	if profile.Mode != VariantHTTPPlus {
+		t.Errorf("Expected mode %s, got %s", VariantHTTPPlus, profile.Mode)
 	}
-	if profile.Name != "XHTTP + Domain Fronting" {
-		t.Errorf("Expected name 'XHTTP + Domain Fronting', got %s", profile.Name)
+	if profile.Name != "HTTP-Family (XHTTP)" {
+		t.Errorf("Expected name 'HTTP-Family (XHTTP)', got %s", profile.Name)
 	}
-	if !profile.Capabilities.StreamOriented {
-		t.Error("Mode 4a should be stream-oriented")
-	}
-	if !profile.Capabilities.ZeroRTT {
-		t.Error("Mode 4a should support 0-RTT")
-	}
-	if !profile.Capabilities.Fronting {
-		t.Error("Mode 4a should support fronting")
+	if !profile.Capabilities.Streams {
+		t.Error("Mode HTTP+ should support streams")
 	}
 	if profile.Defaults.MTU != 1400 {
 		t.Errorf("Expected MTU 1400, got %d", profile.Defaults.MTU)
 	}
 }
 
-func TestMode4bProfile(t *testing.T) {
+func TestModeTCPPlusProfile(t *testing.T) {
 	profile := Mode4bProfile
 
-	if profile.Mode != "4b" {
-		t.Errorf("Expected mode 4b, got %s", profile.Mode)
+	if profile.Mode != VariantTCPPlus {
+		t.Errorf("Expected mode %s, got %s", VariantTCPPlus, profile.Mode)
 	}
-	if profile.Capabilities.StreamOriented {
-		t.Error("Mode 4b should not be stream-oriented")
+	if !profile.Capabilities.Streams {
+		t.Error("Mode TCP+ should support streams")
 	}
-	if !profile.Capabilities.ReplayProtection {
-		t.Error("Mode 4b should have replay protection")
-	}
-	if profile.Defaults.MTU != 1460 {
-		t.Errorf("Expected MTU 1460, got %d", profile.Defaults.MTU)
+	if profile.Defaults.MTU != 1400 {
+		t.Errorf("Expected MTU 1400, got %d", profile.Defaults.MTU)
 	}
 }
 
-func TestMode4cProfile(t *testing.T) {
+func TestModeTLSPlusProfile(t *testing.T) {
 	profile := Mode4cProfile
 
-	if profile.Mode != "4c" {
-		t.Errorf("Expected mode 4c, got %s", profile.Mode)
+	if profile.Mode != VariantTLSPlus {
+		t.Errorf("Expected mode %s, got %s", VariantTLSPlus, profile.Mode)
 	}
-	if !profile.Capabilities.CoverTraffic {
-		t.Error("Mode 4c should support cover traffic")
-	}
-	if !profile.Defaults.PaddingEnabled {
-		t.Error("Mode 4c should have padding enabled by default")
+	if !profile.Capabilities.Streams {
+		t.Error("Mode TLS+ should support streams")
 	}
 }
 
-func TestMode4dProfile(t *testing.T) {
+func TestModeUDPPlusProfile(t *testing.T) {
 	profile := Mode4dProfile
 
-	if profile.Mode != "4d" {
-		t.Errorf("Expected mode 4d, got %s", profile.Mode)
+	if profile.Mode != VariantUDPPlus {
+		t.Errorf("Expected mode %s, got %s", VariantUDPPlus, profile.Mode)
 	}
-	if !profile.Capabilities.PathMigration {
-		t.Error("Mode 4d should support path migration")
+	if !profile.Capabilities.Datagrams {
+		t.Error("Mode UDP+ should support native datagrams")
 	}
-	if !profile.Capabilities.Multipath {
-		t.Error("Mode 4d should support multipath")
-	}
-	if profile.Carrier.CongestionControl != "brutal" {
-		t.Errorf("Expected brutal CC, got %s", profile.Carrier.CongestionControl)
+	if !profile.Capabilities.Capsules {
+		t.Error("Mode UDP+ should support capsules")
 	}
 }
 
-func TestMode4eProfile(t *testing.T) {
+func TestModeTLSProfile(t *testing.T) {
 	profile := Mode4eProfile
 
-	if profile.Mode != "4e" {
-		t.Errorf("Expected mode 4e, got %s", profile.Mode)
+	if profile.Mode != VariantTLS {
+		t.Errorf("Expected mode %s, got %s", VariantTLS, profile.Mode)
 	}
-	if profile.Carrier.Mux != "trusttunnel-icmp" {
-		t.Errorf("Expected trusttunnel-icmp mux, got %s", profile.Carrier.Mux)
+	if profile.Carrier.Type != "trusttunnel" {
+		t.Errorf("Expected trusttunnel carrier, got %s", profile.Carrier.Type)
 	}
 	if profile.Defaults.MTU != 1380 {
 		t.Errorf("Expected MTU 1380, got %d", profile.Defaults.MTU)
@@ -133,30 +118,26 @@ func TestMode4eProfile(t *testing.T) {
 func TestCapabilityMatrix(t *testing.T) {
 	matrix := GetCapabilityMatrix()
 
-	if len(matrix.Capabilities) != 8 {
-		t.Errorf("Expected 8 capability rows, got %d", len(matrix.Capabilities))
+	if len(matrix.Capabilities) != 5 {
+		t.Errorf("Expected 5 capability rows, got %d", len(matrix.Capabilities))
 	}
 
 	// Test specific capabilities
 	for _, row := range matrix.Capabilities {
 		switch row.Capability {
-		case "StreamOriented":
-			if !row.Mode4a || row.Mode4b || !row.Mode4c || !row.Mode4d || !row.Mode4e {
-				t.Error("StreamOriented capability mismatch")
+		case "Streams":
+			if !row.Mode4a || !row.Mode4b || !row.Mode4c || !row.Mode4d || !row.Mode4e {
+				t.Error("Streams capability mismatch")
 			}
-		case "Fronting":
-			if !row.Mode4a || row.Mode4b || row.Mode4c || row.Mode4d || row.Mode4e {
-				t.Error("Fronting capability mismatch")
-			}
-		case "PathMigration":
+		case "Datagrams":
 			if row.Mode4a || row.Mode4b || row.Mode4c || !row.Mode4d || row.Mode4e {
-				t.Error("PathMigration capability mismatch")
+				t.Error("Datagrams capability mismatch")
 			}
 		}
 	}
 }
 
-func TestDefaultMode4aConfig(t *testing.T) {
+func TestDefaultModeHTTPPlusConfig(t *testing.T) {
 	config := DefaultMode4aConfig()
 
 	if config.SessionPlacement != "header" {
@@ -170,7 +151,7 @@ func TestDefaultMode4aConfig(t *testing.T) {
 	}
 }
 
-func TestDefaultMode4bConfig(t *testing.T) {
+func TestDefaultModeTCPPlusConfig(t *testing.T) {
 	config := DefaultMode4bConfig()
 
 	if config.AEADMode != "chacha20poly1305" {
@@ -184,7 +165,7 @@ func TestDefaultMode4bConfig(t *testing.T) {
 	}
 }
 
-func TestDefaultMode4cConfig(t *testing.T) {
+func TestDefaultModeTLSPlusConfig(t *testing.T) {
 	config := DefaultMode4cConfig()
 
 	if config.TLSMode != "reality" {
@@ -198,7 +179,7 @@ func TestDefaultMode4cConfig(t *testing.T) {
 	}
 }
 
-func TestDefaultMode4dConfig(t *testing.T) {
+func TestDefaultModeUDPPlusConfig(t *testing.T) {
 	config := DefaultMode4dConfig()
 
 	if !config.BrutalEnabled {
@@ -215,7 +196,7 @@ func TestDefaultMode4dConfig(t *testing.T) {
 	}
 }
 
-func TestDefaultMode4eConfig(t *testing.T) {
+func TestDefaultModeTLSConfig(t *testing.T) {
 	config := DefaultMode4eConfig()
 
 	if config.HTTPVersion != "http2" {

@@ -3,9 +3,12 @@ package gateway
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -266,7 +269,8 @@ func (g *Gateway) buildUQSPListener() (transport.Listener, error) {
 	}
 
 	if g.cfg.UQSPRuntimeMode() == "legacy" {
-		log.Printf("UQSP runtime mode=legacy; using historical listener path")
+		log.Printf("WARNING: UQSP runtime mode=legacy is deprecated; using historical listener path")
+		metrics.IncDeprecatedLegacyMode()
 		listener, err := uqsp.NewListener(
 			g.cfg.Gateway.Listen, &g.cfg.Transport.UQSP, tlsCfg, smuxCfg, g.cfg.ActiveSharedKey())
 		if err != nil {
@@ -703,7 +707,58 @@ func (g *Gateway) startTun(ctx context.Context, entry *agentEntry, name string) 
 			vpnCfg.Mode = "tun"
 		}
 
-		session, err := vpn.NewSession(vpnCfg, strm)
+		tunTransport := strings.ToLower(strings.TrimSpace(svc.Tun.Transport))
+		if tunTransport == "" {
+			tunTransport = "auto"
+		}
+
+		var session *vpn.Session
+		var err error
+		if tunTransport == "datagram" || tunTransport == "auto" {
+			if ds, ok := entry.sess.(transport.DatagramSession); ok && ds.SupportsNativeDatagrams() {
+				sessionID, err := ds.OpenDatagramSession()
+				if err != nil {
+					_ = strm.Close()
+					metrics.DecStreams()
+					log.Printf("vpn datagram open failed: %v", err)
+					return
+				}
+
+				// Handshake: send session ID, wait for 1-byte ACK.
+				_ = strm.SetDeadline(time.Now().Add(5 * time.Second))
+				var sidBuf [4]byte
+				binary.BigEndian.PutUint32(sidBuf[:], sessionID)
+				if _, err := strm.Write(sidBuf[:]); err != nil {
+					_ = strm.SetDeadline(time.Time{})
+					_ = ds.CloseDatagramSession(sessionID)
+					_ = strm.Close()
+					metrics.DecStreams()
+					log.Printf("vpn datagram handshake write failed: %v", err)
+					return
+				}
+				var ack [1]byte
+				if _, err := io.ReadFull(strm, ack[:]); err != nil {
+					_ = strm.SetDeadline(time.Time{})
+					_ = ds.CloseDatagramSession(sessionID)
+					_ = strm.Close()
+					metrics.DecStreams()
+					log.Printf("vpn datagram handshake ack read failed: %v", err)
+					return
+				}
+				_ = strm.SetDeadline(time.Time{})
+
+				pt := vpn.NewDatagramPacketTransport(ds, sessionID)
+				session, err = vpn.NewSessionWithPacketTransport(vpnCfg, strm, pt)
+			} else if tunTransport == "datagram" {
+				_ = strm.Close()
+				metrics.DecStreams()
+				log.Printf("tun.transport=datagram requested but transport session has no native datagram support")
+				return
+			}
+		}
+		if session == nil {
+			session, err = vpn.NewSession(vpnCfg, strm)
+		}
 		if err != nil {
 			_ = strm.Close()
 			metrics.DecStreams()

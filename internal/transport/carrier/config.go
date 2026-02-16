@@ -6,7 +6,7 @@ import "time"
 // It provides mode-specific settings and cross-cutting concerns like MTU and congestion control.
 type CarrierConfig struct {
 	// Mode specifies which StealthLink mode to use.
-	// Valid values: "4a" | "4b" | "4c" | "4d" | "4e"
+	// Valid values: "HTTP+" | "TCP+" | "TLS+" | "UDP+" | "TLS"
 	// Each mode has different characteristics (see mode profiles in design doc).
 	Mode string
 
@@ -19,7 +19,7 @@ type CarrierConfig struct {
 	// Valid values: "cubic" | "bbr" | "brutal"
 	// - cubic: Standard TCP congestion control (default for TCP-based modes)
 	// - bbr: Bottleneck Bandwidth and RTT (better for high-latency links)
-	// - brutal: Fixed bandwidth (for QUIC mode 4d)
+	// - brutal: Fixed bandwidth (for QUIC mode UDP+)
 	CongestionControl string
 
 	// Reliability specifies the reliability layer.
@@ -69,11 +69,11 @@ type RotationConfig struct {
 
 	// MaxReuseTimes is the maximum number of times a connection can be reused.
 	// After this limit, the connection is rotated (closed and replaced).
-	// Default: 32 (for mode 4a Xmux)
+	// Default: 32 (for mode HTTP+ Xmux)
 	MaxReuseTimes int
 
 	// MaxRequestTimes is the maximum number of requests per connection.
-	// Applies to HTTP-based carriers (modes 4a, 4e).
+	// Applies to HTTP-based carriers (modes HTTP+, TLS).
 	// Default: 100
 	MaxRequestTimes int
 

@@ -1,8 +1,8 @@
 role: agent
-variant: "4b"
+variant: "TCP+"
 
 agent:
-  id: "agent-4b"
+  id: "agent-tcp-plus"
   gateway_addr: "gateway.example.com:8443"
 
 transport:

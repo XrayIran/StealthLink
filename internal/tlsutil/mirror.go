@@ -16,17 +16,17 @@ import (
 
 // MirrorState holds captured TLS state from a real site.
 type MirrorState struct {
-	ServerName    string              `json:"server_name"`
-	Version       uint16              `json:"version"`
-	CipherSuite   uint16              `json:"cipher_suite"`
-	Certificates  [][]byte            `json:"certificates"`
-	SessionTicket []byte              `json:"session_ticket"`
-	OCSPResponse  []byte              `json:"ocsp_response"`
-	SCTList       []byte              `json:"sct_list"`
-	ALPN          string              `json:"alpn"`
-	Extensions    []ExtensionInfo     `json:"extensions"`
-	Timestamp     time.Time           `json:"timestamp"`
-	TTL           time.Duration       `json:"ttl"`
+	ServerName    string          `json:"server_name"`
+	Version       uint16          `json:"version"`
+	CipherSuite   uint16          `json:"cipher_suite"`
+	Certificates  [][]byte        `json:"certificates"`
+	SessionTicket []byte          `json:"session_ticket"`
+	OCSPResponse  []byte          `json:"ocsp_response"`
+	SCTList       []byte          `json:"sct_list"`
+	ALPN          string          `json:"alpn"`
+	Extensions    []ExtensionInfo `json:"extensions"`
+	Timestamp     time.Time       `json:"timestamp"`
+	TTL           time.Duration   `json:"ttl"`
 }
 
 // ExtensionInfo holds information about a TLS extension.
@@ -72,12 +72,12 @@ func MirrorEnrollment(target string) (*MirrorState, error) {
 
 	// Capture state
 	mirror := &MirrorState{
-		ServerName:   host,
-		Version:      state.Version,
-		CipherSuite:  state.CipherSuite,
-		ALPN:         state.NegotiatedProtocol,
-		Timestamp:    time.Now(),
-		TTL:          24 * time.Hour, // Default TTL
+		ServerName:  host,
+		Version:     state.Version,
+		CipherSuite: state.CipherSuite,
+		ALPN:        state.NegotiatedProtocol,
+		Timestamp:   time.Now(),
+		TTL:         24 * time.Hour, // Default TTL
 	}
 
 	// Capture certificates

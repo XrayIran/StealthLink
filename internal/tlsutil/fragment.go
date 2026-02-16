@@ -13,15 +13,15 @@ import (
 // FragmentConfig configures TLS Client Hello fragmentation.
 type FragmentConfig struct {
 	Enabled   bool          `yaml:"enabled"`
-	Size      int           `yaml:"size"`       // Bytes per fragment (default: 32)
-	DelayMin  time.Duration `yaml:"delay_min"`  // Min delay between fragments
-	DelayMax  time.Duration `yaml:"delay_max"`  // Max delay between fragments
-	Randomize bool          `yaml:"randomize"`  // Randomize fragment sizes
+	Size      int           `yaml:"size"`      // Bytes per fragment (default: 32)
+	DelayMin  time.Duration `yaml:"delay_min"` // Min delay between fragments
+	DelayMax  time.Duration `yaml:"delay_max"` // Max delay between fragments
+	Randomize bool          `yaml:"randomize"` // Randomize fragment sizes
 
 	// Advanced fragmentation options (from gfw_resist_tls_proxy)
-	NumFragments int           `yaml:"num_fragments"`   // Total number of fragments (default: 87)
+	NumFragments  int           `yaml:"num_fragments"`  // Total number of fragments (default: 87)
 	FragmentSleep time.Duration `yaml:"fragment_sleep"` // Sleep between fragments (default: 8ms)
-	Mode         FragmentMode  `yaml:"mode"`            // Fragmentation mode
+	Mode          FragmentMode  `yaml:"mode"`           // Fragmentation mode
 }
 
 // FragmentMode defines the fragmentation strategy
@@ -75,9 +75,9 @@ func (c *FragmentConfig) ApplyDefaults() {
 // FragmentedConn wraps a net.Conn to fragment TLS Client Hello.
 type FragmentedConn struct {
 	net.Conn
-	config     FragmentConfig
-	buffer     []byte
-	sent       int
+	config        FragmentConfig
+	buffer        []byte
+	sent          int
 	handshakeDone bool
 }
 

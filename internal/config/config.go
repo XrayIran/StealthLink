@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 )
 
 type Config struct {
-	Variant          string                 `yaml:"variant"` // Optional explicit 4a..4e mode selector
+	Variant          string                 `yaml:"variant"` // Optional explicit mode selector: HTTP+ | TCP+ | TLS+ | UDP+ | TLS
 	Role             string                 `yaml:"role"`
 	Gateway          Gateway                `yaml:"gateway"`
 	Agent            Agent                  `yaml:"agent"`
@@ -55,12 +56,13 @@ type MasqueradeConfig struct {
 type Agent struct {
 	ID               string `yaml:"id"`
 	GatewayAddr      string `yaml:"gateway_addr"`
+	AllowLoopback    bool   `yaml:"allow_loopback_gateway_addr"`
 	ReconnectBackoff string `yaml:"reconnect_backoff"`
 }
 
 type Transport struct {
 	Type         string                `yaml:"type"`
-	Mode         string                `yaml:"mode"` // "4a" | "4b" | "4c" | "4d" | "4e" - StealthLink mode profile
+	Mode         string                `yaml:"mode"` // "HTTP+" | "TCP+" | "TLS+" | "UDP+" | "TLS" - StealthLink mode profile
 	Stealth      StealthConfig         `yaml:"stealth"`
 	UQSP         UQSPConfig            `yaml:"uqsp"`
 	Experimental bool                  `yaml:"experimental"`
@@ -99,9 +101,10 @@ type Transport struct {
 	Mode4e Mode4eConfig `yaml:"mode_4e"` // TrustTunnel + CSTP configuration
 
 	// Underlay dialer configuration
-	Dialer      string      `yaml:"dialer"`       // "direct" (default) | "warp" | "socks"
-	WARPDialer  WARPDialer  `yaml:"warp_dialer"`  // WARP dialer configuration
-	SOCKSDialer SOCKSDialer `yaml:"socks_dialer"` // SOCKS dialer configuration
+	Dialer       string             `yaml:"dialer"`        // "direct" (default) | "warp" | "socks"
+	WARPDialer   WARPDialer         `yaml:"warp_dialer"`   // WARP dialer configuration
+	SOCKSDialer  SOCKSDialer        `yaml:"socks_dialer"`  // SOCKS dialer configuration
+	DialerPolicy DialerPolicyConfig `yaml:"dialer_policy"` // optional per-destination dialer routing
 
 	// Upstream compatibility adapters (OPTIONAL)
 	// Use ONLY when interoperability with upstream clients is required
@@ -180,6 +183,25 @@ type WARPDialer struct {
 	FailurePolicy string `yaml:"failure_policy"`
 
 	DeviceID string `yaml:"device_id"` // WARP device registration ID
+
+	// Mark is the fwmark value used for policy routing.
+	// Sockets created by this dialer will have SO_MARK set to this value,
+	// and policy routing rules will route marked packets via WARP.
+	// Default: 51888
+	Mark int `yaml:"mark"`
+
+	// Table is the routing table number for WARP routes.
+	// Default: 51888
+	Table int `yaml:"table"`
+
+	// RulePriority is the priority for the ip rule that directs marked packets.
+	// Lower values = higher priority. Default: 11000
+	RulePriority int `yaml:"rule_priority"`
+
+	// RoutingPolicy determines how traffic is routed through WARP:
+	// - "socket_mark" (default): Only sockets with SO_MARK set use WARP routing
+	// - "global": All traffic uses WARP (disruptive, changes default route)
+	RoutingPolicy string `yaml:"routing_policy"`
 }
 
 // SOCKSDialer configures SOCKS5 proxy as transport underlay
@@ -518,9 +540,10 @@ type Metrics struct {
 }
 
 type TunConfig struct {
-	Name string `yaml:"name"`
-	MTU  int    `yaml:"mtu"`
-	Mode string `yaml:"mode"` // "tun" or "tap"
+	Name      string `yaml:"name"`
+	MTU       int    `yaml:"mtu"`
+	Mode      string `yaml:"mode"`      // "tun" (L3-only)
+	Transport string `yaml:"transport"` // auto (default), stream, datagram
 }
 
 type UDPConfig struct {
@@ -633,6 +656,18 @@ func (c *Config) applyDefaults() {
 	case "fail-closed":
 		c.Transport.WARPDialer.Required = true
 	}
+	if c.Transport.WARPDialer.Mark == 0 {
+		c.Transport.WARPDialer.Mark = 51888
+	}
+	if c.Transport.WARPDialer.Table == 0 {
+		c.Transport.WARPDialer.Table = 51888
+	}
+	if c.Transport.WARPDialer.RulePriority == 0 {
+		c.Transport.WARPDialer.RulePriority = 11000
+	}
+	if c.Transport.WARPDialer.RoutingPolicy == "" {
+		c.Transport.WARPDialer.RoutingPolicy = "socket_mark"
+	}
 
 	// Apply UQSP defaults if using UQSP transport
 	if c.UQSPEnabled() {
@@ -738,6 +773,9 @@ func (c *Config) validate() error {
 		if c.Agent.GatewayAddr == "" {
 			return fmt.Errorf("agent.gateway_addr is required")
 		}
+		if err := validateGatewayAddr(c.Agent.GatewayAddr, c.Agent.AllowLoopback); err != nil {
+			return err
+		}
 	}
 	if err := c.validateExtensions(); err != nil {
 		return err
@@ -798,8 +836,21 @@ func (c *Config) validate() error {
 			return fmt.Errorf("service %s protocol tun requires tun.name", svc.Name)
 		}
 		if svc.Protocol == "tun" && svc.Tun.Mode != "" {
-			if svc.Tun.Mode != "tun" && svc.Tun.Mode != "tap" {
-				return fmt.Errorf("service %s tun.mode must be 'tun' or 'tap'", svc.Name)
+			if svc.Tun.Mode != "tun" {
+				return fmt.Errorf("service %s tun.mode must be 'tun' (tap/L2 not supported)", svc.Name)
+			}
+		}
+		if svc.Protocol == "tun" {
+			// Default to L3-only TUN if the service doesn't specify a mode.
+			if strings.TrimSpace(svc.Tun.Mode) == "" {
+				svc.Tun.Mode = "tun"
+			}
+			switch strings.ToLower(strings.TrimSpace(svc.Tun.Transport)) {
+			case "", "auto":
+				// default
+			case "stream", "datagram":
+			default:
+				return fmt.Errorf("service %s tun.transport must be one of: auto, stream, datagram", svc.Name)
 			}
 		}
 		if svc.Protocol == "socks5" {
@@ -835,6 +886,50 @@ func (c *Config) validate() error {
 			svc.Host.Path = c.Transport.Stealth.Camouflage.HTTPCover.Path
 		}
 	}
+
+	// Enforce VPN config validation when enabled (L3-only; rejects tap).
+	if err := c.VPN.Validate(); err != nil {
+		return fmt.Errorf("vpn: %w", err)
+	}
+	return nil
+}
+
+func validateGatewayAddr(addr string, allowLoopback bool) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return fmt.Errorf("agent.gateway_addr is required")
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		if strings.Count(addr, ":") > 1 && !strings.HasPrefix(addr, "[") {
+			return fmt.Errorf("agent.gateway_addr must be in host:port form; for IPv6 use [ipv6]:port (example: [2001:db8::1]:8443)")
+		}
+		return fmt.Errorf("agent.gateway_addr invalid (expected host:port): %w", err)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Errorf("agent.gateway_addr missing host")
+	}
+	if host == "0.0.0.0" || host == "::" {
+		return fmt.Errorf("agent.gateway_addr must not be 0.0.0.0 or :: (not dialable)")
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portStr))
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("agent.gateway_addr has invalid port: %q", portStr)
+	}
+
+	if strings.EqualFold(host, "localhost") && !allowLoopback {
+		return fmt.Errorf("agent.gateway_addr=%q is loopback; set agent.allow_loopback_gateway_addr=true for same-host testing", addr)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			return fmt.Errorf("agent.gateway_addr must not be 0.0.0.0 or :: (not dialable)")
+		}
+		if ip.IsLoopback() && !allowLoopback {
+			return fmt.Errorf("agent.gateway_addr=%q is loopback; set agent.allow_loopback_gateway_addr=true for same-host testing", addr)
+		}
+	}
+
 	return nil
 }
 
@@ -843,6 +938,11 @@ func (c *Config) validateUnderlayDialer() error {
 	switch dialer {
 	case "", "direct":
 		return nil
+	case "policy":
+		if !c.Transport.DialerPolicy.Enabled {
+			return fmt.Errorf("transport.dialer=policy requires transport.dialer_policy.enabled=true")
+		}
+		return c.validateDialerPolicy()
 	case "warp":
 		engine := strings.ToLower(strings.TrimSpace(c.Transport.WARPDialer.Engine))
 		switch engine {
@@ -862,6 +962,21 @@ func (c *Config) validateUnderlayDialer() error {
 		if policy == "fail-closed" && !c.Transport.WARPDialer.Required {
 			return fmt.Errorf("transport.warp_dialer.failure_policy=fail-closed requires required=true")
 		}
+		if c.Transport.WARPDialer.Mark < 1 || c.Transport.WARPDialer.Mark > 0xFFFFFFFF {
+			return fmt.Errorf("transport.warp_dialer.mark must be between 1 and %d", 0xFFFFFFFF)
+		}
+		if c.Transport.WARPDialer.Table < 1 || c.Transport.WARPDialer.Table > 0xFFFFFFFF {
+			return fmt.Errorf("transport.warp_dialer.table must be between 1 and %d", 0xFFFFFFFF)
+		}
+		if c.Transport.WARPDialer.RulePriority < 1 || c.Transport.WARPDialer.RulePriority > 32767 {
+			return fmt.Errorf("transport.warp_dialer.rule_priority must be between 1 and 32767")
+		}
+		rp := strings.ToLower(strings.TrimSpace(c.Transport.WARPDialer.RoutingPolicy))
+		switch rp {
+		case "", "socket_mark", "global":
+		default:
+			return fmt.Errorf("transport.warp_dialer.routing_policy must be one of: socket_mark, global")
+		}
 		return nil
 	case "socks":
 		if strings.TrimSpace(c.Transport.SOCKSDialer.Address) == "" {
@@ -869,7 +984,7 @@ func (c *Config) validateUnderlayDialer() error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("transport.dialer must be one of: direct, warp, socks")
+		return fmt.Errorf("transport.dialer must be one of: direct, warp, socks, policy")
 	}
 }
 
@@ -886,8 +1001,28 @@ func validateRemovedTransportBlocks(data []byte) error {
 	if transport == nil {
 		return nil
 	}
+	allowed := map[string]struct{}{
+		"type":          {},
+		"mode":          {},
+		"stealth":       {},
+		"uqsp":          {},
+		"dialer":        {},
+		"warp_dialer":   {},
+		"socks_dialer":  {},
+		"dialer_policy": {},
+		"compat_mode":   {},
+		"xray":          {},
+		"singbox":       {},
+	}
 	for k := range transport {
-		if k == "type" || k == "stealth" || k == "uqsp" {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k == "" {
+			continue
+		}
+		if k == "pipeline" {
+			return fmt.Errorf("transport.pipeline has been removed; use transport.stealth.*")
+		}
+		if _, ok := allowed[k]; ok {
 			continue
 		}
 		if isLegacyTransportBlock(k) {
@@ -1289,7 +1424,7 @@ func kcpKeyRequired(block string) bool {
 }
 
 // GetActiveMode returns the active StealthLink mode.
-// Priority: transport.mode > variant > default ("4a")
+// Priority: transport.mode > variant > default ("HTTP+")
 func (c *Config) GetActiveMode() string {
 	if c.Transport.Mode != "" {
 		return c.Transport.Mode
@@ -1297,7 +1432,7 @@ func (c *Config) GetActiveMode() string {
 	if c.Variant != "" {
 		return c.Variant
 	}
-	return "4a" // default mode
+	return VariantHTTPPlus // default mode
 }
 
 // GetMode4aConfig returns the Mode 4a configuration with defaults applied.
@@ -1454,32 +1589,23 @@ func (c *Config) GetMode4eConfig() Mode4eConfig {
 
 // ValidateMode validates the transport.mode configuration and mode-specific settings.
 func (c *Config) ValidateMode() error {
-	mode := c.GetActiveMode()
-
-	// Validate mode value
-	validModes := map[string]bool{
-		"4a": true,
-		"4b": true,
-		"4c": true,
-		"4d": true,
-		"4e": true,
-	}
-
-	if !validModes[mode] {
-		return fmt.Errorf("transport.mode must be one of: 4a, 4b, 4c, 4d, 4e (got: %s)", mode)
+	modeRaw := c.GetActiveMode()
+	mode, ok := canonicalVariantName(modeRaw)
+	if !ok {
+		return fmt.Errorf("transport.mode must be one of: %s (got: %s)", allowedVariantNamesText(), modeRaw)
 	}
 
 	// Validate mode-specific configuration
 	switch mode {
-	case "4a":
+	case VariantHTTPPlus:
 		return c.validateMode4a()
-	case "4b":
+	case VariantTCPPlus:
 		return c.validateMode4b()
-	case "4c":
+	case VariantTLSPlus:
 		return c.validateMode4c()
-	case "4d":
+	case VariantUDPPlus:
 		return c.validateMode4d()
-	case "4e":
+	case VariantTLS:
 		return c.validateMode4e()
 	}
 

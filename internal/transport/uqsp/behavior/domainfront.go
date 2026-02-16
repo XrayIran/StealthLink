@@ -13,7 +13,17 @@ import (
 	"time"
 
 	"stealthlink/internal/tlsutil"
+	"stealthlink/internal/transport/phantom"
 )
+
+type DomainFrontPhantomConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	SharedSecret   string `yaml:"shared_secret"`
+	EpochSeed      string `yaml:"epoch_seed"`
+	SubnetPrefixV4 string `yaml:"subnet_prefix_v4"`
+	SubnetPrefixV6 string `yaml:"subnet_prefix_v6"`
+	PoolSize       int    `yaml:"pool_size"`
+}
 
 // DomainFrontOverlay implements domain fronting for CDN-based hiding.
 // It modifies the TLS SNI (outer) to a front domain while keeping the
@@ -25,9 +35,10 @@ type DomainFrontOverlay struct {
 	CFWorker     string `yaml:"cf_worker"`    // Cloudflare Worker route header
 
 	// Cloudflare IP range rotation
-	RotateIPs       bool     `yaml:"rotate_ips"`
-	CustomIPs       []string `yaml:"custom_ips"`
-	FailoverDomains []string `yaml:"failover_domains"`
+	RotateIPs       bool                     `yaml:"rotate_ips"`
+	CustomIPs       []string                 `yaml:"custom_ips"`
+	FailoverDomains []string                 `yaml:"failover_domains"`
+	Phantom         DomainFrontPhantomConfig `yaml:"phantom"`
 
 	// HTTP-specific settings
 	PreserveHostHeader bool `yaml:"preserve_host_header"`
@@ -37,6 +48,7 @@ type DomainFrontOverlay struct {
 	ipIndex    int
 	frontIndex int // cycles through FrontDomain + FailoverDomains
 	httpClient *http.Client
+	phantom    *phantom.Pool
 }
 
 // Name returns the name of this overlay
@@ -63,7 +75,31 @@ func (d *DomainFrontOverlay) Validate() error {
 		return fmt.Errorf("real_host is required for domain fronting")
 	}
 
+	if d.Phantom.Enabled && strings.TrimSpace(d.Phantom.SharedSecret) == "" {
+		return fmt.Errorf("phantom.shared_secret is required when phantom is enabled")
+	}
+
 	return nil
+}
+
+func (d *DomainFrontOverlay) ensurePhantomLocked() {
+	if d.phantom != nil || !d.Phantom.Enabled {
+		return
+	}
+	p, err := phantom.NewPool(phantom.Config{
+		Enabled:        true,
+		SharedSecret:   d.Phantom.SharedSecret,
+		EpochSeed:      d.Phantom.EpochSeed,
+		SubnetPrefixV4: d.Phantom.SubnetPrefixV4,
+		SubnetPrefixV6: d.Phantom.SubnetPrefixV6,
+		PoolSize:       d.Phantom.PoolSize,
+	})
+	if err != nil {
+		// Validation should have caught this; keep behavior safe by disabling phantom.
+		d.Phantom.Enabled = false
+		return
+	}
+	d.phantom = p
 }
 
 // Apply applies the domain fronting overlay to a connection
@@ -90,7 +126,7 @@ func (d *DomainFrontOverlay) PrepareContext(ctx context.Context) (context.Contex
 		return ctx, nil
 	}
 	activeFront := d.SelectFront()
-	connectIP := d.SelectIP()
+	connectIP, connectIPs := d.SelectIPs()
 
 	// Build failover list excluding the active front (it's already primary).
 	var failover []string
@@ -105,9 +141,11 @@ func (d *DomainFrontOverlay) PrepareContext(ctx context.Context) (context.Contex
 
 	opts := tlsutil.FrontDialOptions{
 		Enabled:       true,
+		PoolKey:       "domainfront:" + d.RealHost,
 		FrontDomain:   activeFront,
 		RealHost:      d.RealHost,
 		ConnectIP:     connectIP,
+		ConnectIPCandidates: connectIPs,
 		CFWorker:      d.CFWorker,
 		FailoverHosts: failover,
 	}
@@ -162,27 +200,60 @@ func (d *DomainFrontOverlay) frontPool() []string {
 
 // SelectIP selects an IP to connect to (for rotation)
 func (d *DomainFrontOverlay) SelectIP() string {
+	ip, _ := d.SelectIPs()
+	return ip
+}
+
+// SelectIPs selects the primary connect IP and optional fallback candidates.
+// When phantom is enabled, it returns deterministic candidates and rotates the
+// primary by advancing the phantom pool.
+func (d *DomainFrontOverlay) SelectIPs() (string, []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if !d.RotateIPs {
-		return ""
+	// Phantom pool can feed connect_ip rotation even if RotateIPs is false, since
+	// it is explicitly enabled by the operator and is deterministic.
+	if !d.RotateIPs && !d.Phantom.Enabled {
+		return "", nil
 	}
 
 	// Rotate through custom IPs first.
 	if len(d.CustomIPs) > 0 {
-		ip := d.CustomIPs[d.ipIndex]
+		n := len(d.CustomIPs)
+		if n > 4 {
+			n = 4
+		}
+		out := make([]string, 0, n)
+		start := d.ipIndex % len(d.CustomIPs)
+		for i := 0; i < n; i++ {
+			out = append(out, d.CustomIPs[(start+i)%len(d.CustomIPs)])
+		}
 		d.ipIndex = (d.ipIndex + 1) % len(d.CustomIPs)
-		d.currentIP = ip
-		return ip
+		d.currentIP = out[0]
+		return d.currentIP, out
+	}
+
+	if d.Phantom.Enabled {
+		d.ensurePhantomLocked()
+		if d.phantom != nil {
+			ips := d.phantom.NextCandidates(4)
+			if len(ips) > 0 {
+				out := make([]string, 0, len(ips))
+				for _, ip := range ips {
+					out = append(out, ip.String())
+				}
+				d.currentIP = out[0]
+				return d.currentIP, out
+			}
+		}
 	}
 
 	// Fall back to sampled Cloudflare ranges.
 	if ip, ok := randomCloudflareIPv4(); ok {
 		d.currentIP = ip
-		return ip
+		return ip, []string{ip}
 	}
-	return ""
+	return "", nil
 }
 
 // domainFrontConn wraps a connection for domain fronting

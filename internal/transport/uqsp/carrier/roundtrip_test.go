@@ -54,7 +54,75 @@ func TestWebTunnelH1RoundTrip(t *testing.T) {
 		Path:                  "/tunnel",
 		Version:               "h1",
 		TLSInsecureSkipVerify: true,
-	}, smux.DefaultConfig())
+	}, nil, smux.DefaultConfig())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := c.Dial(ctx, "unused")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	reply := make([]byte, 4)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(reply) != "pong" {
+		t.Fatalf("unexpected reply: %q", string(reply))
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server timed out")
+	}
+}
+
+func TestWebTunnelH2RoundTrip(t *testing.T) {
+	serverTLS := testTLSConfig(t)
+	ln, err := NewWebTunnelListener("127.0.0.1:0", serverTLS, "/tunnel")
+	if err != nil {
+		if isSocketPermissionError(err) {
+			t.Skipf("socket listen not permitted in this environment: %v", err)
+		}
+		t.Fatalf("NewWebTunnelListener failed: %v", err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			errCh <- err
+			return
+		}
+		if string(buf) != "ping" {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		_, err = conn.Write([]byte("pong"))
+		errCh <- err
+	}()
+
+	c := NewWebTunnelCarrier(WebTunnelConfig{
+		Server:                ln.Addr().String(),
+		Path:                  "/tunnel",
+		Version:               "h2",
+		TLSInsecureSkipVerify: true,
+	}, nil, smux.DefaultConfig())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

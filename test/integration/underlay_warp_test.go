@@ -18,11 +18,11 @@ func TestUnderlayWarpSelectable_AllVariants(t *testing.T) {
 		id      string
 		carrier string
 	}{
-		{"4a", "xhttp"},
-		{"4b", "rawtcp"},
-		{"4c", "xhttp"},
-		{"4d", "quic"},
-		{"4e", "trusttunnel"},
+		{"HTTP+", "xhttp"},
+		{"TCP+", "rawtcp"},
+		{"TLS+", "xhttp"},
+		{"UDP+", "quic"},
+		{"TLS", "trusttunnel"},
 	}
 
 	for _, tc := range variants {

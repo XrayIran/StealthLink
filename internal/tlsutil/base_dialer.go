@@ -28,4 +28,3 @@ func BaseDialFuncFromContext(ctx context.Context) (BaseDialFunc, bool) {
 	fn, ok := v.(BaseDialFunc)
 	return fn, ok && fn != nil
 }
-

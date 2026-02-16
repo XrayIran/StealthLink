@@ -1,9 +1,10 @@
-//go:build (!linux) || (linux && !netlink)
+//go:build !linux || (linux && !netlink)
 
 package vpn
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -25,8 +26,28 @@ func SetupInterface(cfg NetworkConfig) error {
 
 // setupInterfaceLinux configures the interface on Linux using ip command.
 func setupInterfaceLinux(cfg NetworkConfig) error {
-	// Add IP address
-	cmd := exec.Command("ip", "addr", "add", cfg.InterfaceIP, "dev", cfg.InterfaceName)
+	// Add IP address (honor point-to-point peer semantics when PeerIP is set).
+	localIP, ipNet, err := net.ParseCIDR(cfg.InterfaceIP)
+	if err != nil {
+		return fmt.Errorf("invalid interface IP: %w", err)
+	}
+	ones, _ := ipNet.Mask.Size()
+	addr := fmt.Sprintf("%s/%d", localIP.String(), ones)
+
+	args := []string{"addr", "add", addr}
+	if cfg.PeerIP != "" {
+		peer := net.ParseIP(strings.TrimSpace(cfg.PeerIP))
+		if peer == nil {
+			return fmt.Errorf("invalid peer_ip: %q", cfg.PeerIP)
+		}
+		args = append(args, "peer", peer.String())
+	}
+	args = append(args, "dev", cfg.InterfaceName)
+
+	if localIP.To4() == nil {
+		args = append([]string{"-6"}, args...)
+	}
+	cmd := exec.Command("ip", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		// Address might already exist, ignore that error
 		if !strings.Contains(string(out), "File exists") {
@@ -50,6 +71,10 @@ func setupInterfaceLinux(cfg NetworkConfig) error {
 
 	// Add routes
 	for _, route := range cfg.Routes {
+		_, dstNet, err := net.ParseCIDR(route.Destination)
+		if err != nil || dstNet == nil {
+			return fmt.Errorf("invalid route destination: %q", route.Destination)
+		}
 		args := []string{"route", "add", route.Destination, "dev", cfg.InterfaceName}
 		if route.Gateway != "" {
 			args = append(args, "via", route.Gateway)
@@ -58,6 +83,9 @@ func setupInterfaceLinux(cfg NetworkConfig) error {
 			args = append(args, "metric", fmt.Sprintf("%d", route.Metric))
 		}
 
+		if dstNet.IP.To4() == nil {
+			args = append([]string{"-6"}, args...)
+		}
 		cmd = exec.Command("ip", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			// Route might already exist
@@ -156,9 +184,40 @@ func RemoveInterface(cfg NetworkConfig) error {
 
 // removeInterfaceLinux removes configuration on Linux.
 func removeInterfaceLinux(cfg NetworkConfig) error {
-	// Bring interface down
-	cmd := exec.Command("ip", "link", "set", "dev", cfg.InterfaceName, "down")
-	_ = cmd.Run() // Ignore errors
+	// Remove routes first (best-effort).
+	for _, route := range cfg.Routes {
+		_, dstNet, err := net.ParseCIDR(route.Destination)
+		if err != nil || dstNet == nil {
+			continue
+		}
+		args := []string{"route", "del", route.Destination, "dev", cfg.InterfaceName}
+		if dstNet.IP.To4() == nil {
+			args = append([]string{"-6"}, args...)
+		}
+		_ = exec.Command("ip", args...).Run()
+	}
+
+	// Remove address (best-effort, idempotent).
+	localIP, ipNet, err := net.ParseCIDR(cfg.InterfaceIP)
+	if err == nil && ipNet != nil {
+		ones, _ := ipNet.Mask.Size()
+		addr := fmt.Sprintf("%s/%d", localIP.String(), ones)
+		args := []string{"addr", "del", addr}
+		if cfg.PeerIP != "" {
+			peer := net.ParseIP(strings.TrimSpace(cfg.PeerIP))
+			if peer != nil {
+				args = append(args, "peer", peer.String())
+			}
+		}
+		args = append(args, "dev", cfg.InterfaceName)
+		if localIP.To4() == nil {
+			args = append([]string{"-6"}, args...)
+		}
+		_ = exec.Command("ip", args...).Run()
+	}
+
+	// Bring interface down last.
+	_ = exec.Command("ip", "link", "set", "dev", cfg.InterfaceName, "down").Run()
 
 	return nil
 }

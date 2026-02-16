@@ -7,6 +7,7 @@ import (
 
 	"stealthlink/internal/config"
 	"stealthlink/internal/transport/icmptun"
+	"stealthlink/internal/transport/rawtcp"
 
 	"github.com/xtaci/smux"
 )
@@ -100,7 +101,7 @@ func SelectCarrier(cfg config.UQSPCarrierConfig, tlsCfg *tls.Config, smuxCfg *sm
 			TLSServerName:         cfg.WebTunnel.TLSServerName,
 			TLSFingerprint:        cfg.WebTunnel.TLSFingerprint,
 		}
-		return NewWebTunnelCarrier(wtCfg, smuxCfg), nil
+		return NewWebTunnelCarrier(wtCfg, tlsCfg, smuxCfg), nil
 
 	case "chisel":
 		chCfg := ChiselConfig{
@@ -228,14 +229,24 @@ func SupportsDial(carrierType string) bool {
 
 // IsRawTCPAvailable checks if RawTCP is available (requires raw sockets)
 func IsRawTCPAvailable() bool {
-	// RawTCP requires CAP_NET_RAW or root
-	// This is a simplified check - the actual check happens in rawtcp package
-	return true // Assume available, actual error occurs at dial time
+	ok, _ := rawtcp.Available()
+	return ok
 }
 
 // IsICMPTunAvailable checks if ICMPTun is available (requires raw sockets)
 func IsICMPTunAvailable() bool {
 	return icmptun.IsAvailable()
+}
+
+// UnavailableReason returns a human-readable reason if a carrier is not available.
+func UnavailableReason(carrierType string) string {
+	switch carrierType {
+	case "rawtcp":
+		_, reason := rawtcp.Available()
+		return reason
+	default:
+		return ""
+	}
 }
 
 // CarrierInfo provides information about a carrier

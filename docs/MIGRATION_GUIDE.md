@@ -6,7 +6,7 @@ This guide helps migrate from previous StealthLink versions to v2.0 with the new
 
 StealthLink v2.0 introduces:
 - 12 new upstream integration features (Phases 1-10)
-- 5 unified operational modes (4a-4e)
+- 5 unified operational modes (HTTP+-TLS)
 - UQSP (Unified QUIC Superset Protocol) as the default transport
 - Enhanced security with directional HKDF + AEAD
 - Improved performance with batch I/O and hardware entropy
@@ -47,7 +47,7 @@ transport:
 
 **New (v2.0):** Explicit variant selection
 ```yaml
-variant: "4a"  # or 4b, 4c, 4d, 4e
+variant: "HTTP+"  # or TCP+, TLS+, UDP+, TLS
 ```
 
 ### 3. XHTTP Configuration
@@ -115,7 +115,7 @@ sudo systemctl restart stealthlink-gateway
 |-------------|----------------|-------|
 | `transport.type: kcp` | `transport.type: uqsp` + `carrier.type: kcp` | UQSP wrapper required |
 | `transport.type: xhttp` | `transport.type: uqsp` + `carrier.type: xhttp` | UQSP wrapper required |
-| `transport.type: tls` | `transport.type: uqsp` + `carrier.type: trusttunnel` | See Mode 4e |
+| `transport.type: tls` | `transport.type: uqsp` + `carrier.type: trusttunnel` | See Mode TLS |
 | `transport.kcp.fec: true` | `transport.uqsp.carrier.kcp.fec.enabled: true` | Nested under fec |
 | `transport.kcp.key` | `transport.uqsp.carrier.kcp.key` | Same location |
 | `host.max_conns` | `transport.xmux.reuse_limit` | Xmux controls pooling |
@@ -125,11 +125,11 @@ sudo systemctl restart stealthlink-gateway
 
 ## Mode-Based Quick Migration
 
-### Mode 4a: XHTTP + Domain Fronting
+### Mode HTTP+: XHTTP + Domain Fronting
 
 ```yaml
 # Add to top of config
-variant: "4a"
+variant: "HTTP+"
 
 # Transport changes
 transport:
@@ -144,11 +144,11 @@ transport:
         request_limit: 1000        # NEW
 ```
 
-### Mode 4b: Raw TCP + FakeTCP
+### Mode TCP+: Raw TCP + FakeTCP
 
 ```yaml
 # Add to top of config
-variant: "4b"
+variant: "TCP+"
 
 # Transport changes
 transport:
@@ -166,11 +166,11 @@ transport:
       max_size: 64
 ```
 
-### Mode 4c: REALITY/AnyTLS
+### Mode TLS+: REALITY/AnyTLS
 
 ```yaml
 # Add to top of config
-variant: "4c"
+variant: "TLS+"
 
 # Transport changes
 transport:
@@ -184,11 +184,11 @@ transport:
         padding_max: 900
 ```
 
-### Mode 4d: QUIC/KCP
+### Mode UDP+: QUIC/KCP
 
 ```yaml
 # Add to top of config
-variant: "4d"
+variant: "UDP+"
 
 # Transport changes
 transport:
@@ -204,11 +204,11 @@ transport:
           accelerated: true
 ```
 
-### Mode 4e: TrustTunnel
+### Mode TLS: TrustTunnel
 
 ```yaml
 # Add to top of config
-variant: "4e"
+variant: "TLS"
 
 # Transport changes
 transport:
@@ -237,19 +237,19 @@ OLD_TYPE=$(grep "^  type:" "$CONFIG_FILE" | head -1 | awk '{print $2}')
 
 case "$OLD_TYPE" in
   kcp|quic)
-    VARIANT="4d"
+    VARIANT="UDP+"
     ;;
   xhttp|h2|wss)
-    VARIANT="4a"
+    VARIANT="HTTP+"
     ;;
   rawtcp|faketcp)
-    VARIANT="4b"
+    VARIANT="TCP+"
     ;;
   tls|trusttunnel)
-    VARIANT="4e"
+    VARIANT="TLS"
     ;;
   reality|shadowtls|anytls)
-    VARIANT="4c"
+    VARIANT="TLS+"
     ;;
   *)
     echo "Unknown transport type: $OLD_TYPE"

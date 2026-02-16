@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"stealthlink/internal/config"
+	"stealthlink/internal/metrics"
 	"stealthlink/internal/transport"
 	"stealthlink/internal/transport/uqsp/carrier"
 
@@ -53,6 +54,8 @@ type Listener struct {
 // Deprecated: NewListener creates a legacy UQSP listener. Use NewRuntimeListener instead.
 func NewListener(addr string, cfg *config.UQSPConfig, tlsCfg *tls.Config, smuxCfg *smux.Config, authToken string) (*Listener, error) {
 	log.Println("WARNING: using deprecated legacy UQSP Listener; migrate to runtime.mode=unified (RuntimeListener) — legacy mode will be removed in a future release")
+	metrics.IncDeprecatedLegacyMode()
+	metrics.SetActivePathVariant("legacy")
 	if cfg == nil {
 		cfg = &config.UQSPConfig{}
 	}
@@ -396,6 +399,7 @@ func buildQUICConfig(cfg *config.UQSPConfig, server bool) *quic.Config {
 		MaxIdleTimeout:        cfg.Security.KeyRotation,
 		MaxIncomingStreams:    cfg.Streams.MaxIncomingStreams,
 		MaxIncomingUniStreams: cfg.Streams.MaxIncomingUniStreams,
+		EnableDatagrams:       true,
 	}
 
 	if server {

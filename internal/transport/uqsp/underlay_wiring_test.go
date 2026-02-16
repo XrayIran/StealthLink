@@ -13,7 +13,7 @@ func TestBuildVariantForRole_WiresUnderlayDialer(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Role = "agent"
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4d"
+	cfg.Variant = "UDP+"
 	cfg.Transport.UQSP.Carrier.Type = "quic"
 
 	proto, _, err := BuildVariantForRole(cfg, &tls.Config{InsecureSkipVerify: true}, smux.DefaultConfig(), "token")
@@ -29,4 +29,3 @@ func TestBuildVariantForRole_WiresUnderlayDialer(t *testing.T) {
 		t.Fatalf("underlay type = %q, want %q", got, "direct")
 	}
 }
-

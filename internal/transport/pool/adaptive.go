@@ -237,6 +237,7 @@ func (p *AdaptivePool) scavenge() {
 
 // Get finds an available session or dials a new one if permitted.
 func (p *AdaptivePool) Get(ctx context.Context) (transport.Session, error) {
+	waitStart := time.Now()
 	if p.closed.Load() {
 		return nil, transport.ErrPoolClosed
 	}
@@ -249,6 +250,7 @@ func (p *AdaptivePool) Get(ctx context.Context) (transport.Session, error) {
 				c.lastUsed.Store(time.Now())
 				p.activeCount.Add(1)
 				p.mu.RUnlock()
+				metrics.ObservePoolWaitTime(time.Since(waitStart))
 				return c, nil
 			}
 		}
@@ -273,6 +275,7 @@ func (p *AdaptivePool) Get(ctx context.Context) (transport.Session, error) {
 	for {
 		select {
 		case <-ctx.Done():
+			metrics.ObservePoolWaitTime(time.Since(waitStart))
 			return nil, ctx.Err()
 		case <-ticker.C:
 			p.mu.RLock()
@@ -282,6 +285,7 @@ func (p *AdaptivePool) Get(ctx context.Context) (transport.Session, error) {
 						c.lastUsed.Store(time.Now())
 						p.activeCount.Add(1)
 						p.mu.RUnlock()
+						metrics.ObservePoolWaitTime(time.Since(waitStart))
 						return c, nil
 					}
 				}

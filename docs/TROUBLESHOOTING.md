@@ -26,7 +26,7 @@ curl http://localhost:8080/metrics       # JSON format
 ### Issue: Batch I/O Not Working
 
 **Symptoms:**
-- Low throughput on UDP-based transports (Mode 4b, 4d)
+- Low throughput on UDP-based transports (Mode TCP+, UDP+)
 - `stealthlink_udp_batch_fallback_total` counter increasing
 
 **Diagnosis:**
@@ -48,7 +48,7 @@ curl -s http://localhost:8080/metrics/prom | grep batch_fallback
 
 **Symptoms:**
 - `stealthlink_faketcp_aead_auth_failures_total` increasing
-- Connection drops or data corruption in Mode 4b
+- Connection drops or data corruption in Mode TCP+
 
 **Diagnosis:**
 ```bash
@@ -107,7 +107,7 @@ curl -s http://localhost:8080/metrics/prom | grep xmux
 ### Issue: REALITY Spider Timeout
 
 **Symptoms:**
-- Mode 4c connections timing out during establishment
+- Mode TLS+ connections timing out during establishment
 - Long connection times (>10 seconds)
 
 **Diagnosis:**
@@ -219,7 +219,7 @@ logging:
 
 ### Packet Capture
 
-For Mode 4b (FakeTCP) issues:
+For Mode TCP+ (FakeTCP) issues:
 ```bash
 sudo tcpdump -i eth0 -w /tmp/stealthlink.pcap 'tcp port 443'
 # Analyze with Wireshark
@@ -244,14 +244,14 @@ go tool pprof /tmp/heap.prof
 
 ### Throughput Optimization
 
-1. **Enable Batch I/O** (Mode 4b, 4d):
+1. **Enable Batch I/O** (Mode TCP+, UDP+):
    ```yaml
    transport:
      udp_batch_enabled: true
      udp_batch_size: 32
    ```
 
-2. **Tune KCP Parameters** (Mode 4d):
+2. **Tune KCP Parameters** (Mode UDP+):
    ```yaml
    transport:
      uqsp:

@@ -24,18 +24,20 @@ This runbook separates in-repo completion from live infrastructure validation.
    - `python3 tools/live_validation_runner.py validate-live --target <vps-ip> --warp both`
 4. Full Phase 11 live gate on two VPS nodes (recommended, SSH orchestration):
    - `make validate-live-ssh GATEWAY_HOST=<gateway-ip> AGENT_HOST=<agent-ip> BUNDLE=dist/<stealthlink-zip> WARP=both`
-4. Stress gate:
+5. Requested-upstreams scenario pack (HTTP+ domainfront+phantom+ech, TCP+ rawtcp+obfs4, UDP+ quic datagram, TLS webtunnel h2 + cstp):
+   - `python3 tools/live_validation_ssh.py --gateway-host <gateway-ip> --agent-host <agent-ip> --bundle dist/<stealthlink-zip> --scenario-pack requested-upstreams --warp both`
+6. Stress gate:
    - `make stress-live`
-5. Soak gate (24h):
+7. Soak gate (24h):
    - `make soak-24h`
-6. Profiling capture:
+8. Profiling capture:
    - `make profile-live`
-7. Release-readiness summary:
+9. Release-readiness summary:
    - `python3 tools/live_validation_runner.py release-readiness`
 
 ## Gate Behavior (Strict)
 
-- `validate-live` fails unless every mode (`4a..4e`) has:
+- `validate-live` fails unless every mode (`HTTP+..TLS`) has:
   - non-empty `metrics`,
   - non-empty acceptance `checks`,
   - acceptance `pass=true`.

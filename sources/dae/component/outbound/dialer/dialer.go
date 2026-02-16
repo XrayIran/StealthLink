@@ -66,16 +66,11 @@ type AliveDialerSetSet map[*AliveDialerSet]int
 func NewGlobalOption(global *config.Global, log *logrus.Logger) *GlobalOption {
 	return &GlobalOption{
 		ExtraOption: D.ExtraOption{
-			AllowInsecure:       global.AllowInsecure,
-			TlsImplementation:   global.TlsImplementation,
-			UtlsImitate:         global.UtlsImitate,
-			BandwidthMaxTx:      global.BandwidthMaxTx,
-			BandwidthMaxRx:      global.BandwidthMaxRx,
-			TlsFragment:         global.TlsFragment,
-			TlsFragmentLength:   global.TlsFragmentLength,
-			TlsFragmentInterval: global.TlsFragmentInterval,
-			UDPHopInterval:      global.UDPHopInterval,
-		},
+			AllowInsecure:     global.AllowInsecure,
+			TlsImplementation: global.TlsImplementation,
+			UtlsImitate:       global.UtlsImitate,
+			BandwidthMaxTx:    global.BandwidthMaxTx,
+			BandwidthMaxRx:    global.BandwidthMaxRx},
 		Log:               log,
 		TcpCheckOptionRaw: TcpCheckOptionRaw{Raw: global.TcpCheckUrl, Log: log, ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp), Method: global.TcpCheckHttpMethod},
 		CheckDnsOptionRaw: CheckDnsOptionRaw{Raw: global.UdpCheckDns, ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp), Somark: global.SoMarkFromDae},

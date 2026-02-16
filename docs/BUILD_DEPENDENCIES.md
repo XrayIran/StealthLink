@@ -55,7 +55,7 @@ xcode-select --install
 |---------|----------------|-------|
 | `sendmmsg` syscall | 3.0 | Batch UDP send operations |
 | `recvmmsg` syscall | 2.6.33 | Batch UDP receive operations |
-| TUN/TAP devices | 2.4+ | Virtual network interfaces |
+| TUN devices | 2.4+ | Virtual network interfaces (L3-only) |
 | eBPF (optional) | 4.1+ | Advanced packet filtering |
 | io_uring (future) | 5.1+ | High-performance async I/O |
 
@@ -70,7 +70,7 @@ uname -r
 For full functionality, ensure these kernel options are enabled:
 
 ```
-CONFIG_TUN=y                    # TUN/TAP support
+CONFIG_TUN=y                    # TUN support
 CONFIG_NET_SCH_FQ=y            # Fair Queue packet scheduler
 CONFIG_TCP_CONG_BBR=y          # BBR congestion control
 CONFIG_NETFILTER=y             # Netfilter support
@@ -244,4 +244,4 @@ echo "tun" | sudo tee -a /etc/modules
 - [Linux Kernel Documentation](https://www.kernel.org/doc/html/latest/)
 - [sendmmsg(2) man page](https://man7.org/linux/man-pages/man2/sendmmsg.2.html)
 - [recvmmsg(2) man page](https://man7.org/linux/man-pages/man2/recvmmsg.2.html)
-- [TUN/TAP Documentation](https://www.kernel.org/doc/Documentation/networking/tuntap.txt)
+- [TUN/TAP Documentation](https://www.kernel.org/doc/Documentation/networking/tuntap.txt) (TUN is used; TAP/L2 is out of scope)

@@ -55,9 +55,16 @@ func SetupInterface(cfg NetworkConfig) error {
 	if err != nil {
 		return fmt.Errorf("invalid interface IP: %w", err)
 	}
+	var peer net.IP
+	if cfg.PeerIP != "" {
+		peer = net.ParseIP(cfg.PeerIP)
+		if peer == nil {
+			return fmt.Errorf("invalid peer IP: %q", cfg.PeerIP)
+		}
+	}
 
 	// Add IP address to interface using netlink
-	if err := addAddress(iface.Index, ip, ipNet); err != nil {
+	if err := addAddress(iface.Index, ip, peer, ipNet); err != nil {
 		return fmt.Errorf("failed to add address: %w", err)
 	}
 
@@ -84,7 +91,8 @@ func SetupInterface(cfg NetworkConfig) error {
 }
 
 // addAddress adds an IP address to an interface using netlink.
-func addAddress(ifIndex int, ip net.IP, ipNet *net.IPNet) error {
+// If peer is set, it configures point-to-point semantics (IFA_LOCAL=local, IFA_ADDRESS=peer).
+func addAddress(ifIndex int, ip net.IP, peer net.IP, ipNet *net.IPNet) error {
 	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_ROUTE)
 	if err != nil {
 		return err
@@ -105,7 +113,19 @@ func addAddress(ifIndex int, ip net.IP, ipNet *net.IPNet) error {
 
 	ones, _ := ipNet.Mask.Size()
 
-	msg := buildAddrMsg(ifIndex, family, ipBytes, ones)
+	var peerBytes []byte
+	if peer != nil {
+		if family == syscall.AF_INET {
+			peerBytes = peer.To4()
+		} else {
+			peerBytes = peer.To16()
+		}
+		if peerBytes == nil {
+			return fmt.Errorf("peer IP family mismatch")
+		}
+	}
+
+	msg := buildAddrMsg(ifIndex, family, ipBytes, peerBytes, ones)
 	return sendNetlinkMsg(fd, syscall.RTM_NEWADDR, msg)
 }
 
@@ -181,7 +201,9 @@ func addRtAttr(buf []byte, attrType uint16, data []byte) []byte {
 }
 
 // buildAddrMsg builds an RTM_NEWADDR netlink message payload (ifaddrmsg + attrs).
-func buildAddrMsg(ifIndex int, family int, ip []byte, prefixLen int) []byte {
+// If peer is nil, IFA_LOCAL and IFA_ADDRESS are set to local (normal addr add).
+// If peer is non-nil, IFA_LOCAL is local and IFA_ADDRESS is peer (point-to-point).
+func buildAddrMsg(ifIndex int, family int, local []byte, peer []byte, prefixLen int) []byte {
 	// ifaddrmsg: family(1) + prefixlen(1) + flags(1) + scope(1) + index(4)
 	msg := make([]byte, sizeofIfAddrmsg)
 	msg[0] = byte(family)
@@ -191,10 +213,14 @@ func buildAddrMsg(ifIndex int, family int, ip []byte, prefixLen int) []byte {
 	binary.LittleEndian.PutUint32(msg[4:8], uint32(ifIndex))
 
 	// IFA_LOCAL attribute
-	msg = addRtAttr(msg, syscall.IFA_LOCAL, ip)
+	msg = addRtAttr(msg, syscall.IFA_LOCAL, local)
 
 	// IFA_ADDRESS attribute
-	msg = addRtAttr(msg, syscall.IFA_ADDRESS, ip)
+	addr := local
+	if peer != nil {
+		addr = peer
+	}
+	msg = addRtAttr(msg, syscall.IFA_ADDRESS, addr)
 
 	return msg
 }
@@ -203,8 +229,8 @@ func buildAddrMsg(ifIndex int, family int, ip []byte, prefixLen int) []byte {
 func buildLinkMsg(ifIndex int, flags int) []byte {
 	// ifinfomsg: family(1) + pad(1) + type(2) + index(4) + flags(4) + change(4)
 	msg := make([]byte, sizeofIfInfomsg)
-	msg[0] = syscall.AF_UNSPEC // family
-	msg[1] = 0                 // pad
+	msg[0] = syscall.AF_UNSPEC                 // family
+	msg[1] = 0                                 // pad
 	binary.LittleEndian.PutUint16(msg[2:4], 0) // type
 	binary.LittleEndian.PutUint32(msg[4:8], uint32(ifIndex))
 	binary.LittleEndian.PutUint32(msg[8:12], uint32(flags))
@@ -273,16 +299,25 @@ func buildRouteMsg(ifIndex int, dst *net.IPNet, gw net.IP) []byte {
 
 // sendNetlinkMsg sends a netlink message and waits for ACK.
 func sendNetlinkMsg(fd int, msgType uint16, payload []byte) error {
+	flags := uint16(syscall.NLM_F_REQUEST | syscall.NLM_F_ACK)
+	switch msgType {
+	case syscall.RTM_NEWADDR, syscall.RTM_NEWROUTE:
+		flags |= syscall.NLM_F_CREATE | syscall.NLM_F_EXCL
+	}
+	return sendNetlinkMsgWithFlags(fd, msgType, payload, flags)
+}
+
+func sendNetlinkMsgWithFlags(fd int, msgType uint16, payload []byte, flags uint16) error {
 	// Build complete netlink message: nlmsghdr + payload
 	totalLen := sizeofNlMsghdr + len(payload)
 	msg := make([]byte, nlmsgAlign(totalLen))
 
 	// nlmsghdr
-	binary.LittleEndian.PutUint32(msg[0:4], uint32(totalLen))        // nlmsg_len
-	binary.LittleEndian.PutUint16(msg[4:6], msgType)                 // nlmsg_type
-	binary.LittleEndian.PutUint16(msg[6:8], syscall.NLM_F_REQUEST|syscall.NLM_F_ACK|syscall.NLM_F_CREATE|syscall.NLM_F_EXCL) // nlmsg_flags
-	binary.LittleEndian.PutUint32(msg[8:12], 1)                      // nlmsg_seq
-	binary.LittleEndian.PutUint32(msg[12:16], uint32(os.Getpid()))    // nlmsg_pid
+	binary.LittleEndian.PutUint32(msg[0:4], uint32(totalLen))      // nlmsg_len
+	binary.LittleEndian.PutUint16(msg[4:6], msgType)               // nlmsg_type
+	binary.LittleEndian.PutUint16(msg[6:8], flags)                 // nlmsg_flags
+	binary.LittleEndian.PutUint32(msg[8:12], 1)                    // nlmsg_seq
+	binary.LittleEndian.PutUint32(msg[12:16], uint32(os.Getpid())) // nlmsg_pid
 
 	// Copy payload after header
 	copy(msg[sizeofNlMsghdr:], payload)
@@ -318,11 +353,12 @@ func sendNetlinkMsg(fd int, msgType uint16, payload []byte) error {
 	return nil
 }
 
-// RemoveInterface removes the network interface configuration.
-func RemoveInterface(ifaceName string) error {
-	iface, err := net.InterfaceByName(ifaceName)
+// RemoveInterface removes the addresses and routes that were added by SetupInterface,
+// and brings the interface down (best-effort, idempotent).
+func RemoveInterface(cfg NetworkConfig) error {
+	iface, err := net.InterfaceByName(cfg.InterfaceName)
 	if err != nil {
-		return nil // Interface doesn't exist, nothing to do
+		return nil // Interface doesn't exist, nothing to do.
 	}
 
 	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_ROUTE)
@@ -335,13 +371,78 @@ func RemoveInterface(ifaceName string) error {
 		return err
 	}
 
-	// Set interface down
-	msg := buildLinkMsg(iface.Index, 0) // flags=0 to bring down
-	// For bringing down, change mask should be IFF_UP
-	binary.LittleEndian.PutUint32(msg[8:12], 0)                    // flags = 0 (down)
-	binary.LittleEndian.PutUint32(msg[12:16], uint32(syscall.IFF_UP)) // change = IFF_UP
+	// Remove routes.
+	for _, route := range cfg.Routes {
+		_ = delRoute(fd, iface.Index, route.Destination, route.Gateway)
+	}
 
-	return sendNetlinkMsg(fd, syscall.RTM_SETLINK, msg)
+	// Remove address.
+	ip, ipNet, err := net.ParseCIDR(cfg.InterfaceIP)
+	if err == nil && ipNet != nil {
+		var peer net.IP
+		if cfg.PeerIP != "" {
+			peer = net.ParseIP(cfg.PeerIP)
+		}
+		_ = delAddress(fd, iface.Index, ip, peer, ipNet)
+	}
+
+	// Set interface down last.
+	_ = setInterfaceDown(fd, iface.Index)
+	return nil
+}
+
+func delAddress(fd int, ifIndex int, ip net.IP, peer net.IP, ipNet *net.IPNet) error {
+	family := syscall.AF_INET
+	ipBytes := ip.To4()
+	if ipBytes == nil {
+		family = syscall.AF_INET6
+		ipBytes = ip.To16()
+	}
+
+	ones, _ := ipNet.Mask.Size()
+
+	var peerBytes []byte
+	if peer != nil {
+		if family == syscall.AF_INET {
+			peerBytes = peer.To4()
+		} else {
+			peerBytes = peer.To16()
+		}
+	}
+
+	msg := buildAddrMsg(ifIndex, family, ipBytes, peerBytes, ones)
+	flags := uint16(syscall.NLM_F_REQUEST | syscall.NLM_F_ACK)
+	if err := sendNetlinkMsgWithFlags(fd, syscall.RTM_DELADDR, msg, flags); err != nil {
+		// Best-effort (idempotent).
+		return nil
+	}
+	return nil
+}
+
+func delRoute(fd int, ifIndex int, destination, gateway string) error {
+	_, dstNet, err := net.ParseCIDR(destination)
+	if err != nil {
+		return nil
+	}
+	var gwIP net.IP
+	if gateway != "" {
+		gwIP = net.ParseIP(gateway)
+	}
+	msg := buildRouteMsg(ifIndex, dstNet, gwIP)
+	flags := uint16(syscall.NLM_F_REQUEST | syscall.NLM_F_ACK)
+	if err := sendNetlinkMsgWithFlags(fd, syscall.RTM_DELROUTE, msg, flags); err != nil {
+		return nil
+	}
+	return nil
+}
+
+func setInterfaceDown(fd int, ifIndex int) error {
+	msg := buildLinkMsg(ifIndex, 0)
+	// flags = 0 (down), change mask = IFF_UP.
+	binary.LittleEndian.PutUint32(msg[8:12], 0)
+	binary.LittleEndian.PutUint32(msg[12:16], uint32(syscall.IFF_UP))
+	flags := uint16(syscall.NLM_F_REQUEST | syscall.NLM_F_ACK)
+	return sendNetlinkMsgWithFlags(fd, syscall.RTM_SETLINK, msg, flags)
 }
 
 // checkNetlinkAvailable checks if netlink is available (always true on Linux).

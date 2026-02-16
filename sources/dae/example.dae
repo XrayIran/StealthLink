@@ -1,20 +1,3 @@
-#
-# You can split the configuration into multiple files with `include { ... }`.
-#
-# Notes about include paths:
-# - Relative paths (e.g. `config.d/*.dae`) are resolved relative to the directory of the entry config file
-#   (the file you pass to `dae -c ...`), NOT relative to your current working directory.
-# - Absolute paths (e.g. `/etc/dae/config.d/*.dae`) start with "/" and are used as-is.
-# - For security reasons, dae requires included files to be under the entry config directory.
-#
-# include {
-#     # Relative path example:
-#     config.d/*.dae
-#
-#     # Absolute path example:
-#     /etc/dae/config.d/*.dae
-# }
-
 global {
     ##### Software options.
 
@@ -38,6 +21,9 @@ global {
 
     # Disable waiting for network before pulling subscriptions.
     disable_waiting_network: false
+
+    # Enable fast redirect for local TCP connections. There is a known kernel issue that breaks certain clients/proxies, such as nadoo/glider. Users may enable this experimental option at their own risks.
+    enable_local_tcp_fast_redirect: false
 
     ##### Interface and kernel options.
 
@@ -112,15 +98,6 @@ global {
     # See more: https://github.com/daeuniverse/dae/blob/331fa23c16/component/outbound/transport/tls/utls.go#L17
     utls_imitate: chrome_auto
 
-    # TLS fragmentation support. If is true, dae will send Client Hello in fragments to bypass SNI blocking.
-    tls_fragment: false
-
-    # TLS fragment packet length range, in bytes. The length of each fragment is randomly generated from this range.
-    tls_fragment_length: '50-100'
-
-    # TLS fragment packet length, in milliseconds. Each fragment interval is randomly generated from this range.
-    tls_fragment_interval: '10-20'
-
     # Multipath TCP (MPTCP) support. If is true, dae will try to use MPTCP to connect all nodes, but it will only take
     # effects when the node supports MPTCP. It can use for load balance and failover to multiple interfaces and IPs.
     mptcp: false
@@ -131,11 +108,11 @@ global {
     bandwidth_max_tx: '200 mbps' # uplink, or '200 m' or '200 mb' or '200 mbps' or 25000000(which is 200/8*1000*1000)
     bandwidth_max_rx: '1 gbps' # downlink, or '1 g' or '1 gb' or '1 gbps' or 125000000(which is 1000/8*1000*1000)
 
-    # dae use system DNS to resolve DoH/DoT domain and subscription links. However, system DNS may not be reliable or may be
-    # broken, so we specify a fallback DNS resolver to be used when DNS resolution using resolv.conf fails. This ensures DNS
-    # resolution continues to work even when the system's default DNS servers are unavailable or not responding properly.
-    # The default value is the Google's DNS (8.8.8.8:53). For IPv4 DNS servers, the format is "ipv4:port", such as "8.8.8.8:53".
-    # For IPv6 DNS servers, the format is "[ipv6]:port", such as "[2001:4860:4860::8888]:53".
+    # dae use system DNS to resolve DoH/DoT domain and subscription links. However, system DNS may not be reliable or may be 
+    # broken, so we specify a fallback DNS resolver to be used when DNS resolution using resolv.conf fails. This ensures DNS  
+    # resolution continues to work even when the system's default DNS servers are unavailable or not responding properly.  
+    # The default value is the Google's DNS (8.8.8.8:53). For IPv4 DNS servers, the format is "ipv4:port", such as "8.8.8.8:53". 
+    # For IPv6 DNS servers, the format is "[ipv6]:port", such as "[2001:4860:4860::8888]:53". 
     # Fallback resolver will always be available, even if you do not specify it in the configuration file.
     # fallback_resolver: '8.8.8.8:53'
 }
@@ -180,12 +157,6 @@ dns {
     #    ddns.example.org: 10
     #    test.example.org: 3600
     #}
-
-    # Bind to local address to listen for DNS queries
-    # bind: '127.0.0.1:5353'
-    # bind: 'tcp://127.0.0.1:5353'
-    # bind: 'udp://127.0.0.1:5353'
-    # bind: 'tcp+udp://127.0.0.1:5353'
 
     upstream {
         # Value can be scheme://host:port, where the scheme can be tcp/udp/tcp+udp/h3/http3/quic/https/tls.
@@ -320,6 +291,7 @@ routing {
     l4proto(udp) && dport(443) -> block
     dip(geoip:cn) -> direct
     domain(geosite:cn) -> direct
+    
 
     fallback: my_group
 }

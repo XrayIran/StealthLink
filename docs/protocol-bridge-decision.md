@@ -6,14 +6,14 @@ Scope: `sources/openconnect`, `sources/ocserv`, `sources/TrustTunnel`
 
 ## Decision
 
-StealthLink treats mode `4e` as **in-core canonical**.  
+StealthLink treats mode `TLS` as **in-core canonical**.  
 TrustTunnel/CSTP/DTLS behavior is implemented in-core and wired through the unified UQSP runtime.
 
 External sidecars may still be used for interoperability experiments, but they are no longer the architecture default and must not redefine the primary runtime path.
 
 ## Implementation Status (As of 2026-02-10)
 
-**All mode 4e components are now complete:**
+**All mode TLS components are now complete:**
 
 - ✅ **TrustTunnel Carrier**: Full HTTP/1.1 upgrade, HTTP/2 SETTINGS frames, HTTP/3 (QUIC-based) support in `internal/transport/uqsp/carrier/trusttunnel.go`
 - ✅ **TrustTunnel Race Condition Fix**: ttStream.Read now properly synchronized with readMu mutex
@@ -25,14 +25,14 @@ External sidecars may still be used for interoperability experiments, but they a
 
 ## Why
 
-- Project goal is full in-core consolidation across 5 customized modes (`4a..4e`).
-- In-core mode `4e` gives a single control plane for reverse mode, WARP routing, metrics, and lifecycle management.
+- Project goal is full in-core consolidation across 5 customized modes (`HTTP+..TLS`).
+- In-core mode `TLS` gives a single control plane for reverse mode, WARP routing, metrics, and lifecycle management.
 - Operational reliability is improved when systemd/CLI/install tooling controls one runtime shape instead of mixed in-core/sidecar stacks.
 
 ## Canonical Runtime Shape
 
 - `transport.type=uqsp` (or unified stealth runtime path)
-- `variant_profile=4e`
+- `variant_profile=TLS`
 - carrier: `trusttunnel`
 - behaviors: `cstp` (+ optional `tlsfrag`, `qpp`, `violated_tcp`)
 - reverse mode and WARP are applied uniformly by variant builders
@@ -41,17 +41,17 @@ External sidecars may still be used for interoperability experiments, but they a
 
 - Allowed only as explicitly selected compatibility adapters.
 - Must be clearly labeled non-canonical in docs/config examples.
-- Must not silently replace in-core `4e` behavior.
+- Must not silently replace in-core `TLS` behavior.
 
 ## Test Coverage
 
 - ✅ Unit tests: `internal/transport/trusttunnel/trusttunnel_test.go` (concurrent read race, H2/H3 probes)
-- ✅ Integration tests: `test/integration/e2e_test.go` and `test/integration/uqsp_variants_test.go` include mode 4e
+- ✅ Integration tests: `test/integration/e2e_test.go` and `test/integration/uqsp_variants_test.go` include mode TLS
 
 ## Exit Criteria To Reconsider
 
 Reconsider in-core canonical status only if all are true:
 
-- repeatable benchmark evidence shows in-core `4e` cannot meet throughput/latency targets,
+- repeatable benchmark evidence shows in-core `TLS` cannot meet throughput/latency targets,
 - critical security or correctness gaps remain unresolved after hardening,
 - compatibility requirements cannot be met without external protocol termination.

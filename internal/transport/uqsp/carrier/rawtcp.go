@@ -81,9 +81,8 @@ func (c *RawTCPCarrier) Close() error {
 
 // IsAvailable returns whether raw sockets are available
 func (c *RawTCPCarrier) IsAvailable() bool {
-	// RawTCP requires CAP_NET_RAW or root
-	// The actual check happens when trying to create the packet conn
-	return true
+	ok, _ := rawtcp.Available()
+	return ok
 }
 
 func (c *RawTCPCarrier) effectiveKCPConfig() config.KCPConfig {

@@ -58,7 +58,7 @@ def file_nonempty(path: pathlib.Path) -> bool:
 def run_mode_matrix(target: str, include_warp: bool) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     matrix_ok = True
-    for mode in ("4a", "4b", "4c", "4d", "4e"):
+    for mode in ("HTTP+", "TCP+", "TLS+", "UDP+", "TLS"):
         cmd = [
             "python3",
             "tools/benchmark_runner.py",

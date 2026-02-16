@@ -1,7 +1,8 @@
-.PHONY: build test property-test vet check rust-crypto dashboard-build pytools-check package release-assets publish-v2 \
+.PHONY: build test property-test vet check rust-crypto dashboard-build pytools-check package release-assets release-assets-preflight publish-v2 \
        clean install help cross-compile coverage benchmark-ci benchmark-live \
        upstream-audit coverage-touched stress-live soak-24h profile-live release-readiness \
-       validate-live-ssh fuzz fuzz-ci
+	validate-live-ssh fuzz fuzz-ci upstreams-lock upstreams-update upstream-feature-audit upstream-wiring-audit release-readiness-local \
+	release-gate lint-deprecations
 
 # ---------------------------------------------------------------------------
 # Version stamping
@@ -109,6 +110,18 @@ benchmark-live:
 upstream-audit:
 	python3 tools/upstream_delta_scan.py --strict
 
+upstream-feature-audit:
+	python3 tools/upstream_feature_verify.py --strict
+
+upstream-wiring-audit:
+	python3 tools/upstream_wiring_audit.py --strict --upstreams "conjure,daggerConnect,snowflake,Tunnel,psiphon-tunnel-core,paqet,paqctl,EasyTier,lyrebird,webtunnel"
+
+upstreams-lock:
+	python3 tools/upstreams_lock.py --write
+
+upstreams-update:
+	python3 tools/upstreams_lock.py --update --write
+
 coverage-touched:
 	python3 tools/coverage_touched.py --min 80 --scope-file tools/upstream_scope_packages.txt --baseline tools/baseline_coverage.json --write-baseline-if-missing
 
@@ -121,7 +134,10 @@ soak-24h:
 profile-live:
 	python3 tools/live_validation_runner.py profile
 
-release-readiness:
+release-readiness-local: upstream-audit upstream-feature-audit upstream-wiring-audit test vet pytools-check
+	@echo "Local release readiness checks passed"
+
+release-readiness: release-readiness-local
 	python3 tools/live_validation_runner.py release-readiness
 
 validate-live-ssh:
@@ -139,6 +155,20 @@ package:
 
 release-assets:
 	./scripts/build-release-assets.sh --version $(VERSION)
+
+release-assets-preflight:
+	./scripts/release-assets-preflight.sh --assets-dir dist/release-assets
+
+release-gate:
+	./scripts/release-assets-preflight.sh --assets-dir dist/release-assets --require-live-validation
+
+lint-deprecations:
+	@if rg -n '^[[:space:]]*mode:[[:space:]]*legacy([[:space:]]*#.*)?$$' examples/*.yaml; then \
+		echo "Legacy runtime mode is deprecated: remove mode: legacy from examples"; \
+		exit 1; \
+	else \
+		echo "No deprecated legacy runtime mode found in examples"; \
+	fi
 
 publish-v2:
 	./scripts/publish-v2.0.0.sh --repo "$${REPO:-XrayIran/StealthLink}"
@@ -216,6 +246,9 @@ help:
 	@echo "  release-readiness Summarize live-validation gate status"
 	@echo "  package          Create release ZIP bundle"
 	@echo "  release-assets   Prepare publishable release assets (ZIP + helper script)"
+	@echo "  release-assets-preflight Validate release asset policy in dist/release-assets"
+	@echo "  release-gate     Enforce release assets + live-validation evidence gate"
+	@echo "  lint-deprecations Fail if deprecated runtime.mode=legacy appears in examples"
 	@echo "  publish-v2       Dry-run v2.0.0-only GitHub publish workflow (set REPO=owner/name)"
 	@echo "  package-all      Create release ZIP bundles for all platforms"
 	@echo "  package-linux    Create Linux release ZIP bundles"

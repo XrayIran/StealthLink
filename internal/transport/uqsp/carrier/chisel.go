@@ -158,10 +158,14 @@ func (c *ChiselCarrier) establishConnectTunnel(ctx context.Context) (net.Conn, e
 		if frontOpts.RealHost != "" {
 			hostHeader = frontOpts.RealHost
 		}
-		if frontOpts.ConnectIP != "" {
+		connectIP := frontOpts.ConnectIP
+		if len(frontOpts.ConnectIPCandidates) > 0 && strings.TrimSpace(frontOpts.ConnectIPCandidates[0]) != "" {
+			connectIP = frontOpts.ConnectIPCandidates[0]
+		}
+		if strings.TrimSpace(connectIP) != "" {
 			_, port, splitErr := net.SplitHostPort(c.config.Server)
 			if splitErr == nil && port != "" {
-				connectTarget = net.JoinHostPort(frontOpts.ConnectIP, port)
+				connectTarget = net.JoinHostPort(strings.TrimSpace(connectIP), port)
 			}
 		}
 	}

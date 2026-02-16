@@ -12,7 +12,7 @@ transport:
   # No compatibility adapter (default)
   # compat_mode: none  # This is the default, can be omitted
   
-  # UQSP configuration for Mode 4a (XHTTP + Domain Fronting)
+  # UQSP configuration for Mode HTTP+ (XHTTP + Domain Fronting)
   # Using StealthLink's native wire format
   uqsp:
     carrier:

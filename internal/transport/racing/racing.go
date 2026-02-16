@@ -191,6 +191,12 @@ func (r *Racer) Race(ctx context.Context) (*Result, error) {
 		case result := <-resultCh:
 			r.racesWon.Add(1)
 
+			// Snapshot errors before background goroutines can append more.
+			errorsMu.Lock()
+			errSnapshot := make([]error, len(errors))
+			copy(errSnapshot, errors)
+			errorsMu.Unlock()
+
 			// Close other connections that may have succeeded
 			go func() {
 				wg.Wait()
@@ -214,7 +220,7 @@ func (r *Racer) Race(ctx context.Context) (*Result, error) {
 				Conn:     result.conn,
 				Latency:  time.Since(start),
 				Attempts: len(attempted),
-				Errors:   errors,
+				Errors:   errSnapshot,
 			}, nil
 
 		case <-done:
@@ -223,12 +229,18 @@ func (r *Racer) Race(ctx context.Context) (*Result, error) {
 
 		case <-ctx.Done():
 			r.racesFailed.Add(1)
-			return nil, fmt.Errorf("race timeout: %v", errors)
+			errorsMu.Lock()
+			snapshot := fmt.Sprintf("%v", errors)
+			errorsMu.Unlock()
+			return nil, fmt.Errorf("race timeout: %s", snapshot)
 		}
 	}
 
 	r.racesFailed.Add(1)
-	return nil, fmt.Errorf("all candidates failed: %v", errors)
+	errorsMu.Lock()
+	snapshot := fmt.Sprintf("%v", errors)
+	errorsMu.Unlock()
+	return nil, fmt.Errorf("all candidates failed: %s", snapshot)
 }
 
 // RaceWithFallback races candidates with fallback to best historical performer

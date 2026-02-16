@@ -69,12 +69,13 @@ type VariantConfig struct {
 
 // UnifiedProtocol implements the unified protocol with all variants.
 type UnifiedProtocol struct {
-	variant VariantConfig
-	session *uqspSession
-	warpMu  sync.Mutex
-	warp    *warp.StealthWrap
-	warpErr error
-	warpOn  bool
+	variant   VariantConfig
+	sessionMu sync.Mutex
+	session   *uqspSession
+	warpMu    sync.Mutex
+	warp      *warp.StealthWrap
+	warpErr   error
+	warpOn    bool
 }
 
 // Overlays returns the configured behavior overlays for this protocol instance.
@@ -156,11 +157,13 @@ func (u *UnifiedProtocol) Dial(ctx context.Context, addr string) (conn net.Conn,
 
 	// Track the session; if the carrier supports QUIC muxing, a SessionManager
 	// will be attached later via AttachSessionManager.
+	u.sessionMu.Lock()
 	u.session = &uqspSession{
 		variant:   u.variant.Variant,
 		conn:      conn,
 		behaviors: u.variant.Behaviors,
 	}
+	u.sessionMu.Unlock()
 
 	recordConnectionEstablished(carrierName)
 	return wrapMetricsConn(conn, carrierName), nil
@@ -424,6 +427,7 @@ func finalizeHandshakeMetrics(start time.Time, carrierName string, errp *error) 
 	metrics.AddUQSPhandshakeDuration(time.Since(start))
 	if errp != nil && *errp != nil {
 		metrics.IncErrors()
+		metrics.IncHandshakeFailure()
 		metrics.RecordCarrierError(carrierName)
 	}
 }
@@ -456,6 +460,8 @@ func carrierMetricName(c carrier.Carrier) string {
 // AttachSessionManager attaches a SessionManager to the protocol for
 // QUIC-backed carriers that support multiplexed streams and UDP relay.
 func (u *UnifiedProtocol) AttachSessionManager(mgr *SessionManager) {
+	u.sessionMu.Lock()
+	defer u.sessionMu.Unlock()
 	if u.session == nil {
 		u.session = &uqspSession{variant: u.variant.Variant}
 	}
@@ -465,6 +471,8 @@ func (u *UnifiedProtocol) AttachSessionManager(mgr *SessionManager) {
 // SessionManager returns the attached SessionManager, or nil if the carrier
 // does not support QUIC multiplexing.
 func (u *UnifiedProtocol) SessionManager() *SessionManager {
+	u.sessionMu.Lock()
+	defer u.sessionMu.Unlock()
 	if u.session == nil {
 		return nil
 	}

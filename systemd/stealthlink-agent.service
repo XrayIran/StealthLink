@@ -32,7 +32,7 @@ SystemCallArchitectures=native
 ReadWritePaths=/var/log/stealthlink /var/lib/stealthlink /etc/stealthlink
 ReadOnlyPaths=/proc/sys/net
 
-# Capabilities (required for TUN/TAP and raw sockets)
+# Capabilities (required for TUN and raw sockets)
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 

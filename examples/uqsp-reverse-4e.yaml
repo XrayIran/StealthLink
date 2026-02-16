@@ -1,0 +1,70 @@
+# Reverse-init example (Mode TLS)
+#
+# Two YAML documents:
+# 1) Gateway config (server role): dials out to agent behind NAT using reverse-init
+# 2) Agent config (client role): listens and accepts the reverse-init connection
+#
+# For TLS, we show `webtunnel` as the carrier. WARP can be enabled independently via `transport.dialer=warp`.
+---
+role: gateway
+
+gateway:
+  listen: "0.0.0.0:8443"
+
+transport:
+  type: uqsp
+  uqsp:
+    variant_profile: "TLS"
+    carrier:
+      type: webtunnel
+      webtunnel:
+        server: "agent.example.com:8443"
+        path: "/tunnel"
+        version: "h2"
+        tls_fingerprint: "chrome_auto"
+        tls_insecure_skip_verify: true
+    behaviors:
+      cstp:
+        enabled: true
+    reverse:
+      enabled: true
+      role: "rendezvous"
+      auth_token: "reverse-auth-token"
+      client_address: ""
+      rendezvous:
+        enabled: false
+        broker_url: "https://broker.example.com/rv"
+        front_domain: "cdn.sstatic.net"
+        utls_fingerprint: "chrome_auto"
+---
+role: agent
+
+agent:
+  server: "0.0.0.0:0"
+
+transport:
+  type: uqsp
+  uqsp:
+    variant_profile: "TLS"
+    carrier:
+      type: webtunnel
+      webtunnel:
+        server: "0.0.0.0:0"
+        path: "/tunnel"
+        version: "h2"
+        tls_fingerprint: "chrome_auto"
+        tls_insecure_skip_verify: true
+    behaviors:
+      cstp:
+        enabled: true
+    reverse:
+      enabled: true
+      role: "rendezvous"
+      auth_token: "reverse-auth-token"
+      server_address: "0.0.0.0:8443"
+      rendezvous:
+        enabled: false
+        broker_url: "https://broker.example.com/rv"
+        front_domain: "cdn.sstatic.net"
+        utls_fingerprint: "chrome_auto"
+

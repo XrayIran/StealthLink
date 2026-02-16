@@ -6,53 +6,53 @@
 
 ## Summary
 
-StealthLink v2.0 is a major release that consolidates best-of-breed techniques from 12 upstream projects into five unified operational modes (4a-4e). This release delivers significant performance improvements, enhanced security, and improved anti-detection capabilities.
+StealthLink v2.0 is a major release that consolidates best-of-breed techniques from 12 upstream projects into five unified operational modes (HTTP+-TLS). This release delivers significant performance improvements, enhanced security, and improved anti-detection capabilities.
 
 ## Major Features
 
-### Phase 1: Batch I/O (Mode 4b/4d Foundation)
+### Phase 1: Batch I/O (Mode TCP+/UDP+ Foundation)
 - **Linux batch syscalls** (`sendmmsg`/`recvmmsg`) for UDP packet transmission
 - Achieves **2-4× throughput improvement** at >10,000 packets/second
 - Automatic fallback to single-packet I/O on non-Linux systems or syscall failures
 - Configurable batch size (1-64, default: 32)
 
-### Phase 2: XHTTP Metadata Placement (Mode 4a)
+### Phase 2: XHTTP Metadata Placement (Mode HTTP+)
 - **Flexible placement** of session IDs and sequence numbers in HTTP requests
 - Supports `path`, `query`, `header`, and `cookie` placement types
 - Enables optimization for different CDN providers
 - Custom key names for encoded values
 
-### Phase 3: Xmux Connection Lifecycle (Mode 4a)
+### Phase 3: Xmux Connection Lifecycle (Mode HTTP+)
 - **Connection rotation limits** for anti-fingerprinting
 - Configurable reuse limits, request limits, and connection age limits
 - Graceful drain with configurable timeout
 - Rotation metrics for monitoring
 
-### Phase 4: FakeTCP Directional Keys & AEAD (Mode 4b Security)
+### Phase 4: FakeTCP Directional Keys & AEAD (Mode TCP+ Security)
 - **Directional HKDF key derivation** (separate keys for each direction)
 - **AEAD encryption** with ChaCha20-Poly1305 or AES-128-GCM
 - Custom AAD construction for packet authentication
 - MTU adjustment for AEAD overhead
 
-### Phase 5: AnyTLS Protocol (Mode 4c/4e)
+### Phase 5: AnyTLS Protocol (Mode TLS+/TLS)
 - **sing-box AnyTLS compatibility** for TLS fingerprint resistance
 - Configurable padding schemes: `random`, `fixed`, `burst`, `adaptive`
 - Idle session timeout support
 - JA3/JA4 fingerprint evasion
 
-### Phase 6: REALITY Spider Enhancement (Mode 4c)
+### Phase 6: REALITY Spider Enhancement (Mode TLS+)
 - **Concurrent web crawling** during certificate validation (up to 4 workers)
 - SpiderY timing array with ±10% jitter
 - URL deduplication and crawler limits (depth, total fetches, per-host cap)
 - Configurable timeout and depth
 
-### Phase 7: KCP Hardware Entropy (Mode 4d)
+### Phase 7: KCP Hardware Entropy (Mode UDP+)
 - **Hardware-accelerated RNG** using AES-NI when available
 - Go 1.22+ ChaCha8Rand fallback
 - Automatic reseed every 1 MiB
 - ~50% CPU overhead reduction for nonce generation
 
-### Phase 8: KCP FEC Enhancements (Mode 4d)
+### Phase 8: KCP FEC Enhancements (Mode UDP+)
 - **Non-continuous parity skip** during bursty traffic
 - **Pulse-based auto-tuning** based on network conditions
 - Hysteresis rules to prevent oscillation
@@ -89,10 +89,10 @@ transport:
 
 ### Variant Presets
 ```yaml
-variant: "4a"  # Automatically applies optimized preset
+variant: "HTTP+"  # Automatically applies optimized preset
 ```
 
-See `examples/uqsp-mode-4a.yaml` through `examples/uqsp-mode-4e.yaml` for complete configurations.
+See `examples/uqsp-mode-HTTP+.yaml` through `examples/uqsp-mode-TLS.yaml` for complete configurations.
 
 ## Performance Improvements
 
@@ -139,7 +139,7 @@ sudo ./stealthlink-ctl install --local --role=gateway
 sudo stealthlink-ctl install --wizard
 
 # Or configure manually
-sudo stealthlink-ctl configure --variant=4a
+sudo stealthlink-ctl configure --variant=HTTP+
 ```
 
 ## Upgrade Instructions
@@ -172,7 +172,7 @@ The published GitHub release must contain only:
 
 ## Known Issues
 
-1. **REALITY Compatibility Scope**: StealthLink uses in-core REALITY-compatible behavior for mode 4c hardening, but does not guarantee byte-for-byte upstream parity
+1. **REALITY Compatibility Scope**: StealthLink uses in-core REALITY-compatible behavior for mode TLS+ hardening, but does not guarantee byte-for-byte upstream parity
 2. **Container Support**: Batch I/O syscalls may be blocked in some container configurations
 3. **macOS**: Batch I/O falls back to single-packet (Linux-only feature)
 

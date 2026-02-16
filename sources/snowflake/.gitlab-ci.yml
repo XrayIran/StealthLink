@@ -101,7 +101,7 @@ variables:
 # -- jobs ------------------------------------------------------------
 
 android:
-  image: ${DOCKER_REGISTRY_URL}/golang:1.24-$DEBIAN_OLD_STABLE
+  image: ${DOCKER_REGISTRY_URL}/golang:1.25-$DEBIAN_STABLE
   variables:
     ANDROID_HOME: /usr/lib/android-sdk
     LANG: C.UTF-8
@@ -113,8 +113,7 @@ android:
   before_script:
     - *apt-template
     - apt-get install
-        android-sdk-platform-23
-        android-sdk-platform-tools
+        sdkmanager
         build-essential
         curl
         default-jdk-headless
@@ -123,6 +122,9 @@ android:
         unzip
         wget
         ca-certificates
+
+    - sdkmanager --install "platforms;android-35"
+    - sdkmanager --install "build-tools;35.0.0"
 
     - ndk=android-ndk-r21e-linux-x86_64.zip
     - wget --continue --no-verbose https://dl.google.com/android/repository/$ndk

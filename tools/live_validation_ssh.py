@@ -2,7 +2,7 @@
 """SSH-based live validation orchestrator for StealthLink Phase 11 gates.
 
 This tool provisions (via stealthlink-ctl install --bundle) a gateway + agent,
-generates configs per mode (4a..4e) and WARP setting (off/on), runs:
+generates configs per mode (HTTP+..TLS) and WARP setting (off/on), runs:
 - health checks and metrics assertions (underlay_selected / warp_health),
 - iperf3 TCP+UDP benchmarks through the TUN interface,
 - reconnect measurement,
@@ -166,7 +166,7 @@ def build_gateway_config(
         },
     }
 
-    if mode == "4b":
+    if mode == "TCP+":
         cfg["transport"]["uqsp"]["carrier"] = {
             "type": "rawtcp",
             "rawtcp": {
@@ -182,7 +182,7 @@ def build_gateway_config(
             },
         }
 
-    if mode == "4c":
+    if mode == "TLS+":
         # Exercise AnyTLS carrier path for TLS-lookalike mode.
         password = rand_b64(24)
         cfg["transport"]["uqsp"]["carrier"] = {
@@ -265,7 +265,7 @@ def build_agent_config(
         },
     }
 
-    if mode == "4b":
+    if mode == "TCP+":
         cfg["transport"]["uqsp"]["carrier"] = {
             "type": "rawtcp",
             "rawtcp": {
@@ -281,11 +281,77 @@ def build_agent_config(
             },
         }
 
-    if mode == "4c":
+    if mode == "TLS+":
         # Must match gateway password; will be injected by orchestrator when building both configs.
         pass
 
     return cfg
+
+
+def apply_requested_upstream_scenario(
+    mode: str,
+    gw_cfg: dict[str, Any],
+    ag_cfg: dict[str, Any],
+    gateway_host: str,
+    gateway_port: int,
+) -> None:
+    gw_uqsp = gw_cfg.setdefault("transport", {}).setdefault("uqsp", {})
+    ag_uqsp = ag_cfg.setdefault("transport", {}).setdefault("uqsp", {})
+    gw_beh = gw_uqsp.setdefault("behaviors", {})
+    ag_beh = ag_uqsp.setdefault("behaviors", {})
+
+    if mode == "HTTP+":
+        # HTTP+ scenario: domainfront + phantom + ech.
+        for beh in (gw_beh, ag_beh):
+            beh["domainfront"] = {
+                "enabled": True,
+                "front_domain": gateway_host,
+                "real_host": gateway_host,
+                "phantom": {
+                    "enabled": True,
+                    "shared_secret": "live-validation-shared-secret",
+                    "pool_size": 16,
+                },
+            }
+            beh["ech"] = {
+                "enabled": True,
+                "public_name": gateway_host,
+            }
+    elif mode == "TCP+":
+        # TCP+ scenario: rawtcp + obfs4.
+        gw_beh["obfs4"] = {"enabled": True, "seed": "0123456789abcdef"}
+        ag_beh["obfs4"] = {"enabled": True, "seed": "0123456789abcdef"}
+    elif mode == "UDP+":
+        # UDP+ scenario: quic datagram.
+        gw_uqsp["carrier"] = {"type": "quic"}
+        ag_uqsp["carrier"] = {"type": "quic"}
+        gw_uqsp.setdefault("datagrams", {})["relay_mode"] = "native"
+        ag_uqsp.setdefault("datagrams", {})["relay_mode"] = "native"
+    elif mode == "TLS":
+        # TLS scenario: webtunnel h2 + cstp.
+        gw_uqsp["carrier"] = {
+            "type": "webtunnel",
+            "webtunnel": {
+                "server": f"0.0.0.0:{gateway_port}",
+                "path": "/tunnel",
+                "version": "h2",
+                "tls_fingerprint": "chrome_auto",
+                "tls_insecure_skip_verify": True,
+            },
+        }
+        ag_uqsp["carrier"] = {
+            "type": "webtunnel",
+            "webtunnel": {
+                "server": f"{gateway_host}:{gateway_port}",
+                "path": "/tunnel",
+                "version": "h2",
+                "tls_fingerprint": "chrome_auto",
+                "tls_server_name": gateway_host,
+                "tls_insecure_skip_verify": True,
+            },
+        }
+        gw_beh["cstp"] = {"enabled": True}
+        ag_beh["cstp"] = {"enabled": True}
 
 
 def write_local(path: pathlib.Path, obj: dict[str, Any]) -> None:
@@ -330,7 +396,7 @@ def run() -> int:
     ap.add_argument("--ssh-user", default="root")
     ap.add_argument("--ssh-key", default="")
     ap.add_argument("--gateway-port", type=int, default=8443)
-    ap.add_argument("--modes", default="4a,4b,4c,4d,4e")
+    ap.add_argument("--modes", default="HTTP+,TCP+,TLS+,UDP+,TLS")
     ap.add_argument("--warp", choices=["both", "off", "builtin", "wgquick"], default="both")
     ap.add_argument("--bundle", required=True)
     ap.add_argument("--tun-subnet", default="10.77.0.0/30")
@@ -345,9 +411,10 @@ def run() -> int:
     ap.add_argument("--soak", action="store_true", help="Run a long soak loop after validate-live (default off).")
     ap.add_argument("--soak-duration-seconds", type=int, default=24 * 60 * 60)
     ap.add_argument("--soak-interval-seconds", type=int, default=300)
-    ap.add_argument("--soak-mode", default="4d")
+    ap.add_argument("--soak-mode", default="UDP+")
     ap.add_argument("--soak-warp", choices=["off", "on"], default="off")
     ap.add_argument("--soak-engine", choices=["builtin", "wgquick"], default="builtin")
+    ap.add_argument("--scenario-pack", choices=["none", "requested-upstreams"], default="none")
     args = ap.parse_args()
 
     out_dir = pathlib.Path(args.output_dir) if args.output_dir else (ROOT / "dist" / "live-validation" / dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -373,11 +440,14 @@ def run() -> int:
     r = run_ssh(ssh_cfg, args.agent_host, "stealthlink-ctl install --bundle=/tmp/stealthlink.zip --role=agent --offline")
     ensure_rc(r.returncode == 0, "install agent", r.stdout, r.stderr)
 
-    # Detect rawtcp uplink (only required for 4b, but cheap and reused)
+    # Detect rawtcp uplink (only required for TCP+, but cheap and reused)
     gw_uplink = detect_uplink(ssh_cfg, args.gateway_host)
     ag_uplink = detect_uplink(ssh_cfg, args.agent_host)
 
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    if args.scenario_pack == "requested-upstreams":
+        modes = ["HTTP+", "TCP+", "UDP+", "TLS"]
+    else:
+        modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     warp_runs: list[tuple[str, str]] = []
     if args.warp == "both":
         warp_runs = [("off", "builtin"), ("on", "builtin")]
@@ -393,6 +463,7 @@ def run() -> int:
         "gateway_host": args.gateway_host,
         "agent_host": args.agent_host,
         "gateway_port": args.gateway_port,
+        "scenario_pack": args.scenario_pack,
         "runs": [],
         "pass": True,
     }
@@ -444,8 +515,17 @@ def run() -> int:
                 rawtcp=ag_uplink,
             )
 
-            # Sync AnyTLS password for 4c carrier if used.
-            if mode == "4c":
+            if args.scenario_pack == "requested-upstreams":
+                apply_requested_upstream_scenario(
+                    mode=mode,
+                    gw_cfg=gw_cfg,
+                    ag_cfg=ag_cfg,
+                    gateway_host=args.gateway_host,
+                    gateway_port=args.gateway_port,
+                )
+
+            # Sync AnyTLS password for TLS+ carrier if used.
+            if mode == "TLS+":
                 anytls = gw_cfg["transport"]["uqsp"]["carrier"]["anytls"]
                 ag_carrier = {"type": "anytls", "anytls": dict(anytls)}
                 # The agent must dial the real gateway host:port.
@@ -648,7 +728,7 @@ def run() -> int:
             warp_engine=soak_engine,
             rawtcp=ag_uplink,
         )
-        if soak_mode == "4c":
+        if soak_mode == "TLS+":
             anytls = gw_cfg["transport"]["uqsp"]["carrier"]["anytls"]
             ag_carrier = {"type": "anytls", "anytls": dict(anytls)}
             ag_carrier["anytls"]["server"] = f"{args.gateway_host}:{args.gateway_port}"

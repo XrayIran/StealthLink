@@ -45,33 +45,42 @@ func TestValidateVariantRejectsUnknownExplicitVariant(t *testing.T) {
 	}
 }
 
+func TestValidateVariantRejectsLegacy4aAlias(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = "4a"
+	if err := cfg.ValidateVariant(); err == nil {
+		t.Fatal("expected legacy 4a alias to be rejected after cutover")
+	}
+}
+
 func TestApplyVariantPreset4CPinsCarrierAndPQDefaults(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4c"
+	cfg.Variant = VariantTLSPlus
 	cfg.applyDefaults()
 
 	if cfg.Transport.UQSP.Carrier.Type != "xhttp" {
-		t.Fatalf("expected 4c carrier xhttp, got %q", cfg.Transport.UQSP.Carrier.Type)
+		t.Fatalf("expected %s carrier xhttp, got %q", VariantTLSPlus, cfg.Transport.UQSP.Carrier.Type)
 	}
 	if !cfg.Transport.UQSP.Behaviors.Vision.Enabled {
-		t.Fatal("expected vision enabled for 4c preset")
+		t.Fatalf("expected vision enabled for %s preset", VariantTLSPlus)
 	}
 	if !cfg.Transport.UQSP.Security.PQKEM {
-		t.Fatal("expected pq_kem enabled for 4c preset")
+		t.Fatalf("expected pq_kem enabled for %s preset", VariantTLSPlus)
 	}
 	if !cfg.Transport.UQSP.Behaviors.TLSMirror.Enabled {
-		t.Fatal("expected tlsmirror enabled by default for 4c preset")
+		t.Fatalf("expected tlsmirror enabled by default for %s preset", VariantTLSPlus)
 	}
 }
 
 func TestValidateVariantRawTCPAllowsFakeTCPCarrier(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4b"
+	cfg.Variant = VariantTCPPlus
 	cfg.Transport.UQSP.Carrier.Type = "faketcp"
 	if err := cfg.ValidateVariant(); err != nil {
-		t.Fatalf("expected faketcp carrier to validate for 4b, got: %v", err)
+		t.Fatalf("expected faketcp carrier to validate for %s, got: %v", VariantTCPPlus, err)
 	}
 }
 
@@ -80,28 +89,28 @@ func TestGetVariantDetectsFakeTCPAs4B(t *testing.T) {
 	cfg.Transport.Type = "uqsp"
 	cfg.Transport.UQSP.Carrier.Type = "faketcp"
 	if got := cfg.GetVariant(); got != 1 {
-		t.Fatalf("expected variant 1 (4b) for faketcp carrier, got %d", got)
+		t.Fatalf("expected variant 1 (%s) for faketcp carrier, got %d", VariantTCPPlus, got)
 	}
 }
 
 func TestApplyVariantPreset4EDefaultsToTrustTunnel(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4e"
+	cfg.Variant = VariantTLS
 	cfg.applyDefaults()
 
 	if cfg.Transport.UQSP.Carrier.Type != "trusttunnel" {
-		t.Fatalf("expected 4e carrier trusttunnel, got %q", cfg.Transport.UQSP.Carrier.Type)
+		t.Fatalf("expected %s carrier trusttunnel, got %q", VariantTLS, cfg.Transport.UQSP.Carrier.Type)
 	}
 	if !cfg.Transport.UQSP.Behaviors.CSTP.Enabled {
-		t.Fatal("expected CSTP enabled for 4e preset")
+		t.Fatalf("expected CSTP enabled for %s preset", VariantTLS)
 	}
 }
 
 func TestVariantCanBeSelectedFromTransportProfile(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Transport.UQSP.VariantProfile = "4e"
+	cfg.Transport.UQSP.VariantProfile = VariantTLS
 	cfg.applyDefaults()
 
 	if got := cfg.GetVariant(); got != 4 {
@@ -112,19 +121,19 @@ func TestVariantCanBeSelectedFromTransportProfile(t *testing.T) {
 func TestValidateVariantDetectsConflictBetweenSelectors(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4a"
-	cfg.Transport.UQSP.VariantProfile = "4d"
+	cfg.Variant = VariantHTTPPlus
+	cfg.Transport.UQSP.VariantProfile = VariantUDPPlus
 	if err := cfg.ValidateVariant(); err == nil {
 		t.Fatal("expected conflict validation error when variant selectors disagree")
 	}
 }
 
-func TestLegacyNumericVariantStillAccepted(t *testing.T) {
+func TestLegacyNumericVariantRejected(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "3" // Backward compatibility with older helpers.
-	if err := cfg.ValidateVariant(); err != nil {
-		t.Fatalf("expected numeric variant to remain valid, got: %v", err)
+	cfg.Variant = "3"
+	if err := cfg.ValidateVariant(); err == nil {
+		t.Fatal("expected numeric variant to be rejected after cutover")
 	}
 }
 
@@ -133,14 +142,14 @@ func TestGetVariantDetectsAnyTLSAs4C(t *testing.T) {
 	cfg.Transport.Type = "uqsp"
 	cfg.Transport.UQSP.Behaviors.AnyTLS.Enabled = true
 	if got := cfg.GetVariant(); got != 2 {
-		t.Fatalf("expected variant 2 (4c) for anytls behavior, got %d", got)
+		t.Fatalf("expected variant 2 (%s) for anytls behavior, got %d", VariantTLSPlus, got)
 	}
 }
 
 func TestValidateVariantTLSMirrorRequiresAnyTLSPassword(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4c"
+	cfg.Variant = VariantTLSPlus
 	cfg.Transport.UQSP.Behaviors.AnyTLS.Enabled = true
 	cfg.Transport.UQSP.Behaviors.AnyTLS.Password = ""
 	if err := cfg.ValidateVariant(); err == nil {
@@ -148,29 +157,79 @@ func TestValidateVariantTLSMirrorRequiresAnyTLSPassword(t *testing.T) {
 	}
 }
 
-func TestValidateVariant4aRejectsNonXHTTPCarrier(t *testing.T) {
+func TestValidateVariant4aRejectsIncompatibleCarrier(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4a"
-	cfg.Transport.UQSP.Carrier.Type = "quic"
+	cfg.Variant = VariantHTTPPlus
+	cfg.Transport.UQSP.Carrier.Type = "trusttunnel"
 	cfg.Transport.UQSP.Behaviors.Vision.Enabled = true
 	cfg.Transport.UQSP.Behaviors.ECH.Enabled = true
 	cfg.Transport.UQSP.Behaviors.ECH.PublicName = "cloudflare-ech.com"
 	if err := cfg.ValidateVariant(); err == nil {
-		t.Fatal("expected 4a carrier validation error")
+		t.Fatalf("expected %s carrier validation error", VariantHTTPPlus)
+	}
+}
+
+func TestValidateVariant4aAllowsExplicitQUICCarrier(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = VariantHTTPPlus
+	cfg.Transport.UQSP.Carrier.Type = "quic"
+	cfg.Transport.UQSP.Behaviors.Vision.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.Enabled = true
+	cfg.Transport.UQSP.Behaviors.ECH.PublicName = "cloudflare-ech.com"
+	if err := cfg.ValidateVariant(); err != nil {
+		t.Fatalf("expected explicit quic carrier to validate for %s, got: %v", VariantHTTPPlus, err)
+	}
+}
+
+func TestValidateVariant4eAllowsAnyTLSCarrier(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = VariantTLS
+	cfg.Transport.UQSP.Carrier.Type = "anytls"
+	cfg.Transport.UQSP.Behaviors.CSTP.Enabled = true
+	if err := cfg.ValidateVariant(); err != nil {
+		t.Fatalf("expected anytls carrier to validate for %s, got: %v", VariantTLS, err)
+	}
+}
+
+func TestValidateVariantTLSRequiresReverseForChiselCarrier(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Variant = VariantTLS
+	cfg.Transport.UQSP.Carrier.Type = "chisel"
+	cfg.Transport.UQSP.Behaviors.CSTP.Enabled = true
+	if err := cfg.ValidateVariant(); err == nil {
+		t.Fatalf("expected %s chisel carrier to require reverse mode", VariantTLS)
+	}
+}
+
+func TestValidateVariantTLSAllowsChiselCarrierInReverseMode(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.Role = "gateway"
+	cfg.Variant = VariantTLS
+	cfg.Transport.UQSP.Carrier.Type = "chisel"
+	cfg.Transport.UQSP.Behaviors.CSTP.Enabled = true
+	cfg.Transport.UQSP.Reverse.Enabled = true
+	cfg.Transport.UQSP.Reverse.Role = "client"
+	cfg.Transport.UQSP.Reverse.AuthToken = "test-token"
+	if err := cfg.ValidateVariant(); err != nil {
+		t.Fatalf("expected %s chisel carrier to validate in reverse mode, got: %v", VariantTLS, err)
 	}
 }
 
 func TestValidateVariantPolicyReverseRequiresAuthToken(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4a"
+	cfg.Variant = VariantHTTPPlus
 	cfg.Transport.UQSP.Carrier.Type = "xhttp"
 	cfg.Transport.UQSP.Behaviors.Vision.Enabled = true
 	cfg.Transport.UQSP.Behaviors.ECH.Enabled = true
 	cfg.Transport.UQSP.Behaviors.ECH.PublicName = "cloudflare-ech.com"
 	cfg.Transport.UQSP.VariantPolicy = map[string]UQSPVariantPolicy{
-		"4a": {ReverseEnabled: boolPtr(true)},
+		VariantHTTPPlus: {ReverseEnabled: boolPtr(true)},
 	}
 	if err := cfg.ValidateVariant(); err == nil {
 		t.Fatal("expected reverse auth token validation error for variant policy")
@@ -180,13 +239,13 @@ func TestValidateVariantPolicyReverseRequiresAuthToken(t *testing.T) {
 func TestValidateVariantPolicyWarpDefaultsToFailClosed(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
-	cfg.Variant = "4a"
+	cfg.Variant = VariantHTTPPlus
 	cfg.Transport.UQSP.Carrier.Type = "xhttp"
 	cfg.Transport.UQSP.Behaviors.Vision.Enabled = true
 	cfg.Transport.UQSP.Behaviors.ECH.Enabled = true
 	cfg.Transport.UQSP.Behaviors.ECH.PublicName = "cloudflare-ech.com"
 	cfg.Transport.UQSP.VariantPolicy = map[string]UQSPVariantPolicy{
-		"4a": {WARPEnabled: boolPtr(true)},
+		VariantHTTPPlus: {WARPEnabled: boolPtr(true)},
 	}
 	if err := cfg.ValidateVariant(); err != nil {
 		t.Fatalf("unexpected validation error: %v", err)

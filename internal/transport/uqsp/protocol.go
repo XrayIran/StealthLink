@@ -294,10 +294,10 @@ func (e ErrorCode) String() string {
 
 // FrameHeader is the header for all UQSP frames
 type FrameHeader struct {
-	Type       FrameType
-	Length     uint16
-	StreamID   uint32 // For stream-associated frames
-	SessionID  uint32 // For UDP session-associated frames
+	Type      FrameType
+	Length    uint16
+	StreamID  uint32 // For stream-associated frames
+	SessionID uint32 // For UDP session-associated frames
 }
 
 // Encode encodes the frame header to bytes
@@ -384,9 +384,9 @@ func (c *ControlPayload) Decode(data []byte) error {
 
 // UDPSessionInfo contains UDP session information
 type UDPSessionInfo struct {
-	SessionID   uint32
-	TargetAddr  string
-	ContextID   uint64
+	SessionID  uint32
+	TargetAddr string
+	ContextID  uint64
 }
 
 // Encode encodes the UDP session info to bytes

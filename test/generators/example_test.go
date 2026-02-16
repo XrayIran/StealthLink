@@ -77,7 +77,7 @@ func TestProperty_ModeValidity(t *testing.T) {
 
 		// Property: Mode must be one of the valid modes
 		validModes := map[string]bool{
-			"4a": true, "4b": true, "4c": true, "4d": true, "4e": true,
+			"HTTP+": true, "TCP+": true, "TLS+": true, "UDP+": true, "TLS": true,
 		}
 		if !validModes[mode] {
 			t.Fatalf("invalid mode: %s", mode)

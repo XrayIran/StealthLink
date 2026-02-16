@@ -23,11 +23,11 @@ def run(cmd: list[str]) -> dict:
     }
 
 MODE_PROFILES: dict[str, dict[str, str]] = {
-    "4a": {"label": "xhttp+fronting"},
-    "4b": {"label": "rawtcp+faketcp"},
-    "4c": {"label": "tls-lookalike"},
-    "4d": {"label": "udp+quic"},
-    "4e": {"label": "trusttunnel+cstp"},
+    "HTTP+": {"label": "xhttp+fronting"},
+    "TCP+": {"label": "rawtcp+faketcp"},
+    "TLS+": {"label": "tls-lookalike"},
+    "UDP+": {"label": "udp+quic"},
+    "TLS": {"label": "trusttunnel+cstp"},
 }
 
 
@@ -42,7 +42,7 @@ def load_baseline_metrics(path: str, mode_profile: str | None = None, warp: str 
     # Baseline schema v2:
     # {
     #   "profiles": {
-    #     "4a": {"off": {"tcp_mbps": ..., "udp_mbps": ..., "latency_ms": ...}, "on": {...}},
+    #     "HTTP+": {"off": {"tcp_mbps": ..., "udp_mbps": ..., "latency_ms": ...}, "on": {...}},
     #     ...
     #   }
     # }

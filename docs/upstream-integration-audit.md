@@ -31,7 +31,7 @@ Release operations closure:
 
 ## Executive Summary
 
-**StealthLink has completed its upstream integration consolidation.** As of 2026-02-10, all 5 modes (4a-4e) are fully implemented with in-core protocol variants:
+**StealthLink has completed its upstream integration consolidation.** As of 2026-02-10, all 5 modes (HTTP+-TLS) are fully implemented with in-core protocol variants:
 
 Completion status is split explicitly:
 - `Code Complete`: ✅ in-repo implementation and tests
@@ -67,7 +67,7 @@ Deterministic snapshot audit artifacts:
 - ✅ Fixed XHTTP metadata path decode ambiguity when metadata values matched other metadata keys:
   - parser now decodes path metadata as tail key/value pairs (`internal/transport/xhttpmeta/metadata.go`).
 - ✅ Added deterministic property-test runner (`make property-test`) to run all rapid suites without false flag failures on non-rapid packages.
-- ✅ Fixed mode 4e TrustTunnel/CSTP reliability race:
+- ✅ Fixed mode TLS TrustTunnel/CSTP reliability race:
   - `trustTunnelConn` now uses concrete `*smux.Stream` with guarded lazy-open and close teardown (`internal/transport/uqsp/carrier/trusttunnel.go`).
 - ✅ Restored Linux arm64 ZIP build reliability for offline packaging:
   - cross-target build defaults to `CGO_ENABLED=0` when cross-compiling (`scripts/build-release-zip.sh`, `Makefile`),
@@ -79,9 +79,9 @@ Deterministic snapshot audit artifacts:
   - Removed stale TODO paths in `internal/transport/kcpbase/base.go` and added lifecycle tests in `internal/transport/kcpbase/base_lifecycle_test.go`.
 
 ### Delta Closure Patch (2026-02-12, policy/migration validation hardening)
-- ✅ Added per-mode reverse/WARP policy override tests across all five variants (4a..4e):
+- ✅ Added per-mode reverse/WARP policy override tests across all five variants (HTTP+..TLS):
   - verifies mode-specific enable/disable overrides against global defaults
-  - verifies reverse-mode HTTP registration behavior for 4a/4e
+  - verifies reverse-mode HTTP registration behavior for HTTP+/TLS
   - files: `internal/transport/uqsp/variant_builder_test.go`
 - ✅ Added migration regression tests with realistic legacy inputs and current examples:
   - validates legacy→v2 conversion + validation path
@@ -92,32 +92,32 @@ Deterministic snapshot audit artifacts:
 - ✅ `github.com/xtaci/kcp-go/v5@latest` - RingBuffer boundary fixes, improved performance
 - ✅ `github.com/xtaci/smux@latest` - Window threshold improvements, read-path performance
 
-### Mode 4a (XHTTP + TLS + Vision + ECH)
+### Mode HTTP+ (XHTTP + TLS + Vision + ECH)
 - ✅ GFW TLS resistance: extension randomization, record padding, GREASE insertion
 - ✅ Domain fronting with Cloudflare Workers routing
 - ✅ XHTTP carrier with chunked transfer encoding and header randomization
 - ✅ Vision flow detection with proper buffer management
 
-### Mode 4b (Raw TCP)
+### Mode TCP+ (Raw TCP)
 - ✅ GFW TCP resistance: window manipulation, strategic RST/FIN injection
 - ✅ FakeTCP with reorder buffer (cap 64), retransmission (max 5), keepalive
 - ✅ Realistic TCP options: MSS (1460), window scale (7), SACK permitted, timestamps
 - ✅ Fake-HTTP handshake preface from udp2raw (opt-in, default off)
 
-### Mode 4c (TLS Look-alikes + Vision + PQ)
+### Mode TLS+ (TLS Look-alikes + Vision + PQ)
 - ✅ REALITY with short ID generation, session ticket interception
 - ✅ ShadowTLS with robust TLS 1.2/1.3 handling and proper ServerHello parsing
 - ✅ ML-DSA-65 (FIPS 204) post-handshake signatures via Go 1.25 crypto/mldsa65
 - ✅ Session resumption support
 
-### Mode 4d (UDP-based)
+### Mode UDP+ (UDP-based)
 - ✅ Hysteria2 Brutal CC with fixed-rate sending (ignores loss signals)
 - ✅ Salamander XOR obfuscation with key-derived pad
 - ✅ Morphing: packet length randomization to defeat traffic analysis
 - ✅ Datagram reassembly with timeout/GC, duplicate handling, bounded memory
 - ✅ AWG 2.0 junk packets with optional special junk (amnezia-client delta)
 
-### Mode 4e (TLS/HTTP-based - Canonical In-Core)
+### Mode TLS (TLS/HTTP-based - Canonical In-Core)
 - ✅ TrustTunnel carrier: HTTP/1.1 upgrade, HTTP/2 SETTINGS, HTTP/3 (QUIC-based)
 - ✅ CSTP framing for HTTP-based tunneling (OpenConnect pattern)
 - ✅ DTLS fallback: automatic TCP→UDP on block
@@ -165,7 +165,7 @@ Legend:
 11. ⚠️  `sources/Vwarp` → **Compatibility**: Noize and SNI blend lineage (no direct chain integration)
 12. ⚠️  `sources/shadowsocks-rust` → **Compatibility**: FakeDNS + bloom replay ideas (no SS protocol)
 13. ⚠️  `sources/qtun` → **Compatibility**: QUIC + QPP concepts (no SIP003 plugin)
-14. ⚠️  `sources/badvpn` → **Compatibility**: TUN/TAP primitives (no badvpn protocol)
+14. ⚠️  `sources/badvpn` → **Compatibility**: TUN primitives (L3-only; no badvpn protocol)
 15. ✅ `sources/VPS-Optimizer` → **Integrated**: Host optimization tooling and sysctl snapshot/rollback
 16. ✅ `sources/udp_tun` → **Integrated**: UDP-over-TCP carrier support
 17. ✅ `sources/udp2raw` → **Integrated**: Fake-HTTP handshake preface (opt-in)
@@ -189,23 +189,23 @@ Requested reliability/stealth/performance set status:
 | `smux` | ✅ Integrated | `internal/mux/*`, all carrier session paths |
 | `qtun` | ⚠️ Compatibility | `internal/transport/quicmux/*`, `internal/crypto/qpp/*` |
 | `kcptun` | ✅ Integrated | `internal/transport/kcpbase/*`, `internal/transport/kcpmux/*` |
-| `VortexL2` | ⚠️ Compatibility | L3/TUN-focused architecture; no L2 bridge parity |
+| `VortexL2` | `out_of_scope_l3` | L3/TUN-focused architecture; no L2 bridge parity |
 | `ocserv` | ✅ Integrated (compat) | `internal/transport/uqsp/behavior/cstp.go` |
 | `udp2raw` | ✅ Integrated (compat) | `internal/transport/faketcp/*`, `internal/transport/icmptun/*` |
 | `dae` | ⚠️ Compatibility | routing/control patterns across `internal/routing/*`, `internal/transport/underlay/*` |
 | `juicity` | ⚠️ Compatibility | QUIC/UDP behavior in `internal/transport/quicmux/*` |
 | `mihomo` | ⚠️ Compatibility | policy/routing ideas, not full mihomo runtime parity |
-| `EasyTier` | ⚠️ Compatibility | topology/routing concepts; canonical path remains point-to-point UQSP |
-| `conjure` | ⚠️ Compatibility | camouflage/fronting strategy represented via mode 4a/4c behavior chain |
-| `lyrebird` | ✅ Integrated (compat) | obfs4/meek classes in `internal/transport/uqsp/behavior/obfs4.go`, `internal/transport/psiphon/meek.go` |
-| `snowflake` | ⚠️ Compatibility | pluggable rendezvous/fronting patterns only |
-| `openconnect` | ✅ Integrated (compat) | CSTP + DTLS fallback in mode 4e |
+| `EasyTier` | ✅ Integrated (L3 only) | `transport.uqsp.path_policy.*` + `internal/transport/underlay/path_policy_dialer.go` |
+| `conjure` | ✅ Integrated (technique-only) | phantom pool + domainfront wiring (`internal/transport/phantom/pool.go`, `internal/transport/uqsp/behavior/domainfront.go`) |
+| `lyrebird` | ✅ Integrated (compat) | obfs4 classes in `internal/transport/uqsp/behavior/obfs4.go` |
+| `snowflake` | ✅ Integrated (technique-only) | rendezvous broker client in `internal/transport/snowflake/rendezvous_client.go` wired from `internal/transport/uqsp/reverse.go` |
+| `openconnect` | ✅ Integrated (compat) | CSTP + DTLS fallback in mode TLS |
 | `TrustTunnel` | ✅ Integrated | `internal/transport/uqsp/carrier/trusttunnel.go` |
 | `shadowsocks-rust` | ⚠️ Compatibility | FakeDNS/replay/bloom components |
 | `haproxy` | ⚠️ Compatibility | proxy/fronting operational patterns, no HAProxy control-plane parity |
 | `amnezia-client` | ✅ Integrated (compat) | AWG behavior and special-junk handling |
 | `kcp-go` | ✅ Integrated | batch I/O/FEC/entropy + lifecycle fix in `internal/transport/kcpbase/*` |
-| `psiphon-tunnel-core` | ✅ Integrated (compat) | `internal/transport/psiphon/*` |
+| `psiphon-tunnel-core` | ✅ Integrated (technique-only) | front pool scoring in `internal/tlsutil/front_pool.go` wired by `internal/transport/uqsp/carrier/tlsdial.go` |
 | `anytls-go` | ✅ Integrated | `internal/transport/anytls/*`, UQSP AnyTLS carrier |
 | `Tunnel` | ✅ Integrated (compat) | reverse orchestration + tunnel management |
 
@@ -290,7 +290,7 @@ Legend:
 - Gap: not a qtun SIP003 plugin-compatible implementation.
 
 14. `sources/badvpn` -> `Partial`
-- Evidence: TUN/TAP and transport tuning primitives (`internal/tun/*`, `internal/transport/taptun/taptun.go`).
+- Evidence: TUN and transport tuning primitives (`internal/tun/*`). L2/TAP code exists under `internal/transport/taptun`, but is out of scope for the L3-only product surface.
 - Gap: no badvpn protocol/runtime integration.
 
 15. `sources/VPS-Optimizer` -> `Integrated (partial-fidelity)`
@@ -324,7 +324,7 @@ Legend:
 - Gap: full ocserv feature parity is incomplete.
 
 23. `sources/openconnect` -> `Partial`
-- Evidence: in-core CSTP + DTLS-fallback patterns are wired in mode 4e carriers/behaviors.
+- Evidence: in-core CSTP + DTLS-fallback patterns are wired in mode TLS carriers/behaviors.
 - Gap: full OpenConnect parity and interop matrices remain incomplete.
 
 24. `sources/TrustTunnel` -> `Integrated (partial-fidelity)`
@@ -369,9 +369,9 @@ Legend:
 - v2rayA redirect/tproxy:
   - extend from command-path e2e tests to privileged kernel-level e2e scenarios for policy/routing edge cases.
 
-### Phase 4: In-Core 4e Hardening
+### Phase 4: In-Core TLS Hardening
 
-- Keep mode 4e canonical in-core (TrustTunnel + CSTP + DTLS fallback).
+- Keep mode TLS canonical in-core (TrustTunnel + CSTP + DTLS fallback).
 - Sidecars are optional compatibility adapters only and must not replace canonical runtime behavior (`docs/protocol-bridge-decision.md`).
 
 ## Acceptance Criteria for "Unified"

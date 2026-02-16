@@ -424,17 +424,10 @@ func newBLAKE2sHMAC(key []byte) (hash.Hash, error) {
 
 // setupRouting configures routing for the WARP tunnel.
 func (t *Tunnel) setupRouting() error {
-	// In a real implementation, this would:
-	// 1. Create a TUN device
-	// 2. Configure IP addresses
-	// 3. Add routes based on RoutingMode
-
 	switch t.config.RoutingMode {
 	case "all":
-		// Route all traffic through WARP
 		return t.setupFullRouting()
 	case "vpn_only":
-		// Only route VPN return traffic through WARP
 		return t.setupVPNSplitRouting()
 	default:
 		return fmt.Errorf("unknown routing mode: %s", t.config.RoutingMode)
@@ -443,35 +436,42 @@ func (t *Tunnel) setupRouting() error {
 
 // setupFullRouting routes all traffic through WARP.
 func (t *Tunnel) setupFullRouting() error {
-	// Add default route through WARP interface
-	// This requires root privileges and netlink
-	return setupDefaultRoute(t.config.InterfaceName)
+	if err := checkIPCommand(); err != nil {
+		return err
+	}
+	cfg := PolicyRoutingConfig{
+		Mark:         DefaultFWMark,
+		Table:        DefaultRoutingTable,
+		RulePriority: DefaultRulePriority,
+		IfaceName:    t.config.InterfaceName,
+	}
+	return SetupPolicyRouting(cfg)
 }
 
 // setupVPNSplitRouting routes only VPN return traffic through WARP.
 func (t *Tunnel) setupVPNSplitRouting() error {
-	// Add specific routes for VPN traffic only
-	// This typically means routing the VPN subnet through WARP
-	return setupVPNSpecificRoutes(t.config.InterfaceName, t.config.VPNSubnet)
-}
-
-// setupDefaultRoute adds a default route through the WARP interface.
-func setupDefaultRoute(ifaceName string) error {
-	// Platform-specific implementation
-	// On Linux with netlink support, this adds a default route
-	return addDefaultRouteViaInterface(ifaceName)
-}
-
-// setupVPNSpecificRoutes adds routes specific to VPN traffic.
-func setupVPNSpecificRoutes(ifaceName string, vpnSubnet string) error {
-	// Add route for VPN subnet only
-	return addRouteViaInterface(ifaceName, vpnSubnet, "")
+	if err := checkIPCommand(); err != nil {
+		return err
+	}
+	cfg := PolicyRoutingConfig{
+		Mark:         DefaultFWMark,
+		Table:        DefaultRoutingTable,
+		RulePriority: DefaultRulePriority,
+		IfaceName:    t.config.InterfaceName,
+		VPNSubnet:    t.config.VPNSubnet,
+	}
+	return SetupPolicyRouting(cfg)
 }
 
 // restoreRouting restores the original routing configuration.
 func (t *Tunnel) restoreRouting() error {
-	// Remove WARP routes
-	return removeRoutesViaInterface(t.config.InterfaceName)
+	cfg := PolicyRoutingConfig{
+		Mark:         DefaultFWMark,
+		Table:        DefaultRoutingTable,
+		RulePriority: DefaultRulePriority,
+		IfaceName:    t.config.InterfaceName,
+	}
+	return TeardownPolicyRouting(cfg)
 }
 
 // WireGuard message types

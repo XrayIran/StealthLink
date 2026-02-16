@@ -18,27 +18,27 @@ func TestGetActiveMode(t *testing.T) {
 	}{
 		{
 			name:     "transport.mode takes precedence",
-			mode:     "4b",
-			variant:  "4a",
-			expected: "4b",
+			mode:     "TCP+",
+			variant:  "HTTP+",
+			expected: "TCP+",
 		},
 		{
 			name:     "variant used when mode not set",
 			mode:     "",
-			variant:  "4c",
-			expected: "4c",
+			variant:  "TLS+",
+			expected: "TLS+",
 		},
 		{
-			name:     "default to 4a when neither set",
+			name:     "default to HTTP+ when neither set",
 			mode:     "",
 			variant:  "",
-			expected: "4a",
+			expected: "HTTP+",
 		},
 		{
 			name:     "transport.mode only",
-			mode:     "4d",
+			mode:     "UDP+",
 			variant:  "",
-			expected: "4d",
+			expected: "UDP+",
 		},
 	}
 
@@ -65,33 +65,33 @@ func TestValidateMode(t *testing.T) {
 		errMsg  string
 	}{
 		{
-			name:    "valid mode 4a",
-			mode:    "4a",
-			config:  Transport{Mode: "4a", Mode4a: DefaultMode4aConfig()},
+			name:    "valid mode HTTP+",
+			mode:    "HTTP+",
+			config:  Transport{Mode: "HTTP+", Mode4a: DefaultMode4aConfig()},
 			wantErr: false,
 		},
 		{
-			name:    "valid mode 4b with shared secret",
-			mode:    "4b",
-			config:  Transport{Mode: "4b", Mode4b: Mode4bConfig{SharedSecret: "test", AEADMode: "chacha20poly1305", BatchSize: 32, TCPFingerprint: "linux"}},
+			name:    "valid mode TCP+ with shared secret",
+			mode:    "TCP+",
+			config:  Transport{Mode: "TCP+", Mode4b: Mode4bConfig{SharedSecret: "test", AEADMode: "chacha20poly1305", BatchSize: 32, TCPFingerprint: "linux"}},
 			wantErr: false,
 		},
 		{
-			name:    "valid mode 4c",
-			mode:    "4c",
-			config:  Transport{Mode: "4c", Mode4c: DefaultMode4cConfig()},
+			name:    "valid mode TLS+",
+			mode:    "TLS+",
+			config:  Transport{Mode: "TLS+", Mode4c: DefaultMode4cConfig()},
 			wantErr: false,
 		},
 		{
-			name:    "valid mode 4d",
-			mode:    "4d",
-			config:  Transport{Mode: "4d", Mode4d: DefaultMode4dConfig()},
+			name:    "valid mode UDP+",
+			mode:    "UDP+",
+			config:  Transport{Mode: "UDP+", Mode4d: DefaultMode4dConfig()},
 			wantErr: false,
 		},
 		{
-			name:    "valid mode 4e",
-			mode:    "4e",
-			config:  Transport{Mode: "4e", Mode4e: DefaultMode4eConfig()},
+			name:    "valid mode TLS",
+			mode:    "TLS",
+			config:  Transport{Mode: "TLS", Mode4e: DefaultMode4eConfig()},
 			wantErr: false,
 		},
 		{
@@ -99,10 +99,10 @@ func TestValidateMode(t *testing.T) {
 			mode:    "invalid",
 			config:  Transport{Mode: "invalid"},
 			wantErr: true,
-			errMsg:  "transport.mode must be one of: 4a, 4b, 4c, 4d, 4e",
+			errMsg:  "transport.mode must be one of: HTTP+, TCP+, TLS+, UDP+, TLS",
 		},
 		{
-			name:    "empty mode defaults to 4a",
+			name:    "empty mode defaults to HTTP+",
 			mode:    "",
 			config:  Transport{Mode: "", Mode4a: DefaultMode4aConfig()},
 			wantErr: false,
@@ -125,7 +125,7 @@ func TestValidateMode(t *testing.T) {
 	}
 }
 
-// TestValidateMode4a tests Mode 4a validation.
+// TestValidateMode4a tests Mode HTTP+ validation.
 func TestValidateMode4a(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -221,7 +221,7 @@ func TestValidateMode4a(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
 				Transport: Transport{
-					Mode:   "4a",
+					Mode:   "HTTP+",
 					Mode4a: tt.config,
 				},
 			}
@@ -236,7 +236,7 @@ func TestValidateMode4a(t *testing.T) {
 	}
 }
 
-// TestValidateMode4b tests Mode 4b validation.
+// TestValidateMode4b tests Mode TCP+ validation.
 func TestValidateMode4b(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -314,7 +314,7 @@ func TestValidateMode4b(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
 				Transport: Transport{
-					Mode:   "4b",
+					Mode:   "TCP+",
 					Mode4b: tt.config,
 				},
 			}
@@ -329,7 +329,7 @@ func TestValidateMode4b(t *testing.T) {
 	}
 }
 
-// TestValidateMode4c tests Mode 4c validation.
+// TestValidateMode4c tests Mode TLS+ validation.
 func TestValidateMode4c(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -403,7 +403,7 @@ func TestValidateMode4c(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
 				Transport: Transport{
-					Mode:   "4c",
+					Mode:   "TLS+",
 					Mode4c: tt.config,
 				},
 			}
@@ -418,7 +418,7 @@ func TestValidateMode4c(t *testing.T) {
 	}
 }
 
-// TestValidateMode4d tests Mode 4d validation.
+// TestValidateMode4d tests Mode UDP+ validation.
 func TestValidateMode4d(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -479,7 +479,7 @@ func TestValidateMode4d(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
 				Transport: Transport{
-					Mode:   "4d",
+					Mode:   "UDP+",
 					Mode4d: tt.config,
 				},
 			}
@@ -494,7 +494,7 @@ func TestValidateMode4d(t *testing.T) {
 	}
 }
 
-// TestValidateMode4e tests Mode 4e validation.
+// TestValidateMode4e tests Mode TLS validation.
 func TestValidateMode4e(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -532,7 +532,7 @@ func TestValidateMode4e(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
 				Transport: Transport{
-					Mode:   "4e",
+					Mode:   "TLS",
 					Mode4e: tt.config,
 				},
 			}
@@ -552,7 +552,7 @@ func TestGetModeConfig(t *testing.T) {
 	t.Run("GetMode4aConfig applies defaults", func(t *testing.T) {
 		cfg := &Config{
 			Transport: Transport{
-				Mode: "4a",
+				Mode: "HTTP+",
 				Mode4a: Mode4aConfig{
 					SessionPlacement: "query",
 					// Other fields left empty to test defaults
@@ -569,7 +569,7 @@ func TestGetModeConfig(t *testing.T) {
 	t.Run("GetMode4bConfig applies defaults", func(t *testing.T) {
 		cfg := &Config{
 			Transport: Transport{
-				Mode: "4b",
+				Mode: "TCP+",
 				Mode4b: Mode4bConfig{
 					SharedSecret: "test-secret",
 					// Other fields left empty to test defaults
@@ -586,7 +586,7 @@ func TestGetModeConfig(t *testing.T) {
 	t.Run("GetMode4cConfig applies defaults", func(t *testing.T) {
 		cfg := &Config{
 			Transport: Transport{
-				Mode: "4c",
+				Mode: "TLS+",
 				Mode4c: Mode4cConfig{
 					REALITYEnabled: true,
 					// Other fields left empty to test defaults
@@ -604,7 +604,7 @@ func TestGetModeConfig(t *testing.T) {
 	t.Run("GetMode4dConfig applies defaults", func(t *testing.T) {
 		cfg := &Config{
 			Transport: Transport{
-				Mode: "4d",
+				Mode: "UDP+",
 				Mode4d: Mode4dConfig{
 					BrutalEnabled: true,
 					// Other fields left empty to test defaults
@@ -622,7 +622,7 @@ func TestGetModeConfig(t *testing.T) {
 	t.Run("GetMode4eConfig applies defaults", func(t *testing.T) {
 		cfg := &Config{
 			Transport: Transport{
-				Mode: "4e",
+				Mode: "TLS",
 				Mode4e: Mode4eConfig{
 					CSTPEnabled: true,
 					// Other fields left empty to test defaults

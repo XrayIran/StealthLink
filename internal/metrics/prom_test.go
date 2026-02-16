@@ -23,7 +23,15 @@ func seedAllMetrics() {
 	IncRawDrop()
 	IncUQSPReassemblyEviction()
 	SetUnderlaySelected("warp")
+	SetActivePathVariant("UDP+")
 	SetWARPHealth("up")
+	IncPathPolicyWinnerSelection("warp")
+	IncPathPolicyWinnerSelection("direct")
+	IncPathPolicyRerace()
+	ObservePathPolicyDialLatency("warp", 20*time.Millisecond)
+	ObservePathPolicyDialLatency("warp", 40*time.Millisecond)
+	ObservePathPolicyDialLatency("warp", 80*time.Millisecond)
+	ObservePathPolicyDialLatency("direct", 10*time.Millisecond)
 	IncReverseReconnectAttempts()
 	IncReverseConnectionsActive()
 	IncTransportSession("quic")
@@ -52,8 +60,12 @@ func seedAllMetrics() {
 	IncSmuxShaperStarvationPreventions()
 	SetPoolSize(50)
 	SetPoolUtilization(0.75)
+	ObservePoolWaitTime(25 * time.Millisecond)
 	IncPoolAdjustment("up")
 	IncPoolAdjustment("down")
+	IncReverseAuthRejects()
+	IncHandshakeFailure()
+	IncDeprecatedLegacyMode()
 	RecordCarrierConnection("quic")
 	RecordCarrierConnection("kcp")
 	RecordCarrierTraffic("quic", 1000, 2000)
@@ -91,9 +103,16 @@ func TestPromHandler_AllMetricsPresent(t *testing.T) {
 		"stealthlink_raw_drops_total",
 		"stealthlink_uqsp_reassembly_evictions_total",
 		"stealthlink_underlay_selected",
+		"stealthlink_active_path_variant",
 		"stealthlink_warp_health",
+		"stealthlink_path_policy_winner_selections_total",
+		"stealthlink_path_policy_reraces_total",
+		"stealthlink_path_policy_dial_latency_ms",
 		"stealthlink_reverse_reconnect_attempts_total",
 		"stealthlink_reverse_connections_active",
+		"stealthlink_reverse_auth_rejects_total",
+		"stealthlink_handshake_failures_total",
+		"stealthlink_deprecated_legacy_mode_total",
 		"stealthlink_transport_sessions_active",
 		"stealthlink_xmux_connection_reuses_total",
 		"stealthlink_xmux_connection_rotations_total",
@@ -117,6 +136,7 @@ func TestPromHandler_AllMetricsPresent(t *testing.T) {
 		"stealthlink_smux_shaper_starvation_preventions_total",
 		"stealthlink_pool_size",
 		"stealthlink_pool_utilization",
+		"stealthlink_pool_wait_time_ms",
 		"stealthlink_pool_adjustments_total",
 		"stealthlink_tcp_average_rtt_ms",
 		"stealthlink_tcp_loss_events_total",
@@ -142,7 +162,12 @@ func TestPromHandler_AllMetricsPresent(t *testing.T) {
 		contains string
 	}{
 		{`stealthlink_underlay_selected{type="warp"}`, "1"},
+		{`stealthlink_active_path_variant{variant="UDP+"}`, "1"},
 		{`stealthlink_warp_health{status="up"}`, "1"},
+		{`stealthlink_path_policy_winner_selections_total{candidate="warp"}`, ""},
+		{`stealthlink_path_policy_reraces_total`, ""},
+		{`stealthlink_path_policy_dial_latency_ms{candidate="warp",quantile="0.50"}`, ""},
+		{`stealthlink_path_policy_dial_latency_ms{candidate="warp",quantile="0.95"}`, ""},
 		{`stealthlink_xmux_connection_rotations_total{reason="max_age"}`, ""},
 		{`stealthlink_xmux_connection_rotations_total{reason="idle"}`, ""},
 		{`stealthlink_faketcp_encrypted_bytes_total{direction="tx"}`, "512"},
@@ -198,8 +223,16 @@ func TestPromHandler_HelpAndTypeHeaders(t *testing.T) {
 		"# TYPE stealthlink_sockets_open gauge",
 		"# HELP stealthlink_underlay_selected",
 		"# TYPE stealthlink_underlay_selected gauge",
+		"# HELP stealthlink_active_path_variant",
+		"# TYPE stealthlink_active_path_variant gauge",
 		"# HELP stealthlink_warp_health",
 		"# TYPE stealthlink_warp_health gauge",
+		"# HELP stealthlink_path_policy_winner_selections_total",
+		"# TYPE stealthlink_path_policy_winner_selections_total counter",
+		"# HELP stealthlink_path_policy_reraces_total",
+		"# TYPE stealthlink_path_policy_reraces_total counter",
+		"# HELP stealthlink_path_policy_dial_latency_ms",
+		"# TYPE stealthlink_path_policy_dial_latency_ms gauge",
 		"# HELP stealthlink_reverse_reconnect_attempts_total",
 		"# TYPE stealthlink_reverse_reconnect_attempts_total counter",
 		"# HELP stealthlink_xmux_connection_reuses_total",
@@ -210,6 +243,8 @@ func TestPromHandler_HelpAndTypeHeaders(t *testing.T) {
 		"# TYPE stealthlink_kcp_fec_data_shards gauge",
 		"# HELP stealthlink_pool_size",
 		"# TYPE stealthlink_pool_size gauge",
+		"# HELP stealthlink_pool_wait_time_ms",
+		"# TYPE stealthlink_pool_wait_time_ms gauge",
 		"# HELP stealthlink_tcp_average_rtt_ms",
 		"# TYPE stealthlink_tcp_average_rtt_ms gauge",
 	}

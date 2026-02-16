@@ -156,10 +156,10 @@ metrics:
   listen: "127.0.0.1:9090"
   auth_token: ""
 
-# VPN Configuration (TUN/TAP mode for full VPN tunneling)
+# VPN Configuration (TUN mode for full L3 VPN tunneling)
 vpn:
-  enabled: false          # Enable VPN mode for full TUN/TAP tunneling
-  mode: tun               # "tun" (layer 3, IP) or "tap" (layer 2, Ethernet)
+  enabled: false          # Enable VPN mode for full TUN tunneling (L3-only)
+  mode: tun               # "tun" (layer 3, IP)
   name: "stealth0"        # Interface name
   interface_ip: "10.0.0.1/24"  # Local VPN IP with CIDR
   peer_ip: "10.0.0.2"     # Remote peer VPN IP (point-to-point)
@@ -178,7 +178,7 @@ warp:
   endpoint: "engage.cloudflareclient.com:2408"
   routing_mode: vpn_only  # "all" or "vpn_only" (only VPN return traffic)
 
-# Example Method 4a: XHTTP + Domain Fronting + ECH + Vision
+# Example Method HTTP+: XHTTP + Domain Fronting + ECH + Vision
 # transport:
 #   uqsp:
 #     carrier:
@@ -205,7 +205,7 @@ warp:
 #         min_delay: 10
 #         max_delay: 50
 
-# Example Method 4c: XHTTP + REALITY + Vision + mldsa65
+# Example Method TLS+: XHTTP + REALITY + Vision + mldsa65
 # transport:
 #   uqsp:
 #     carrier:
@@ -224,7 +224,7 @@ warp:
 #     security:
 #       pq_kem: true  # Enable post-quantum key exchange
 
-# Example Method 4d: UDP with Brutal CC + Salamander obfuscation
+# Example Method UDP+: UDP with Brutal CC + Salamander obfuscation
 # transport:
 #   uqsp:
 #     congestion:
@@ -240,7 +240,7 @@ warp:
 #         junk_min_size: 64
 #         junk_max_size: 1024
 
-# Example Method 4e: TLS-based tunnel (WebTunnel/TrustTunnel)
+# Example Method TLS: TLS-based tunnel (WebTunnel/TrustTunnel)
 # transport:
 #   uqsp:
 #     carrier:

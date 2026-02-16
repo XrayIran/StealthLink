@@ -12,6 +12,7 @@ VERSION=""
 SKIP_DASHBOARD=0
 SKIP_RUST=0
 SKIP_PYTHON=0
+LENIENT=0
 
 die() { echo "[ERR] $*" >&2; exit 1; }
 
@@ -21,6 +22,7 @@ while [[ $# -gt 0 ]]; do
         --skip-dashboard) SKIP_DASHBOARD=1; shift ;;
         --skip-rust) SKIP_RUST=1; shift ;;
         --skip-python) SKIP_PYTHON=1; shift ;;
+        --lenient) LENIENT=1; shift ;;
         -h|--help)
             cat <<EOF
 Usage: build-release-zip.sh [OPTIONS]
@@ -30,6 +32,7 @@ Options:
   --skip-dashboard     Skip TypeScript dashboard build
   --skip-rust          Skip Rust crypto build
   --skip-python        Skip Python validation
+  --lenient            Continue on vet/rust/python validation failures
   --help               Show this help
 
 EOF
@@ -129,7 +132,13 @@ echo "=========================================="
 echo ""
 
 echo "[1/8] Validating Go sources..."
-go vet ./... 2>/dev/null || true
+if ! go vet ./...; then
+    if [[ "${LENIENT}" == "1" ]]; then
+        echo "  (go vet failed, continuing due to --lenient)"
+    else
+        die "go vet failed (use --lenient to continue)"
+    fi
+fi
 
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 BUILDTIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -148,7 +157,13 @@ echo "  -> stealthlink-ctl (installer script)"
 if [[ "${SKIP_RUST}" == "0" ]]; then
     echo "[3/8] Building Rust crypto..."
     if command -v cargo >/dev/null 2>&1; then
-        ./scripts/build-rust-crypto.sh 2>/dev/null || echo "  (Rust build failed, continuing)"
+        if ! ./scripts/build-rust-crypto.sh; then
+            if [[ "${LENIENT}" == "1" ]]; then
+                echo "  (Rust build failed, continuing due to --lenient)"
+            else
+                die "Rust build failed (use --lenient to continue)"
+            fi
+        fi
         mkdir -p "${STAGE_DIR}/rust/stealthlink-crypto/src"
         cp rust/stealthlink-crypto/Cargo.toml "${STAGE_DIR}/rust/stealthlink-crypto/" 2>/dev/null || true
         cp rust/stealthlink-crypto/Cargo.lock "${STAGE_DIR}/rust/stealthlink-crypto/" 2>/dev/null || true
@@ -192,7 +207,13 @@ fi
 if [[ "${SKIP_PYTHON}" == "0" ]]; then
     echo "[5/8] Validating Python tools..."
     if [[ -d tools ]]; then
-        python3 -m py_compile tools/*.py 2>/dev/null || echo "  (Python validation failed, continuing)"
+        if ! python3 -m py_compile tools/*.py; then
+            if [[ "${LENIENT}" == "1" ]]; then
+                echo "  (Python validation failed, continuing due to --lenient)"
+            else
+                die "Python validation failed (use --lenient to continue)"
+            fi
+        fi
     fi
 else
     echo "[5/8] Skipping Python validation (requested)"

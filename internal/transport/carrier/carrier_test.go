@@ -113,7 +113,7 @@ func TestCarrierInterface(t *testing.T) {
 
 	// Test Configure
 	config := CarrierConfig{
-		Mode: "4a",
+		Mode: "HTTP+",
 		MTU:  1500,
 	}
 	if err := carrier.Configure(config); err != nil {
@@ -243,7 +243,7 @@ func TestCarrierCapabilities(t *testing.T) {
 		caps CarrierCapabilities
 	}{
 		{
-			name: "mode 4a capabilities",
+			name: "mode HTTP+ capabilities",
 			caps: CarrierCapabilities{
 				StreamOriented: true,
 				ZeroRTT:        true,
@@ -251,14 +251,14 @@ func TestCarrierCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "mode 4b capabilities",
+			name: "mode TCP+ capabilities",
 			caps: CarrierCapabilities{
 				ReplayProtection: true,
 				ServerInitiated:  true,
 			},
 		},
 		{
-			name: "mode 4c capabilities",
+			name: "mode TLS+ capabilities",
 			caps: CarrierCapabilities{
 				StreamOriented: true,
 				ZeroRTT:        true,
@@ -266,7 +266,7 @@ func TestCarrierCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "mode 4d capabilities",
+			name: "mode UDP+ capabilities",
 			caps: CarrierCapabilities{
 				StreamOriented: true,
 				ZeroRTT:        true,
@@ -275,7 +275,7 @@ func TestCarrierCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "mode 4e capabilities",
+			name: "mode TLS capabilities",
 			caps: CarrierCapabilities{
 				StreamOriented:  true,
 				ZeroRTT:         true,
@@ -302,7 +302,7 @@ func TestCarrierCapabilities(t *testing.T) {
 // TestCarrierConfig verifies configuration structure.
 func TestCarrierConfig(t *testing.T) {
 	config := CarrierConfig{
-		Mode:              "4a",
+		Mode:              "HTTP+",
 		MTU:               1500,
 		CongestionControl: "cubic",
 		Reliability:       "none",
@@ -330,8 +330,8 @@ func TestCarrierConfig(t *testing.T) {
 	}
 
 	// Verify all fields are accessible
-	if config.Mode != "4a" {
-		t.Errorf("Mode = %s, want 4a", config.Mode)
+	if config.Mode != "HTTP+" {
+		t.Errorf("Mode = %s, want HTTP+", config.Mode)
 	}
 	if config.MTU != 1500 {
 		t.Errorf("MTU = %d, want 1500", config.MTU)

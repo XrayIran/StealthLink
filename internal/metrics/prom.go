@@ -88,6 +88,16 @@ func PromHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "stealthlink_underlay_selected{type=%q} %d\n", t, v)
 	}
 
+	fmt.Fprintf(w, "# HELP stealthlink_active_path_variant Currently active UQSP path variant (1=active)\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_active_path_variant gauge\n")
+	for _, variant := range []string{"HTTP+", "TCP+", "TLS+", "UDP+", "TLS", "legacy", "unknown"} {
+		v := 0
+		if st.ActivePathVariant == variant {
+			v = 1
+		}
+		fmt.Fprintf(w, "stealthlink_active_path_variant{variant=%q} %d\n", variant, v)
+	}
+
 	fmt.Fprintf(w, "# HELP stealthlink_warp_health Current WARP health (1=active)\n")
 	fmt.Fprintf(w, "# TYPE stealthlink_warp_health gauge\n")
 	for _, s := range []string{"up", "down"} {
@@ -98,6 +108,23 @@ func PromHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "stealthlink_warp_health{status=%q} %d\n", s, v)
 	}
 
+	fmt.Fprintf(w, "# HELP stealthlink_path_policy_winner_selections_total Total winner selections per path-policy candidate\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_path_policy_winner_selections_total counter\n")
+	for candidate, n := range st.PathPolicyWinnerSelectionsTotal {
+		fmt.Fprintf(w, "stealthlink_path_policy_winner_selections_total{candidate=%q} %d\n", candidate, n)
+	}
+
+	fmt.Fprintf(w, "# HELP stealthlink_path_policy_reraces_total Total path-policy re-races\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_path_policy_reraces_total counter\n")
+	fmt.Fprintf(w, "stealthlink_path_policy_reraces_total %d\n", st.PathPolicyReracesTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_path_policy_dial_latency_ms Path-policy dial latency quantiles by candidate\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_path_policy_dial_latency_ms gauge\n")
+	for candidate, q := range st.PathPolicyDialLatencyMs {
+		fmt.Fprintf(w, "stealthlink_path_policy_dial_latency_ms{candidate=%q,quantile=%q} %.3f\n", candidate, "0.50", q.P50Ms)
+		fmt.Fprintf(w, "stealthlink_path_policy_dial_latency_ms{candidate=%q,quantile=%q} %.3f\n", candidate, "0.95", q.P95Ms)
+	}
+
 	// Reverse mode metrics
 	fmt.Fprintf(w, "# HELP stealthlink_reverse_reconnect_attempts_total Total reverse reconnect attempts\n")
 	fmt.Fprintf(w, "# TYPE stealthlink_reverse_reconnect_attempts_total counter\n")
@@ -106,6 +133,18 @@ func PromHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP stealthlink_reverse_connections_active Current active reverse connections\n")
 	fmt.Fprintf(w, "# TYPE stealthlink_reverse_connections_active gauge\n")
 	fmt.Fprintf(w, "stealthlink_reverse_connections_active %d\n", st.ReverseConnectionsActive)
+
+	fmt.Fprintf(w, "# HELP stealthlink_reverse_auth_rejects_total Total reverse authentication rejects\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_reverse_auth_rejects_total counter\n")
+	fmt.Fprintf(w, "stealthlink_reverse_auth_rejects_total %d\n", st.ReverseAuthRejectsTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_handshake_failures_total Total failed handshakes\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_handshake_failures_total counter\n")
+	fmt.Fprintf(w, "stealthlink_handshake_failures_total %d\n", st.HandshakeFailuresTotal)
+
+	fmt.Fprintf(w, "# HELP stealthlink_deprecated_legacy_mode_total Total legacy-mode deprecation hits\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_deprecated_legacy_mode_total counter\n")
+	fmt.Fprintf(w, "stealthlink_deprecated_legacy_mode_total %d\n", st.DeprecatedLegacyModeTotal)
 
 	for name, n := range st.TransportSessions {
 		fmt.Fprintf(w, "stealthlink_transport_sessions_active{transport=%q} %d\n", name, n)
@@ -213,6 +252,10 @@ func PromHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP stealthlink_pool_utilization Connection pool utilization ratio\n")
 	fmt.Fprintf(w, "# TYPE stealthlink_pool_utilization gauge\n")
 	fmt.Fprintf(w, "stealthlink_pool_utilization %.3f\n", st.PoolUtilization)
+
+	fmt.Fprintf(w, "# HELP stealthlink_pool_wait_time_ms Last observed connection pool wait time in milliseconds\n")
+	fmt.Fprintf(w, "# TYPE stealthlink_pool_wait_time_ms gauge\n")
+	fmt.Fprintf(w, "stealthlink_pool_wait_time_ms %d\n", st.PoolWaitTimeMs)
 
 	fmt.Fprintf(w, "# HELP stealthlink_pool_adjustments_total Total connection pool adjustments by direction\n")
 	fmt.Fprintf(w, "# TYPE stealthlink_pool_adjustments_total counter\n")

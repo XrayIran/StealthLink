@@ -22,7 +22,7 @@ func TestUQSPConfigLoad(t *testing.T) {
 			if tc.body != "" {
 				uqspConfig = "    " + tc.body
 			}
-			path := writeCfg(t, "role: agent\nagent:\n  id: a1\n  gateway_addr: \"127.0.0.1:8443\"\ntransport:\n  type: uqsp\n  uqsp:\n"+uqspConfig+"\nsecurity:\n  shared_key: \"k\"\nservices:\n  - name: svc\n    protocol: tcp\n    target: \"127.0.0.1:22\"\n")
+			path := writeCfg(t, "role: agent\nagent:\n  id: a1\n  gateway_addr: \"203.0.113.1:8443\"\ntransport:\n  type: uqsp\n  uqsp:\n"+uqspConfig+"\nsecurity:\n  shared_key: \"k\"\nservices:\n  - name: svc\n    protocol: tcp\n    target: \"127.0.0.1:22\"\n")
 			if _, err := Load(path); err != nil {
 				t.Fatalf("unexpected load error: %v", err)
 			}
@@ -37,40 +37,40 @@ func TestUQSPValidation(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "valid-defaults",
-			body: "transport:\n  type: uqsp\n  uqsp: {}",
+			name:    "valid-defaults",
+			body:    "transport:\n  type: uqsp\n  uqsp: {}",
 			wantErr: false,
 		},
 		{
-			name: "invalid-auth-mode",
-			body: "transport:\n  type: uqsp\n  uqsp:\n    handshake:\n      auth_mode: invalid",
+			name:    "invalid-auth-mode",
+			body:    "transport:\n  type: uqsp\n  uqsp:\n    handshake:\n      auth_mode: invalid",
 			wantErr: true,
 		},
 		{
-			name: "invalid-congestion-algorithm",
-			body: "transport:\n  type: uqsp\n  uqsp:\n    congestion:\n      algorithm: invalid",
+			name:    "invalid-congestion-algorithm",
+			body:    "transport:\n  type: uqsp\n  uqsp:\n    congestion:\n      algorithm: invalid",
 			wantErr: true,
 		},
 		{
-			name: "invalid-relay-mode",
-			body: "transport:\n  type: uqsp\n  uqsp:\n    datagrams:\n      relay_mode: invalid",
+			name:    "invalid-relay-mode",
+			body:    "transport:\n  type: uqsp\n  uqsp:\n    datagrams:\n      relay_mode: invalid",
 			wantErr: true,
 		},
 		{
-			name: "salamander-without-key",
-			body: "transport:\n  type: uqsp\n  uqsp:\n    obfuscation:\n      profile: salamander",
+			name:    "salamander-without-key",
+			body:    "transport:\n  type: uqsp\n  uqsp:\n    obfuscation:\n      profile: salamander",
 			wantErr: true,
 		},
 		{
-			name: "valid-salamander",
-			body: "transport:\n  type: uqsp\n  uqsp:\n    obfuscation:\n      profile: salamander\n      salamander_key: testkey123",
+			name:    "valid-salamander",
+			body:    "transport:\n  type: uqsp\n  uqsp:\n    obfuscation:\n      profile: salamander\n      salamander_key: testkey123",
 			wantErr: false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			path := writeCfg(t, "role: agent\nagent:\n  id: a1\n  gateway_addr: \"127.0.0.1:8443\"\n"+tc.body+"\nsecurity:\n  shared_key: \"k\"\nservices:\n  - name: svc\n    protocol: tcp\n    target: \"127.0.0.1:22\"\n")
+			path := writeCfg(t, "role: agent\nagent:\n  id: a1\n  gateway_addr: \"203.0.113.1:8443\"\n"+tc.body+"\nsecurity:\n  shared_key: \"k\"\nservices:\n  - name: svc\n    protocol: tcp\n    target: \"127.0.0.1:22\"\n")
 			_, err := Load(path)
 			if tc.wantErr {
 				if err == nil {
@@ -98,7 +98,7 @@ func TestLegacyStealthRejected(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			path := writeCfg(t, "role: agent\nagent:\n  id: a1\n  gateway_addr: \"127.0.0.1:8443\"\ntransport:\n  "+tc.body+"\nsecurity:\n  shared_key: \"k\"\nservices:\n  - name: svc\n    protocol: tcp\n    target: \"127.0.0.1:22\"\n")
+			path := writeCfg(t, "role: agent\nagent:\n  id: a1\n  gateway_addr: \"203.0.113.1:8443\"\ntransport:\n  "+tc.body+"\nsecurity:\n  shared_key: \"k\"\nservices:\n  - name: svc\n    protocol: tcp\n    target: \"127.0.0.1:22\"\n")
 			_, err := Load(path)
 			if err == nil {
 				t.Fatalf("expected error for legacy stealth config, got nil")

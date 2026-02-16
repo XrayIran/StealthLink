@@ -358,10 +358,6 @@ type dnsForwarderKey struct {
 }
 
 func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
-	return c.HandleWithResponseWriter_(dnsMessage, req, nil)
-}
-
-func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	if c.log.IsLevelEnabled(logrus.TraceLevel) && len(dnsMessage.Question) > 0 {
 		q := dnsMessage.Question[0]
 		c.log.Tracef("Received UDP(DNS) %v <-> %v: %v %v",
@@ -385,10 +381,10 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 	switch qtype {
 	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 		if c.qtypePrefer == 0 {
-			return c.handleWithResponseWriter_(dnsMessage, req, true, responseWriter)
+			return c.handle_(dnsMessage, req, true)
 		}
 	default:
-		return c.handleWithResponseWriter_(dnsMessage, req, true, responseWriter)
+		return c.handle_(dnsMessage, req, true)
 	}
 
 	// Try to make both A and AAAA lookups.
@@ -407,10 +403,10 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 
 	done := make(chan struct{})
 	go func() {
-		_ = c.handleWithResponseWriter_(dnsMessage2, req, false, responseWriter)
+		_ = c.handle_(dnsMessage2, req, false)
 		done <- struct{}{}
 	}()
-	err = c.handleWithResponseWriter_(dnsMessage, req, false, responseWriter)
+	err = c.handle_(dnsMessage, req, false)
 	<-done
 	if err != nil {
 		return err
@@ -423,21 +419,14 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 		c.log.WithFields(logrus.Fields{
 			"qname": qname,
 		}).Tracef("Reject %v due to resp not valid", qtype)
-		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+		return c.sendReject_(dnsMessage, req)
 	}
 	// resp is valid.
 	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
 	if c.qtypePrefer == qtype || cache2 == nil || !cache2.IncludeAnyIp() {
-		if responseWriter != nil {
-			var respMsg dnsmessage.Msg
-			if err = respMsg.Unpack(resp); err != nil {
-				return fmt.Errorf("failed to unpack DNS response: %w", err)
-			}
-			return responseWriter.WriteMsg(&respMsg)
-		}
 		return sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn)
 	} else {
-		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+		return c.sendReject_(dnsMessage, req)
 	}
 }
 
@@ -445,15 +434,6 @@ func (c *DnsController) handle_(
 	dnsMessage *dnsmessage.Msg,
 	req *udpRequest,
 	needResp bool,
-) (err error) {
-	return c.handleWithResponseWriter_(dnsMessage, req, needResp, nil)
-}
-
-func (c *DnsController) handleWithResponseWriter_(
-	dnsMessage *dnsmessage.Msg,
-	req *udpRequest,
-	needResp bool,
-	responseWriter dnsmessage.ResponseWriter,
 ) (err error) {
 	// Prepare qname, qtype.
 	var qname string
@@ -475,7 +455,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
 		// Reject with empty answer.
 		c.RemoveDnsRespCache(cacheKey)
-		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+		return c.sendReject_(dnsMessage, req)
 	}
 
 	// No parallel for the same lookup.
@@ -494,13 +474,6 @@ func (c *DnsController) handleWithResponseWriter_(
 	if resp := c.LookupDnsRespCache_(dnsMessage, cacheKey, false); resp != nil {
 		// Send cache to client directly.
 		if needResp {
-			if responseWriter != nil {
-				var respMsg dnsmessage.Msg
-				if err = respMsg.Unpack(resp); err != nil {
-					return fmt.Errorf("failed to unpack DNS response: %w", err)
-				}
-				return responseWriter.WriteMsg(&respMsg)
-			}
 			if err = sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
 				return fmt.Errorf("failed to write cached DNS resp: %w", err)
 			}
@@ -545,32 +518,6 @@ func (c *DnsController) sendReject_(dnsMessage *dnsmessage.Msg, req *udpRequest)
 		c.log.WithFields(logrus.Fields{
 			"question": dnsMessage.Question,
 		}).Traceln("Reject")
-	}
-	data, err := dnsMessage.Pack()
-	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
-	}
-	if err = sendPkt(c.log, data, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
-		return err
-	}
-	return nil
-}
-
-// sendRejectWithResponseWriter_ send empty answer using response writer.
-func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
-	dnsMessage.Answer = nil
-	dnsMessage.Rcode = dnsmessage.RcodeSuccess
-	dnsMessage.Response = true
-	dnsMessage.RecursionAvailable = true
-	dnsMessage.Truncated = false
-	dnsMessage.Compress = true
-	if c.log.IsLevelEnabled(logrus.TraceLevel) {
-		c.log.WithFields(logrus.Fields{
-			"question": dnsMessage.Question,
-		}).Traceln("Reject")
-	}
-	if responseWriter != nil {
-		return responseWriter.WriteMsg(dnsMessage)
 	}
 	data, err := dnsMessage.Pack()
 	if err != nil {

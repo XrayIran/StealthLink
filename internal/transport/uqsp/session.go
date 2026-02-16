@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -63,39 +64,39 @@ type SessionManager struct {
 // Config holds UQSP session configuration
 type Config struct {
 	// Stream configuration
-	MaxConcurrentStreams    int
-	FlowControlWindow       int
-	MaxIncomingStreams      int64
-	MaxIncomingUniStreams   int64
+	MaxConcurrentStreams  int
+	FlowControlWindow     int
+	MaxIncomingStreams    int64
+	MaxIncomingUniStreams int64
 
 	// Datagram configuration
-	MaxDatagramSize         int
-	EnableFragmentation     bool
-	MaxIncomingDatagrams    int
+	MaxDatagramSize      int
+	EnableFragmentation  bool
+	MaxIncomingDatagrams int
 
 	// Timeouts
-	HandshakeTimeout        time.Duration
-	MaxIdleTimeout          time.Duration
-	KeepAlivePeriod         time.Duration
+	HandshakeTimeout time.Duration
+	MaxIdleTimeout   time.Duration
+	KeepAlivePeriod  time.Duration
 
 	// Capabilities
-	Capabilities            CapabilityFlag
+	Capabilities CapabilityFlag
 }
 
 // DefaultConfig returns a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		MaxConcurrentStreams:    100,
-		FlowControlWindow:       1048576,
-		MaxIncomingStreams:      1024,
-		MaxIncomingUniStreams:   128,
-		MaxDatagramSize:         1350,
-		EnableFragmentation:     true,
-		MaxIncomingDatagrams:    1024,
-		HandshakeTimeout:        DefaultHandshakeTimeout,
-		MaxIdleTimeout:          DefaultMaxIdleTimeout,
-		KeepAlivePeriod:         DefaultKeepAlivePeriod,
-		Capabilities:            CapabilityDatagram | CapabilityCapsule | Capability0RTT,
+		MaxConcurrentStreams:  100,
+		FlowControlWindow:     1048576,
+		MaxIncomingStreams:    1024,
+		MaxIncomingUniStreams: 128,
+		MaxDatagramSize:       1350,
+		EnableFragmentation:   true,
+		MaxIncomingDatagrams:  1024,
+		HandshakeTimeout:      DefaultHandshakeTimeout,
+		MaxIdleTimeout:        DefaultMaxIdleTimeout,
+		KeepAlivePeriod:       DefaultKeepAlivePeriod,
+		Capabilities:          CapabilityDatagram | CapabilityCapsule | Capability0RTT,
 	}
 }
 
@@ -151,6 +152,15 @@ func (sm *SessionManager) Start() error {
 		return fmt.Errorf("control stream: %w", err)
 	}
 	sm.controlStream = cs
+
+	// Control frames are required for UDP session lifecycle, and also act as a
+	// fallback datagram carrier when native QUIC datagrams aren't available.
+	go sm.controlReadLoop()
+
+	// Native QUIC datagrams, if negotiated.
+	if sm.config != nil && sm.config.Capabilities.Has(CapabilityDatagram) {
+		go sm.datagramReadLoop()
+	}
 
 	// Start keepalive
 	go sm.keepaliveLoop()
@@ -380,7 +390,10 @@ func (sm *SessionManager) ReceiveDatagram(sessionID uint32) (*UDPDatagram, error
 	}
 
 	select {
-	case dg := <-sess.datagramCh:
+	case dg, ok := <-sess.datagramCh:
+		if !ok || dg == nil {
+			return nil, ErrSessionClosed
+		}
 		return dg, nil
 	case <-sm.ctx.Done():
 		return nil, ErrSessionClosed
@@ -482,6 +495,125 @@ func (sm *SessionManager) handleDatagram(data []byte) {
 	}
 }
 
+func (sm *SessionManager) controlReadLoop() {
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		default:
+		}
+
+		// Read frame header (fixed 11 bytes).
+		var hb [11]byte
+		if _, err := io.ReadFull(sm.controlStream.stream, hb[:]); err != nil {
+			return
+		}
+		h := &FrameHeader{}
+		if err := h.Decode(hb[:]); err != nil {
+			return
+		}
+
+		if h.Length == 0 {
+			// Heartbeat.
+			continue
+		}
+
+		payload := make([]byte, h.Length)
+		if _, err := io.ReadFull(sm.controlStream.stream, payload); err != nil {
+			return
+		}
+
+		switch h.Type {
+		case FrameTypeControl, FrameTypeClose:
+			cp := &ControlPayload{}
+			if err := cp.Decode(payload); err != nil {
+				continue
+			}
+			sm.handleControlPayload(cp)
+		default:
+			// Ignore.
+		}
+	}
+}
+
+func (sm *SessionManager) handleControlPayload(cp *ControlPayload) {
+	switch cp.ControlType {
+	case ControlTypeOpenUDPSession:
+		info := &UDPSessionInfo{}
+		if err := info.Decode(cp.Data); err != nil {
+			return
+		}
+		addr, err := net.ResolveUDPAddr("udp", info.TargetAddr)
+		if err != nil {
+			return
+		}
+
+		sm.udpSessionMu.Lock()
+		defer sm.udpSessionMu.Unlock()
+
+		// Idempotent open (peer may retransmit / reconnect).
+		if _, exists := sm.udpSessions[info.SessionID]; exists {
+			return
+		}
+		if info.SessionID >= sm.nextSessionID {
+			sm.nextSessionID = info.SessionID + 1
+		}
+
+		sess := &udpSession{
+			id:         info.SessionID,
+			targetAddr: addr,
+			contextID:  info.ContextID,
+			createdAt:  time.Now(),
+			lastActive: time.Now(),
+			datagramCh: make(chan *UDPDatagram, sm.config.MaxIncomingDatagrams),
+			onClose: func() {
+				if sm.onUDPSessionClose != nil {
+					sm.onUDPSessionClose()
+				}
+			},
+		}
+		sm.udpSessions[info.SessionID] = sess
+		if sm.onUDPSessionOpen != nil {
+			sm.onUDPSessionOpen()
+		}
+
+	case ControlTypeCloseUDPSession:
+		info := &UDPSessionInfo{}
+		if err := info.Decode(cp.Data); err != nil {
+			return
+		}
+		sm.udpSessionMu.Lock()
+		defer sm.udpSessionMu.Unlock()
+		sess, ok := sm.udpSessions[info.SessionID]
+		if !ok {
+			return
+		}
+		sm.closeUDPSessionLocked(sess)
+
+	case ControlTypeUDPSessionAssoc:
+		// Data is: [sessionID(4)] [payload...]
+		sm.handleDatagram(cp.Data)
+	default:
+		// Ignore.
+	}
+}
+
+func (sm *SessionManager) datagramReadLoop() {
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		default:
+		}
+
+		data, err := sm.conn.ReceiveDatagram(sm.ctx)
+		if err != nil {
+			return
+		}
+		sm.handleDatagram(data)
+	}
+}
+
 func (sm *SessionManager) closeUDPSessionLocked(sess *udpSession) {
 	close(sess.datagramCh)
 	delete(sm.udpSessions, sess.id)
@@ -574,6 +706,53 @@ func (s *sessionAdapter) LocalAddr() net.Addr {
 
 func (s *sessionAdapter) RemoteAddr() net.Addr {
 	return s.sm.RemoteAddr()
+}
+
+func (s *sessionAdapter) SupportsNativeDatagrams() bool {
+	if s.sm == nil || s.sm.config == nil {
+		return false
+	}
+	return s.sm.config.Capabilities.Has(CapabilityDatagram)
+}
+
+func (s *sessionAdapter) OpenDatagramSession() (uint32, error) {
+	// We don't care about a target address for pure peer-to-peer datagrams.
+	// Use a well-formed dummy UDP address for the existing session machinery.
+	return s.sm.OpenUDPSession("0.0.0.0:0")
+}
+
+func (s *sessionAdapter) WaitDatagramSession(ctx context.Context, sessionID uint32) error {
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	for {
+		if _, err := s.sm.GetUDPSession(sessionID); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+func (s *sessionAdapter) CloseDatagramSession(sessionID uint32) error {
+	return s.sm.CloseUDPSession(sessionID)
+}
+
+func (s *sessionAdapter) SendDatagram(sessionID uint32, payload []byte) error {
+	return s.sm.SendDatagram(sessionID, payload)
+}
+
+func (s *sessionAdapter) ReceiveDatagram(sessionID uint32) ([]byte, error) {
+	dg, err := s.sm.ReceiveDatagram(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if dg == nil {
+		return nil, ErrSessionClosed
+	}
+	return dg.Data, nil
 }
 
 // streamWrapper wraps smux.Stream with close callback

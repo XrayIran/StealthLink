@@ -108,23 +108,23 @@
     "measurement_status": "not_measured_yet"
   },
   "profiles": {
-    "4a": {
+    "HTTP+": {
       "off": { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 },
       "on":  { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 }
     },
-    "4b": {
+    "TCP+": {
       "off": { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 },
       "on":  { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 }
     },
-    "4c": {
+    "TLS+": {
       "off": { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 },
       "on":  { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 }
     },
-    "4d": {
+    "UDP+": {
       "off": { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 },
       "on":  { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 }
     },
-    "4e": {
+    "TLS": {
       "off": { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 },
       "on":  { "tcp_mbps": 800.0, "udp_mbps": 600.0, "latency_ms": 1.0 }
     }

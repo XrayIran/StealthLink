@@ -14,7 +14,7 @@ This document describes the security hardening applied to StealthLink systemd se
 - Essential defense-in-depth measure
 
 **User=root**
-- Required for TUN/TAP interface creation and raw socket operations
+- Required for TUN interface creation and raw socket operations
 - Capabilities are used to limit what root can do (see Capabilities section)
 
 ### 2. File System Isolation
@@ -71,8 +71,8 @@ This document describes the security hardening applied to StealthLink systemd se
 
 **RestrictNamespaces=false**
 - Allows namespace creation
-- **Required** for TUN/TAP interface creation
-- TUN/TAP requires network namespace operations
+- **Required** for TUN interface creation
+- TUN requires network namespace operations
 
 **RestrictSUIDSGID=true**
 - Prevents creation of SUID/SGID files
@@ -102,7 +102,7 @@ This document describes the security hardening applied to StealthLink systemd se
 StealthLink requires specific Linux capabilities for network operations:
 
 **CAP_NET_ADMIN**
-- Create and configure TUN/TAP interfaces
+- Create and configure TUN interfaces
 - Modify routing tables
 - Configure network interfaces
 - Required for all StealthLink modes
@@ -198,11 +198,11 @@ sudo systemd-analyze security stealthlink-gateway | grep -E "UNSAFE|MEDIUM"
 ### Why root user?
 
 StealthLink requires root for:
-1. TUN/TAP interface creation (CAP_NET_ADMIN)
+1. TUN interface creation (CAP_NET_ADMIN)
 2. Raw socket operations (CAP_NET_RAW)
 3. Privileged port binding (CAP_NET_BIND_SERVICE)
 
-While capabilities could theoretically allow non-root operation, TUN/TAP creation is deeply integrated with root privileges in the Linux kernel.
+While capabilities could theoretically allow non-root operation, TUN creation is deeply integrated with root privileges in the Linux kernel.
 
 ### Why MemoryDenyWriteExecute=false?
 
@@ -210,7 +210,7 @@ Some cryptographic libraries (especially JIT-optimized implementations) require 
 
 ### Why RestrictNamespaces=false?
 
-TUN/TAP interface creation requires network namespace operations. This is fundamental to StealthLink's operation and cannot be disabled.
+TUN interface creation requires network namespace operations. This is fundamental to StealthLink's operation and cannot be disabled.
 
 ## Verification
 

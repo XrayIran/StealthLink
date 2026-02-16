@@ -9,7 +9,7 @@ agent:
 
 transport:
   type: stealth
-  mode: "4a"  # XHTTP + Domain Fronting
+  mode: "HTTP+"  # XHTTP + Domain Fronting
   
   # Underlay dialer configuration
   dialer: direct  # Use direct network dialing (default)

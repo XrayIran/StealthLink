@@ -7,7 +7,7 @@ import (
 // Mode generates random StealthLink mode identifiers.
 // Valid modes: 4a, 4b, 4c, 4d, 4e
 func Mode() *rapid.Generator[string] {
-	return rapid.SampledFrom([]string{"4a", "4b", "4c", "4d", "4e"})
+	return rapid.SampledFrom([]string{"HTTP+", "TCP+", "TLS+", "UDP+", "TLS"})
 }
 
 // Placement generates random XHTTP placement types.

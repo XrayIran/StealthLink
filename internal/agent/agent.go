@@ -3,9 +3,12 @@ package agent
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -220,7 +223,8 @@ func (a *Agent) buildUQSPDialer(target transportTarget) (transport.Dialer, strin
 	}
 
 	if a.cfg.UQSPRuntimeMode() == "legacy" {
-		log.Printf("UQSP runtime mode=legacy; using historical dialer path")
+		log.Printf("WARNING: UQSP runtime mode=legacy is deprecated; using historical dialer path")
+		metrics.IncDeprecatedLegacyMode()
 		d := uqsp.NewDialer(&a.cfg.Transport.UQSP, tlsCfg, smuxCfg, a.cfg.ActiveSharedKey())
 		return d, a.cfg.Agent.GatewayAddr, nil
 	}
@@ -275,12 +279,12 @@ func (a *Agent) acceptStreams(ctx context.Context, sess transport.Session) error
 		metrics.IncStreams()
 		go func() {
 			defer metrics.DecStreams()
-			a.handleStream(ctx, strm)
+			a.handleStream(ctx, sess, strm)
 		}()
 	}
 }
 
-func (a *Agent) handleStream(ctx context.Context, strm net.Conn) {
+func (a *Agent) handleStream(ctx context.Context, sess transport.Session, strm net.Conn) {
 	defer strm.Close()
 	env, _, err := control.ReadEnvelopeWithDeadlineAnyKey(strm, a.cfg.HeaderTimeout(), a.acceptKeys, control.DefaultConfig())
 	if err != nil {
@@ -328,7 +332,7 @@ func (a *Agent) handleStream(ctx context.Context, strm net.Conn) {
 	case "udp":
 		a.handleUDPTarget(strm, svc, target)
 	case "tun":
-		a.handleTun(ctx, strm, svc)
+		a.handleTun(ctx, sess, strm, svc)
 	default:
 		log.Printf("protocol %s not supported", env.Open.Protocol)
 		metrics.IncErrors()
@@ -421,7 +425,7 @@ func (a *Agent) handleUDPTarget(strm net.Conn, svc *config.Service, target strin
 	<-errCh
 }
 
-func (a *Agent) handleTun(ctx context.Context, strm net.Conn, svc *config.Service) {
+func (a *Agent) handleTun(ctx context.Context, sess transport.Session, strm net.Conn, svc *config.Service) {
 	a.tunMu.Lock()
 	if _, exists := a.tunActive[svc.Name]; exists {
 		a.tunMu.Unlock()
@@ -451,7 +455,56 @@ func (a *Agent) handleTun(ctx context.Context, strm net.Conn, svc *config.Servic
 			vpnCfg.Mode = "tun"
 		}
 
-		session, err := vpn.NewSession(vpnCfg, strm)
+		tunTransport := strings.ToLower(strings.TrimSpace(svc.Tun.Transport))
+		if tunTransport == "" {
+			tunTransport = "auto"
+		}
+
+		var session *vpn.Session
+		var err error
+		if tunTransport == "datagram" || tunTransport == "auto" {
+			if ds, ok := sess.(transport.DatagramSession); ok && ds.SupportsNativeDatagrams() {
+				// Receive the datagram session ID from the gateway, wait until it exists locally,
+				// then ACK so the gateway can start the VPN bridge.
+				_ = strm.SetDeadline(time.Now().Add(5 * time.Second))
+				var sidBuf [4]byte
+				if _, err := io.ReadFull(strm, sidBuf[:]); err != nil {
+					_ = strm.SetDeadline(time.Time{})
+					log.Printf("vpn datagram handshake read failed: %v", err)
+					metrics.IncErrors()
+					return
+				}
+				sessionID := binary.BigEndian.Uint32(sidBuf[:])
+
+				waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				waitErr := ds.WaitDatagramSession(waitCtx, sessionID)
+				cancel()
+				if waitErr != nil {
+					_ = strm.SetDeadline(time.Time{})
+					log.Printf("vpn datagram session wait failed: %v", waitErr)
+					metrics.IncErrors()
+					return
+				}
+
+				if _, err := strm.Write([]byte{0x01}); err != nil {
+					_ = strm.SetDeadline(time.Time{})
+					log.Printf("vpn datagram handshake ack failed: %v", err)
+					metrics.IncErrors()
+					return
+				}
+				_ = strm.SetDeadline(time.Time{})
+
+				pt := vpn.NewDatagramPacketTransport(ds, sessionID)
+				session, err = vpn.NewSessionWithPacketTransport(vpnCfg, strm, pt)
+			} else if tunTransport == "datagram" {
+				log.Printf("tun.transport=datagram requested but transport session has no native datagram support")
+				metrics.IncErrors()
+				return
+			}
+		}
+		if session == nil {
+			session, err = vpn.NewSession(vpnCfg, strm)
+		}
 		if err != nil {
 			log.Printf("vpn session init failed: %v", err)
 			metrics.IncErrors()

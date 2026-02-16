@@ -11,27 +11,48 @@ type VariantConfig struct {
 	Variant string `yaml:"variant"`
 }
 
+const (
+	VariantHTTPPlus = "HTTP+"
+	VariantTCPPlus  = "TCP+"
+	VariantTLSPlus  = "TLS+"
+	VariantUDPPlus  = "UDP+"
+	VariantTLS      = "TLS"
+)
+
+func canonicalVariantName(raw string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case VariantHTTPPlus:
+		return VariantHTTPPlus, true
+	case VariantTCPPlus:
+		return VariantTCPPlus, true
+	case VariantTLSPlus:
+		return VariantTLSPlus, true
+	case VariantUDPPlus:
+		return VariantUDPPlus, true
+	case VariantTLS:
+		return VariantTLS, true
+	default:
+		return "", false
+	}
+}
+
+func allowedVariantNamesText() string {
+	return strings.Join(VariantNames(), ", ")
+}
+
 func parseVariantValue(raw string) (int, bool) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "0":
+	switch canonical, ok := canonicalVariantName(raw); {
+	case !ok:
+		return 0, false
+	case canonical == VariantHTTPPlus:
 		return 0, true
-	case "4a", "xhttp-tls", "xhttp_tls":
-		return 0, true
-	case "1":
+	case canonical == VariantTCPPlus:
 		return 1, true
-	case "4b", "raw-tcp", "raw_tcp":
-		return 1, true
-	case "2":
+	case canonical == VariantTLSPlus:
 		return 2, true
-	case "4c", "tls-mirror", "tls_mirror":
-		return 2, true
-	case "3":
+	case canonical == VariantUDPPlus:
 		return 3, true
-	case "4d", "udp":
-		return 3, true
-	case "4":
-		return 4, true
-	case "4e", "trust":
+	case canonical == VariantTLS:
 		return 4, true
 	default:
 		return 0, false
@@ -57,8 +78,8 @@ func (c *Config) applyVariantPreset() {
 
 	u := &c.Transport.UQSP
 	switch variant {
-	case 0: // 4a: XHTTP + gfw_resist_tls + domain fronting + vision + ECH
-		// ApplyUQSPDefaults sets carrier.type="quic" as a generic default. For non-4d variants,
+	case 0: // HTTP+: XHTTP + gfw_resist_tls + domain fronting + vision + ECH
+		// ApplyUQSPDefaults sets carrier.type="quic" as a generic default. For non-UDP+ variants,
 		// treat "quic" as "unset" so the variant preset can choose a more appropriate carrier.
 		if strings.TrimSpace(u.Carrier.Type) == "" || strings.EqualFold(strings.TrimSpace(u.Carrier.Type), "quic") {
 			u.Carrier.Type = "xhttp"
@@ -72,7 +93,7 @@ func (c *Config) applyVariantPreset() {
 		if u.Behaviors.TLSFrag.Strategy == "" {
 			u.Behaviors.TLSFrag.Strategy = "sni_split"
 		}
-	case 1: // 4b: Raw TCP + anti-DPI + obfuscation
+	case 1: // TCP+: Raw TCP + anti-DPI + obfuscation
 		if strings.TrimSpace(u.Carrier.Type) == "" || strings.EqualFold(strings.TrimSpace(u.Carrier.Type), "quic") {
 			u.Carrier.Type = "rawtcp"
 		}
@@ -81,7 +102,7 @@ func (c *Config) applyVariantPreset() {
 		}
 		u.Obfuscation.MorphingEnabled = true
 		u.Behaviors.AWG.Enabled = true
-	case 2: // 4c: XHTTP + TLS look-alikes + Vision + ML-DSA-65
+	case 2: // TLS+: XHTTP + TLS look-alikes + Vision + ML-DSA-65
 		// Allow explicit carrier selection (e.g., AnyTLS) without being overridden by the preset.
 		if strings.TrimSpace(u.Carrier.Type) == "" || strings.EqualFold(strings.TrimSpace(u.Carrier.Type), "quic") {
 			u.Carrier.Type = "xhttp"
@@ -92,7 +113,7 @@ func (c *Config) applyVariantPreset() {
 			u.Behaviors.TLSMirror.Enabled = true
 		}
 		u.Security.PQKEM = true
-	case 3: // 4d: UDP/QUIC + brutal CC + AWG/obfuscation
+	case 3: // UDP+: UDP/QUIC + brutal CC + AWG/obfuscation
 		if strings.TrimSpace(u.Carrier.Type) == "" {
 			u.Carrier.Type = "quic"
 		}
@@ -106,7 +127,7 @@ func (c *Config) applyVariantPreset() {
 		}
 		u.Obfuscation.MorphingEnabled = true
 		u.Behaviors.AWG.Enabled = true
-	case 4: // 4e: TLS-based tunnels + CSTP compatibility
+	case 4: // TLS: TLS-based tunnels + CSTP compatibility
 		if strings.TrimSpace(u.Carrier.Type) == "" || strings.TrimSpace(u.Carrier.Type) == "quic" {
 			u.Carrier.Type = "trusttunnel"
 		}
@@ -147,7 +168,7 @@ func (c *Config) GetVariant() int {
 		return 0
 	case "rawtcp", "faketcp", "icmptun":
 		return 1
-	case "webtunnel", "chisel", "trusttunnel":
+	case "webtunnel", "trusttunnel", "anytls", "chisel":
 		return 4
 	case "quic", "":
 		return 3
@@ -172,15 +193,12 @@ func (c *Config) ValidateVariant() error {
 	raw := c.selectedVariantRaw()
 	variant, ok := parseVariantValue(raw)
 	if raw != "" && !ok {
-		return fmt.Errorf("variant must be one of: 4a, 4b, 4c, 4d, 4e")
+		return fmt.Errorf("variant must be one of: %s", allowedVariantNamesText())
 	}
 	if !ok {
 		variant = c.GetVariant()
 	}
-	rawNorm := strings.ToLower(strings.TrimSpace(raw))
-	strict := rawNorm == "4a" || rawNorm == "4b" || rawNorm == "4c" || rawNorm == "4d" || rawNorm == "4e" ||
-		rawNorm == "xhttp-tls" || rawNorm == "xhttp_tls" || rawNorm == "raw-tcp" || rawNorm == "raw_tcp" ||
-		rawNorm == "tls-mirror" || rawNorm == "tls_mirror" || rawNorm == "udp" || rawNorm == "trust"
+	strict := strings.TrimSpace(raw) != ""
 	if err := c.validateVariantPolicyGuards(variant); err != nil {
 		return err
 	}
@@ -204,15 +222,15 @@ func (c *Config) ValidateVariant() error {
 func variantCodeFromIndex(variant int) string {
 	switch variant {
 	case 0:
-		return "4a"
+		return VariantHTTPPlus
 	case 1:
-		return "4b"
+		return VariantTCPPlus
 	case 2:
-		return "4c"
+		return VariantTLSPlus
 	case 3:
-		return "4d"
+		return VariantUDPPlus
 	case 4:
-		return "4e"
+		return VariantTLS
 	default:
 		return ""
 	}
@@ -240,15 +258,15 @@ func (c *Config) validateVariantPolicyGuards(variant int) error {
 func (c *Config) validateVariantXHTTPTLS(strict bool) error {
 	behaviors := c.Transport.UQSP.Behaviors
 	carrierType := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
-	if carrierType != "" && carrierType != "xhttp" {
-		return fmt.Errorf("xhttp-tls variant requires carrier.type to be xhttp, got: %s", carrierType)
+	if carrierType != "" && carrierType != "xhttp" && carrierType != "quic" {
+		return fmt.Errorf("%s variant requires carrier.type to be xhttp or quic, got: %s", VariantHTTPPlus, carrierType)
 	}
 	if strict {
 		if !behaviors.Vision.Enabled {
-			return fmt.Errorf("xhttp-tls variant requires vision.enabled=true")
+			return fmt.Errorf("%s variant requires vision.enabled=true", VariantHTTPPlus)
 		}
 		if !behaviors.ECH.Enabled && !behaviors.DomainFront.Enabled {
-			return fmt.Errorf("xhttp-tls variant requires at least one of: ech.enabled or domainfront.enabled")
+			return fmt.Errorf("%s variant requires at least one of: ech.enabled or domainfront.enabled", VariantHTTPPlus)
 		}
 	}
 
@@ -285,7 +303,7 @@ func (c *Config) validateVariantRawTCP() error {
 
 	carrierType := c.Transport.UQSP.Carrier.Type
 	if carrierType != "rawtcp" && carrierType != "faketcp" && carrierType != "icmptun" && carrierType != "" {
-		return fmt.Errorf("raw-tcp variant requires carrier.type to be rawtcp, faketcp, or icmptun, got: %s", carrierType)
+		return fmt.Errorf("%s variant requires carrier.type to be rawtcp, faketcp, or icmptun, got: %s", VariantTCPPlus, carrierType)
 	}
 
 	return nil
@@ -295,10 +313,10 @@ func (c *Config) validateVariantTLSMirror(strict bool) error {
 	behaviors := c.Transport.UQSP.Behaviors
 	carrierType := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
 	if carrierType != "" && carrierType != "xhttp" && carrierType != "anytls" {
-		return fmt.Errorf("tls-mirror variant requires carrier.type to be xhttp or anytls, got: %s", carrierType)
+		return fmt.Errorf("%s variant requires carrier.type to be xhttp or anytls, got: %s", VariantTLSPlus, carrierType)
 	}
 	if strict && !behaviors.Vision.Enabled {
-		return fmt.Errorf("tls-mirror variant requires vision.enabled=true")
+		return fmt.Errorf("%s variant requires vision.enabled=true", VariantTLSPlus)
 	}
 
 	tlsModes := 0
@@ -337,7 +355,7 @@ func (c *Config) validateVariantTLSMirror(strict bool) error {
 	}
 
 	if tlsModes == 0 {
-		return fmt.Errorf("tls-mirror variant requires at least one TLS behavior (reality, shadowtls, tlsmirror, or anytls)")
+		return fmt.Errorf("%s variant requires at least one TLS behavior (reality, shadowtls, tlsmirror, or anytls)", VariantTLSPlus)
 	}
 
 	return nil
@@ -361,10 +379,10 @@ func (c *Config) validateVariantUDP(strict bool) error {
 	obfs := c.Transport.UQSP.Obfuscation
 	carrierType := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
 	if carrierType != "" && carrierType != "quic" && carrierType != "kcp" && carrierType != "masque" {
-		return fmt.Errorf("udp variant requires carrier.type to be quic, kcp, or masque, got: %s", carrierType)
+		return fmt.Errorf("%s variant requires carrier.type to be quic, kcp, or masque, got: %s", VariantUDPPlus, carrierType)
 	}
 	if strict && !c.Transport.UQSP.Behaviors.AWG.Enabled && !obfs.MorphingEnabled {
-		return fmt.Errorf("udp variant requires awg.enabled=true or obfuscation.morphing_enabled=true")
+		return fmt.Errorf("%s variant requires awg.enabled=true or obfuscation.morphing_enabled=true", VariantUDPPlus)
 	}
 
 	if obfs.Profile == "salamander" && obfs.SalamanderKey == "" {
@@ -380,12 +398,28 @@ func (c *Config) validateVariantUDP(strict bool) error {
 }
 
 func (c *Config) validateVariantTrust(strict bool) error {
-	carrierType := c.Transport.UQSP.Carrier.Type
-	if carrierType != "webtunnel" && carrierType != "chisel" && carrierType != "trusttunnel" && carrierType != "" {
-		return fmt.Errorf("trust variant requires carrier.type to be webtunnel, chisel, or trusttunnel, got: %s", carrierType)
+	carrierType := strings.ToLower(strings.TrimSpace(c.Transport.UQSP.Carrier.Type))
+	if carrierType != "webtunnel" && carrierType != "trusttunnel" && carrierType != "anytls" && carrierType != "chisel" && carrierType != "" {
+		return fmt.Errorf("%s variant requires carrier.type to be trusttunnel, webtunnel, anytls, or chisel, got: %s", VariantTLS, carrierType)
 	}
 	if strict && !c.Transport.UQSP.Behaviors.CSTP.Enabled {
-		return fmt.Errorf("trust variant requires cstp.enabled=true")
+		return fmt.Errorf("%s variant requires cstp.enabled=true", VariantTLS)
+	}
+	if carrierType == "chisel" {
+		if !c.Transport.UQSP.ReverseEnabledForVariant(VariantTLS) {
+			return fmt.Errorf("%s variant with carrier.type=chisel requires reverse mode enabled (reverse-first)", VariantTLS)
+		}
+		rr := strings.ToLower(strings.TrimSpace(c.GetReverseRole()))
+		switch strings.ToLower(strings.TrimSpace(c.Role)) {
+		case "gateway", "server":
+			if rr != "dialer" && rr != "client" {
+				return fmt.Errorf("%s variant with carrier.type=chisel requires gateway/server reverse role dialer|client (got: %s)", VariantTLS, rr)
+			}
+		case "agent", "client":
+			if rr != "listener" && rr != "server" {
+				return fmt.Errorf("%s variant with carrier.type=chisel requires agent/client reverse role listener|server (got: %s)", VariantTLS, rr)
+			}
+		}
 	}
 
 	return nil
@@ -393,7 +427,7 @@ func (c *Config) validateVariantTrust(strict bool) error {
 
 func (c *Config) VariantName() string {
 	variant := c.GetVariant()
-	names := []string{"xhttp-tls", "raw-tcp", "tls-mirror", "udp", "trust"}
+	names := []string{VariantHTTPPlus, VariantTCPPlus, VariantTLSPlus, VariantUDPPlus, VariantTLS}
 	if variant >= 0 && variant < len(names) {
 		return names[variant]
 	}
@@ -403,11 +437,11 @@ func (c *Config) VariantName() string {
 func (c *Config) VariantDescription() string {
 	variant := c.GetVariant()
 	descs := []string{
-		"XHTTP + TLS + Domain Fronting + XTLS Vision + ECH - Maximum stealth with CDN cover",
-		"RawTCP/FakeTCP + KCP/smux + obfs4 + anti-DPI - Low latency, high throughput",
-		"REALITY/ShadowTLS + XTLS Vision + PQ signatures - TLS fingerprint resistance",
-		"QUIC/UDP + Hysteria2 CC + AmneziaWG - UDP-based with anti-DPI",
-		"TrustTunnel + HTTP/2 + HTTP/3 - HTTP-constrained environments",
+		"HTTP+ (XHTTP + TLS + Domain Fronting + XTLS Vision + ECH) - Maximum stealth with CDN cover",
+		"TCP+ (RawTCP/FakeTCP + KCP/smux + obfs4 + anti-DPI) - Low latency, high throughput",
+		"TLS+ (REALITY/ShadowTLS + XTLS Vision + PQ signatures) - TLS fingerprint resistance",
+		"UDP+ (QUIC/UDP + Hysteria2 CC + AmneziaWG) - UDP-based with anti-DPI",
+		"TLS (TrustTunnel/WebTunnel/AnyTLS/Chisel) - HTTP-constrained environments",
 	}
 	if variant >= 0 && variant < len(descs) {
 		return descs[variant]
@@ -463,5 +497,5 @@ func RecommendedVariantForScenario(scenario string) int {
 }
 
 func VariantNames() []string {
-	return []string{"xhttp-tls", "raw-tcp", "tls-mirror", "udp", "trust"}
+	return []string{VariantHTTPPlus, VariantTCPPlus, VariantTLSPlus, VariantUDPPlus, VariantTLS}
 }

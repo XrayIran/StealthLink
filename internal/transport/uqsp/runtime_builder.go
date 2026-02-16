@@ -13,13 +13,15 @@ import (
 	"time"
 
 	"stealthlink/internal/config"
+	"stealthlink/internal/metrics"
 	"stealthlink/internal/mux"
 	"stealthlink/internal/transport"
 
 	"crypto/tls"
 
-	"github.com/xtaci/smux"
 	"stealthlink/internal/transport/pool"
+
+	"github.com/xtaci/smux"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,7 +37,8 @@ type RuntimeDialer struct {
 	smuxCfg   *smux.Config
 	shaperCfg mux.ShaperConfig
 	authToken string
-	mu        sync.Mutex
+	dialSem   chan struct{}
+	dialFn    func(ctx context.Context, addr string) (net.Conn, error)
 
 	poolEnabled bool
 	poolConfig  pool.PoolConfig
@@ -64,17 +67,25 @@ func NewRuntimeDialer(cfg *config.Config, tlsCfg *tls.Config, smuxCfg *smux.Conf
 
 	log.Printf("UQSP runtime dialer ready: variant=%s (%s)",
 		VariantName(variant), VariantDescription(variant))
+	metrics.SetActivePathVariant(VariantName(variant))
+
+	maxConcurrentDials := cfg.Transport.UQSP.Runtime.MaxConcurrentDials
+	if maxConcurrentDials <= 0 {
+		maxConcurrentDials = 16
+	}
 
 	return &RuntimeDialer{
-		proto:     proto,
-		variant:   variant,
-		smuxCfg:   smuxCfg,
+		proto:   proto,
+		variant: variant,
+		smuxCfg: smuxCfg,
 		shaperCfg: mux.ShaperConfig{
 			Enabled:         cfg.Mux.Shaper.Enabled,
 			MaxControlBurst: cfg.Mux.Shaper.MaxControlBurst,
 			QueueSize:       cfg.Mux.Shaper.QueueSize,
 		},
-		authToken: authToken,
+		authToken:   authToken,
+		dialSem:     make(chan struct{}, maxConcurrentDials),
+		dialFn:      proto.Dial,
 		poolEnabled: cfg.Transport.Pool.Enabled,
 		poolConfig: pool.PoolConfig{
 			Mode:         pool.PoolMode(cfg.Transport.Pool.Mode),
@@ -101,11 +112,18 @@ func (rd *RuntimeDialer) Dial(ctx context.Context, addr string) (transport.Sessi
 }
 
 func (rd *RuntimeDialer) dialOne(ctx context.Context, addr string) (transport.Session, error) {
-	rd.mu.Lock()
-	defer rd.mu.Unlock()
+	if err := rd.acquireDialPermit(ctx); err != nil {
+		return nil, fmt.Errorf("dial concurrency limit: %w", err)
+	}
+	defer rd.releaseDialPermit()
 
-	conn, err := rd.proto.Dial(ctx, addr)
+	dial := rd.dialFn
+	if dial == nil {
+		dial = rd.proto.Dial
+	}
+	conn, err := dial(ctx, addr)
 	if err != nil {
+		metrics.IncHandshakeFailure()
 		return nil, fmt.Errorf("variant dial: %w", err)
 	}
 
@@ -114,6 +132,7 @@ func (rd *RuntimeDialer) dialOne(ctx context.Context, addr string) (transport.Se
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := transport.SendGuard(conn, rd.authToken); err != nil {
 			_ = conn.Close()
+			metrics.IncHandshakeFailure()
 			return nil, fmt.Errorf("guard send: %w", err)
 		}
 		_ = conn.SetDeadline(time.Time{})
@@ -121,10 +140,33 @@ func (rd *RuntimeDialer) dialOne(ctx context.Context, addr string) (transport.Se
 
 	rs, err := NewRuntimeSession(conn, rd.smuxCfg, rd.shaperCfg, rd.variant, false)
 	if err != nil {
+		metrics.IncHandshakeFailure()
 		return nil, fmt.Errorf("runtime session: %w", err)
 	}
 
 	return rs.Session(), nil
+}
+
+func (rd *RuntimeDialer) acquireDialPermit(ctx context.Context) error {
+	if rd.dialSem == nil {
+		return nil
+	}
+	select {
+	case rd.dialSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (rd *RuntimeDialer) releaseDialPermit() {
+	if rd.dialSem == nil {
+		return
+	}
+	select {
+	case <-rd.dialSem:
+	default:
+	}
 }
 
 // Proto returns the underlying UnifiedProtocol for callers that need
@@ -177,11 +219,12 @@ func NewRuntimeListener(listenAddr string, cfg *config.Config, tlsCfg *tls.Confi
 
 	log.Printf("UQSP runtime listener started: variant=%s addr=%s (%s)",
 		VariantName(variant), listenAddr, VariantDescription(variant))
+	metrics.SetActivePathVariant(VariantName(variant))
 
 	return &RuntimeListener{
-		proto:     proto,
-		variant:   variant,
-		smuxCfg:   smuxCfg,
+		proto:   proto,
+		variant: variant,
+		smuxCfg: smuxCfg,
 		shaperCfg: mux.ShaperConfig{
 			Enabled:         cfg.Mux.Shaper.Enabled,
 			MaxControlBurst: cfg.Mux.Shaper.MaxControlBurst,
@@ -209,6 +252,7 @@ func (rl *RuntimeListener) Accept() (transport.Session, error) {
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 			if err := transport.RecvGuard(conn, rl.authToken); err != nil {
 				_ = conn.Close()
+				metrics.IncHandshakeFailure()
 				log.Printf("runtime listener: guard verify failed from %v: %v", conn.RemoteAddr(), err)
 				continue
 			}
@@ -218,6 +262,7 @@ func (rl *RuntimeListener) Accept() (transport.Session, error) {
 		rs, err := NewRuntimeSession(conn, rl.smuxCfg, rl.shaperCfg, rl.variant, true)
 		if err != nil {
 			_ = conn.Close()
+			metrics.IncHandshakeFailure()
 			log.Printf("runtime listener: session setup failed: %v", err)
 			continue
 		}

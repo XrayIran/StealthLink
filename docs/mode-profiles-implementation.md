@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document summarizes the implementation of task -1.2: "Define 5 profile configs (4a-4e) as canonical config surface" from the upstream integration completion spec.
+This document summarizes the implementation of task -1.2: "Define 5 profile configs (HTTP+-TLS) as canonical config surface" from the upstream integration completion spec.
 
 ## Implementation Details
 
@@ -10,7 +10,7 @@ This document summarizes the implementation of task -1.2: "Define 5 profile conf
 
 1. **`internal/config/mode_profiles.go`** - Core mode profile definitions
    - Defines `ModeProfile` struct with carrier, capabilities, and defaults
-   - Implements all 5 mode profiles (4a-4e)
+   - Implements all 5 mode profiles (HTTP+-TLS)
    - Provides mode-specific configuration structs
    - Includes capability matrix generation
 
@@ -33,35 +33,35 @@ This document summarizes the implementation of task -1.2: "Define 5 profile conf
 
 ## Mode Profiles Implemented
 
-### Mode 4a: XHTTP + Domain Fronting
+### Mode HTTP+: XHTTP + Domain Fronting
 - **Protocol**: HTTP/2 over TLS
 - **Key Features**: Flexible metadata placement, Xmux rotation, domain fronting
 - **Capabilities**: StreamOriented, ZeroRTT, ServerInitiated, Fronting
 - **Default MTU**: 1400 bytes
 - **Use Case**: CDN-friendly scenarios, domain fronting
 
-### Mode 4b: FakeTCP + Anti-DPI
+### Mode TCP+: FakeTCP + Anti-DPI
 - **Protocol**: UDP with TCP mimicry
 - **Key Features**: Directional HKDF, AEAD encryption, batch I/O
 - **Capabilities**: ReplayProtection, ServerInitiated
 - **Default MTU**: 1460 bytes
 - **Use Case**: Deep packet inspection evasion
 
-### Mode 4c: TLS-Like + REALITY/AnyTLS
+### Mode TLS+: TLS-Like + REALITY/AnyTLS
 - **Protocol**: TLS 1.3
 - **Key Features**: REALITY spider, AnyTLS padding, fingerprint resistance
 - **Capabilities**: StreamOriented, ZeroRTT, ServerInitiated, CoverTraffic
 - **Default MTU**: 1400 bytes
 - **Use Case**: TLS proxy detection evasion
 
-### Mode 4d: QUIC + Brutal CC
+### Mode UDP+: QUIC + Brutal CC
 - **Protocol**: QUIC
 - **Key Features**: Brutal CC, FEC, hardware entropy, batch I/O, migration
 - **Capabilities**: StreamOriented, ZeroRTT, ReplayProtection, PathMigration, Multipath, ServerInitiated, CoverTraffic
 - **Default MTU**: 1450 bytes
 - **Use Case**: High-throughput, lossy networks
 
-### Mode 4e: TrustTunnel + CSTP
+### Mode TLS: TrustTunnel + CSTP
 - **Protocol**: HTTP/2 or HTTP/3
 - **Key Features**: HTTP CONNECT, ICMP mux, session recovery
 - **Capabilities**: StreamOriented, ZeroRTT, ServerInitiated
@@ -70,7 +70,7 @@ This document summarizes the implementation of task -1.2: "Define 5 profile conf
 
 ## Capability Matrix
 
-| Capability | 4a | 4b | 4c | 4d | 4e |
+| Capability | HTTP+ | TCP+ | TLS+ | UDP+ | TLS |
 |------------|----|----|----|----|----| 
 | StreamOriented | ✅ | ❌ | ✅ | ✅ | ✅ |
 | ZeroRTT | ✅ | ❌ | ✅ | ✅ | ✅ |
@@ -91,7 +91,7 @@ profiles := config.AllModeProfiles()
 
 ### Getting a Specific Mode Profile
 ```go
-profile, exists := config.GetModeProfile("4a")
+profile, exists := config.GetModeProfile("HTTP+")
 if exists {
     fmt.Printf("Mode: %s\n", profile.Name)
     fmt.Printf("MTU: %d\n", profile.Defaults.MTU)
@@ -102,34 +102,34 @@ if exists {
 ```go
 matrix := config.GetCapabilityMatrix()
 for _, row := range matrix.Capabilities {
-    fmt.Printf("%s: 4a=%v, 4b=%v, 4c=%v, 4d=%v, 4e=%v\n",
+    fmt.Printf("%s: HTTP+=%v, TCP+=%v, TLS+=%v, UDP+=%v, TLS=%v\n",
         row.Capability, row.Mode4a, row.Mode4b, row.Mode4c, row.Mode4d, row.Mode4e)
 }
 ```
 
 ### Using Default Configurations
 ```go
-// Mode 4a
+// Mode HTTP+
 config4a := config.DefaultMode4aConfig()
 config4a.SessionPlacement = "path"
 config4a.CMaxReuseTimes = 64
 
-// Mode 4b
+// Mode TCP+
 config4b := config.DefaultMode4bConfig()
 config4b.AEADMode = "aesgcm"
 config4b.BatchSize = 64
 
-// Mode 4c
+// Mode TLS+
 config4c := config.DefaultMode4cConfig()
 config4c.TLSMode = "anytls"
 config4c.PaddingScheme = "burst"
 
-// Mode 4d
+// Mode UDP+
 config4d := config.DefaultMode4dConfig()
 config4d.BrutalBandwidth = 200
 config4d.FECEnabled = true
 
-// Mode 4e
+// Mode TLS
 config4e := config.DefaultMode4eConfig()
 config4e.HTTPVersion = "http3"
 config4e.ICMPMuxMode = "timestamp"

@@ -55,7 +55,7 @@ The service files include comprehensive security hardening options following Red
 
 ### System Call Restrictions
 - `RestrictRealtime=true` - Prevents realtime scheduling
-- `RestrictNamespaces=false` - Allows namespace creation (required for TUN/TAP)
+- `RestrictNamespaces=false` - Allows namespace creation (required for TUN)
 - `RestrictSUIDSGID=true` - Prevents SUID/SGID file creation
 - `LockPersonality=true` - Prevents personality changes
 - `SystemCallArchitectures=native` - Restricts to native architecture syscalls
@@ -69,7 +69,7 @@ The service files include comprehensive security hardening options following Red
 
 ### Capabilities
 StealthLink requires specific Linux capabilities for network operations:
-- `CAP_NET_ADMIN` - Required for TUN/TAP interface creation and configuration
+- `CAP_NET_ADMIN` - Required for TUN interface creation and configuration
 - `CAP_NET_RAW` - Required for raw socket operations (FakeTCP mode)
 - `CAP_NET_BIND_SERVICE` - Required for binding to privileged ports (<1024)
 

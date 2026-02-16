@@ -17,7 +17,7 @@ transport:
     enabled: true
     mode: anytls  # AnyTLS protocol
   
-  # UQSP configuration for Mode 4c (TLS-Like + AnyTLS)
+  # UQSP configuration for Mode TLS+ (TLS-Like + AnyTLS)
   uqsp:
     carrier:
       type: anytls

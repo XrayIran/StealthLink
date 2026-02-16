@@ -128,7 +128,7 @@ func chrome120Extensions() []utls.TLSExtension {
 		// Cookie
 		&utls.CookieExtension{},
 
-				// Certificate Compression (brotli)
+		// Certificate Compression (brotli)
 		&utls.UtlsCompressCertExtension{
 			Algorithms: []utls.CertCompressionAlgo{
 				utls.CertCompressionBrotli,
@@ -167,7 +167,7 @@ func (c *ChromeFingerprint) ToClientHelloSpec() *utls.ClientHelloSpec {
 // ToClientHelloID returns a ClientHelloID for this fingerprint.
 func (c *ChromeFingerprint) ToClientHelloID() utls.ClientHelloID {
 	return utls.ClientHelloID{
-		Client: "Custom",
+		Client:  "Custom",
 		Version: c.Version,
 	}
 }

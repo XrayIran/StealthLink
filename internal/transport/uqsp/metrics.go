@@ -9,14 +9,14 @@ import (
 // Metrics holds UQSP-specific metrics
 type Metrics struct {
 	// Session metrics
-	sessionsTotal     uint64
-	sessionsActive    int64
-	sessionsFailed    uint64
+	sessionsTotal  uint64
+	sessionsActive int64
+	sessionsFailed uint64
 
 	// Stream metrics
-	streamsOpened     uint64
-	streamsClosed     uint64
-	streamsActive     int64
+	streamsOpened uint64
+	streamsClosed uint64
+	streamsActive int64
 
 	// Datagram metrics
 	datagramsSent     uint64
@@ -29,18 +29,18 @@ type Metrics struct {
 	udpSessionsActive int64
 
 	// Capsule metrics
-	capsulesSent      uint64
-	capsulesReceived  uint64
+	capsulesSent     uint64
+	capsulesReceived uint64
 
 	// Obfuscation metrics
-	obfuscationOps    uint64
+	obfuscationOps uint64
 
 	// Congestion metrics
-	congestionEvents  uint64
+	congestionEvents uint64
 
 	// Security metrics
-	replayDrops       uint64
-	authFailures      uint64
+	replayDrops  uint64
+	authFailures uint64
 
 	// Handshake metrics
 	handshakeTotal    uint64
@@ -48,12 +48,12 @@ type Metrics struct {
 	handshakeDuration uint64 // nanoseconds, for histogram
 
 	// Bytes transferred
-	bytesSent         uint64
-	bytesReceived     uint64
+	bytesSent     uint64
+	bytesReceived uint64
 
 	// Last update time
-	lastUpdate        time.Time
-	mu                sync.RWMutex
+	lastUpdate time.Time
+	mu         sync.RWMutex
 }
 
 // NewMetrics creates a new metrics collector
@@ -293,26 +293,26 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 	defer m.mu.RUnlock()
 
 	return map[string]interface{}{
-		"sessions_total":       m.SessionsTotal(),
-		"sessions_active":      m.SessionsActive(),
-		"sessions_failed":      m.SessionsFailed(),
-		"streams_active":       m.StreamsActive(),
-		"streams_opened":       m.StreamsOpened(),
-		"datagrams_sent":       m.DatagramsSent(),
-		"datagrams_received":   m.DatagramsReceived(),
-		"datagrams_dropped":    m.DatagramsDropped(),
-		"udp_sessions_active":  m.UDPSessionsActive(),
-		"capsules_total":       m.CapsulesTotal(),
-		"obfuscation_ops":      m.ObfuscationOps(),
-		"congestion_events":    m.CongestionEvents(),
-		"replay_drops":         m.ReplayDrops(),
-		"auth_failures":        m.AuthFailures(),
-		"handshake_total":      m.HandshakeTotal(),
-		"handshake_success":    m.HandshakeSuccess(),
-		"handshake_avg_ms":     m.HandshakeAverageDuration().Milliseconds(),
-		"bytes_sent":           m.BytesSent(),
-		"bytes_received":       m.BytesReceived(),
-		"last_update":          m.lastUpdate,
+		"sessions_total":      m.SessionsTotal(),
+		"sessions_active":     m.SessionsActive(),
+		"sessions_failed":     m.SessionsFailed(),
+		"streams_active":      m.StreamsActive(),
+		"streams_opened":      m.StreamsOpened(),
+		"datagrams_sent":      m.DatagramsSent(),
+		"datagrams_received":  m.DatagramsReceived(),
+		"datagrams_dropped":   m.DatagramsDropped(),
+		"udp_sessions_active": m.UDPSessionsActive(),
+		"capsules_total":      m.CapsulesTotal(),
+		"obfuscation_ops":     m.ObfuscationOps(),
+		"congestion_events":   m.CongestionEvents(),
+		"replay_drops":        m.ReplayDrops(),
+		"auth_failures":       m.AuthFailures(),
+		"handshake_total":     m.HandshakeTotal(),
+		"handshake_success":   m.HandshakeSuccess(),
+		"handshake_avg_ms":    m.HandshakeAverageDuration().Milliseconds(),
+		"bytes_sent":          m.BytesSent(),
+		"bytes_received":      m.BytesReceived(),
+		"last_update":         m.lastUpdate,
 	}
 }
 

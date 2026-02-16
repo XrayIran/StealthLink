@@ -12,7 +12,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"stealthlink/internal/metrics"
@@ -506,7 +505,9 @@ func (s *fakeSession) connect() error {
 
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		synSeq := atomic.LoadUint32(&s.sndNxt)
+		s.mu.Lock()
+		synSeq := s.sndNxt
+		s.mu.Unlock()
 		syn := &packet{
 			Type: PacketTypeSYN,
 			Seq:  synSeq,
@@ -514,7 +515,11 @@ func (s *fakeSession) connect() error {
 		if err := s.sendPacket(syn); err != nil {
 			return err
 		}
-		atomic.CompareAndSwapUint32(&s.sndNxt, synSeq, synSeq+1)
+		s.mu.Lock()
+		if s.sndNxt == synSeq {
+			s.sndNxt = synSeq + 1
+		}
+		s.mu.Unlock()
 
 		select {
 		case <-s.readyCh:
@@ -850,19 +855,22 @@ func (s *fakeSession) Read(p []byte) (n int, err error) {
 
 // Write implements net.Conn.
 func (s *fakeSession) Write(p []byte) (n int, err error) {
-	s.mu.RLock()
+	s.mu.Lock()
 	if s.state != StateEstablished {
-		s.mu.RUnlock()
+		s.mu.Unlock()
 		return 0, fmt.Errorf("connection not established")
 	}
-	s.mu.RUnlock()
 
 	// Send data packet
 	payload := make([]byte, len(p))
 	copy(payload, p)
+	seq := s.sndNxt
+	s.sndNxt += uint32(len(p))
+	s.mu.Unlock()
+
 	pkt := &packet{
 		Type:    PacketTypeData,
-		Seq:     atomic.AddUint32(&s.sndNxt, uint32(len(p))) - uint32(len(p)),
+		Seq:     seq,
 		Payload: payload,
 	}
 

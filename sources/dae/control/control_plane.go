@@ -57,7 +57,6 @@ type ControlPlane struct {
 	inConnections sync.Map
 
 	dnsController    *DnsController
-	dnsListener      *DNSListener
 	onceNetworkReady sync.Once
 
 	dialMode consts.DialMode
@@ -159,8 +158,8 @@ func NewControlPlane(
 		log.Infof("Loading eBPF programs and maps into the kernel...")
 		log.Infof("The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure.")
 	}
-	// var bpf bpfObjects
-	ProgramOptions := ebpf.ProgramOptions{
+	//var bpf bpfObjects
+	var ProgramOptions = ebpf.ProgramOptions{
 		KernelTypes: nil,
 		LogSize:     ebpf.DefaultVerifierLogSize * 10,
 	}
@@ -228,6 +227,11 @@ func NewControlPlane(
 	if len(global.WanInterface) > 0 {
 		if err = core.setupSkPidMonitor(); err != nil {
 			log.WithError(err).Warnln("cgroup2 is not enabled; pname routing cannot be used")
+		}
+		if global.EnableLocalTcpFastRedirect {
+			if err = core.setupLocalTcpFastRedirect(); err != nil {
+				log.WithError(err).Warnln("failed to setup local tcp fast redirect")
+			}
 		}
 		for _, ifname := range global.WanInterface {
 			if len(global.LanInterface) > 0 {
@@ -460,21 +464,6 @@ func NewControlPlane(
 	}); err != nil {
 		return nil, err
 	}
-
-	// Create and start DNS listener if configured
-	if dnsConfig.Bind != "" {
-		plane.dnsListener, err = NewDNSListener(log, dnsConfig.Bind, plane)
-		if err != nil {
-			return nil, err
-		}
-		if err = plane.dnsListener.Start(); err != nil {
-			log.Errorf("Failed to start DNS listener: %v", err)
-		} else {
-			log.Infof("DNS listener started on %s", dnsConfig.Bind)
-			// Add DNS listener stop to defer functions
-			deferFuncs = append(deferFuncs, plane.dnsListener.Stop)
-		}
-	}
 	// Refresh domain routing cache with new routing.
 	// FIXME: We temperarily disable it because we want to make change of DNS section take effects immediately.
 	// TODO: Add change detection.
@@ -566,7 +555,6 @@ func ParseGroupOverrideOption(group config.Group, global config.Global, log *log
 func (c *ControlPlane) EjectBpf() *bpfObjects {
 	return c.core.EjectBpf()
 }
-
 func (c *ControlPlane) InjectBpf(bpf *bpfObjects) {
 	c.core.InjectBpf(bpf)
 }
@@ -644,7 +632,6 @@ func (c *ControlPlane) ActivateCheck() {
 		}
 	}
 }
-
 func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) (dialTarget string, shouldReroute bool, dialIp bool) {
 	dialMode := consts.DialMode_Ip
 
@@ -711,6 +698,7 @@ func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip
 		} else if _, _, err := net.SplitHostPort(domain); err == nil {
 			// domain is already domain:port
 			dialTarget = domain
+
 		} else {
 			dialTarget = net.JoinHostPort(domain, strconv.Itoa(int(dst.Port())))
 		}
@@ -858,7 +846,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 
 func (c *ControlPlane) ListenAndServe(readyChan chan<- bool, port uint16) (listener *Listener, err error) {
 	// Listen.
-	listenConfig := net.ListenConfig{
+	var listenConfig = net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			return dialer.TproxyControl(c)
 		},
@@ -1004,7 +992,6 @@ func (c *ControlPlane) AbortConnections() (err error) {
 	})
 	return errors.Join(errs...)
 }
-
 func (c *ControlPlane) Close() (err error) {
 	// Invoke defer funcs in reverse order.
 	for i := len(c.deferFuncs) - 1; i >= 0; i-- {
@@ -1019,12 +1006,4 @@ func (c *ControlPlane) Close() (err error) {
 	}
 	c.cancel()
 	return c.core.Close()
-}
-
-// StopDNSListener stops the DNS listener if it's running
-func (c *ControlPlane) StopDNSListener() error {
-	if c.dnsListener != nil {
-		return c.dnsListener.Stop()
-	}
-	return nil
 }

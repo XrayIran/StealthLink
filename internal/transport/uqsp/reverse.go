@@ -6,17 +6,23 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log"
 	mathrand "math/rand"
 	"net"
 	"net/http"
 	"stealthlink/internal/metrics"
+	"stealthlink/internal/transport"
+	"stealthlink/internal/transport/snowflake"
+	"stealthlink/internal/transport/uqsp/rendezvous"
 	"strings"
 	"sync"
 	"time"
@@ -55,22 +61,43 @@ type ReverseMode struct {
 	// HTTP registration improves reverse connectivity behind CDNs/proxies.
 	UseHTTPRegistration bool   `yaml:"use_http_registration"`
 	RegistrationPath    string `yaml:"registration_path"`
+
+	Rendezvous ReverseRendezvous `yaml:"rendezvous"`
+}
+
+// ReverseRendezvous configures an optional HTTP rendezvous broker that can
+// exchange the listener's dialable address out-of-band. This is technique-only.
+type ReverseRendezvous struct {
+	Enabled         bool   `yaml:"enabled"`
+	BrokerURL       string `yaml:"broker_url"`
+	FrontDomain     string `yaml:"front_domain"`
+	UTLSFingerprint string `yaml:"utls_fingerprint"`
 }
 
 // ReverseDialer implements a dialer that works in reverse mode
 type ReverseDialer struct {
-	mode      *ReverseMode
-	tlsConfig *tls.Config
-	dialFn    func(ctx context.Context, network, addr string) (net.Conn, error)
-	connChan  chan net.Conn
-	mu        sync.RWMutex
-	closed    bool
-	stopCh    chan struct{}
-	qualityMu sync.RWMutex
-	quality   ReverseQuality
-	randMu    sync.Mutex
-	rng       *mathrand.Rand
+	mode        *ReverseMode
+	tlsConfig   *tls.Config
+	dialFn      func(ctx context.Context, network, addr string) (net.Conn, error)
+	connChan    chan net.Conn
+	mu          sync.RWMutex
+	closed      bool
+	stopCh      chan struct{}
+	qualityMu   sync.RWMutex
+	quality     ReverseQuality
+	randMu      sync.Mutex
+	rng         *mathrand.Rand
+	nonceCache  *nonceCache
+	authLimiter *transport.PeerRateLimiter
 }
+
+const (
+	reverseAuthVersion       byte          = 1
+	reverseAuthNonceSize                   = 16
+	reverseAuthTimestampSkew time.Duration = 30 * time.Second
+	reverseAuthNonceTTL      time.Duration = 5 * time.Minute
+	reverseAuthMaxNonces                   = 4096
+)
 
 type ReverseQuality struct {
 	Score          float64
@@ -101,12 +128,14 @@ func NewReverseDialerWithDialFunc(mode *ReverseMode, tlsConfig *tls.Config, dial
 		dialFn = dialer.DialContext
 	}
 	return &ReverseDialer{
-		mode:      mode,
-		tlsConfig: tlsConfig,
-		dialFn:    dialFn,
-		connChan:  make(chan net.Conn, 10),
-		stopCh:    make(chan struct{}),
-		rng:       mathrand.New(mathrand.NewSource(seed)),
+		mode:        mode,
+		tlsConfig:   tlsConfig,
+		dialFn:      dialFn,
+		connChan:    make(chan net.Conn, 10),
+		stopCh:      make(chan struct{}),
+		rng:         mathrand.New(mathrand.NewSource(seed)),
+		nonceCache:  newNonceCache(reverseAuthMaxNonces, reverseAuthNonceTTL),
+		authLimiter: transport.NewPeerRateLimiter(6, 2*time.Minute),
 	}
 }
 
@@ -177,8 +206,8 @@ func (d *ReverseDialer) startRendezvous(ctx context.Context) error {
 // startDialer continuously dials the peer (server's behavior in reverse mode)
 func (d *ReverseDialer) startDialer(ctx context.Context) error {
 	addr := d.mode.ClientAddress
-	if addr == "" {
-		return fmt.Errorf("client_address required for dialer role")
+	if addr == "" && !d.mode.Rendezvous.Enabled {
+		return fmt.Errorf("client_address required for dialer role (or enable transport.uqsp.reverse.rendezvous)")
 	}
 
 	go d.dialLoop(ctx, addr)
@@ -214,7 +243,22 @@ func (d *ReverseDialer) dialLoop(ctx context.Context, addr string) {
 		default:
 		}
 
-		conn, err := d.dialWithRetry(addr)
+		target := addr
+		if strings.TrimSpace(target) == "" && d.mode.Rendezvous.Enabled {
+			resolved, rerr := d.pollRendezvous(ctx)
+			if rerr != nil {
+				d.recordFailure(0)
+				time.Sleep(d.backoffWithJitter(currentBackoff, maxBackoff))
+				currentBackoff *= 2
+				if currentBackoff > maxBackoff {
+					currentBackoff = maxBackoff
+				}
+				continue
+			}
+			target = resolved
+		}
+
+		conn, err := d.dialWithRetry(target)
 		if err != nil {
 			retries++
 			metrics.IncReverseReconnectAttempts()
@@ -249,21 +293,31 @@ func (d *ReverseDialer) dialLoop(ctx context.Context, addr string) {
 		currentBackoff = initialBackoff
 		metrics.IncReverseConnectionsActive()
 
+		// Wrap connection to detect Close
+		notifyCh := make(chan struct{})
+		wrappedConn := &notifyCloseConn{Conn: conn, notify: notifyCh}
+
 		// Send the connection to the channel
 		select {
-		case d.connChan <- conn:
+		case d.connChan <- wrappedConn:
 		case <-ctx.Done():
-			conn.Close()
+			wrappedConn.Close()
 			metrics.DecReverseConnectionsActive()
 			return
 		case <-d.stopCh:
-			conn.Close()
+			wrappedConn.Close()
 			metrics.DecReverseConnectionsActive()
 			return
 		}
 
-		// Wait for connection to close before reconnecting
-		d.waitForClose(conn)
+		// Wait for connection to close
+		select {
+		case <-notifyCh:
+		case <-ctx.Done():
+			wrappedConn.Close()
+		case <-d.stopCh:
+			wrappedConn.Close()
+		}
 		metrics.DecReverseConnectionsActive()
 
 		// After connection closes, apply reconnect delay before next attempt
@@ -307,6 +361,7 @@ func (d *ReverseDialer) dialWithRetry(addr string) (net.Conn, error) {
 		tlsConn := tls.Client(conn, d.tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
+			metrics.IncHandshakeFailure()
 			return nil, fmt.Errorf("TLS handshake: %w", err)
 		}
 		conn = tlsConn
@@ -324,6 +379,7 @@ func (d *ReverseDialer) dialWithRetry(addr string) (net.Conn, error) {
 	if d.mode.AuthToken != "" {
 		if err := d.sendAuth(conn); err != nil {
 			conn.Close()
+			metrics.IncHandshakeFailure()
 			d.recordFailure(time.Since(start))
 			return nil, fmt.Errorf("auth failed: %w", err)
 		}
@@ -342,15 +398,22 @@ func contains(s, substr string) bool {
 
 // sendAuth sends authentication token
 func (d *ReverseDialer) sendAuth(conn net.Conn) error {
-	// Simple auth protocol: [4-byte length][token]
 	tokenBytes := []byte(d.mode.AuthToken)
-	length := make([]byte, 4)
-	length[0] = byte(len(tokenBytes) >> 24)
-	length[1] = byte(len(tokenBytes) >> 16)
-	length[2] = byte(len(tokenBytes) >> 8)
-	length[3] = byte(len(tokenBytes))
+	if len(tokenBytes) > 4096 {
+		return fmt.Errorf("token too long")
+	}
 
-	if _, err := conn.Write(length); err != nil {
+	var nonce [reverseAuthNonceSize]byte
+	if _, err := io.ReadFull(cryptorand.Reader, nonce[:]); err != nil {
+		return fmt.Errorf("nonce generation failed: %w", err)
+	}
+
+	header := make([]byte, 1+8+reverseAuthNonceSize)
+	header[0] = reverseAuthVersion
+	binary.BigEndian.PutUint64(header[1:9], uint64(time.Now().UnixNano()))
+	copy(header[9:9+reverseAuthNonceSize], nonce[:])
+
+	if _, err := conn.Write(header); err != nil {
 		return err
 	}
 	if _, err := conn.Write(tokenBytes); err != nil {
@@ -370,11 +433,22 @@ func (d *ReverseDialer) sendAuth(conn net.Conn) error {
 	return nil
 }
 
-// waitForClose waits for a connection to close
-func (d *ReverseDialer) waitForClose(conn net.Conn) {
-	buf := make([]byte, 1)
-	conn.Read(buf) // This will block until connection closes
+// notifyCloseConn wraps a connection and closes a channel when Close is called
+type notifyCloseConn struct {
+	net.Conn
+	notify chan struct{}
+	once   sync.Once
 }
+
+func (c *notifyCloseConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		close(c.notify)
+	})
+	return err
+}
+
+// waitForClose removed (replaced by notifyCloseConn logic)
 
 // startListener starts listening for incoming connections
 // (client's behavior in reverse mode)
@@ -389,8 +463,46 @@ func (d *ReverseDialer) startListener(ctx context.Context) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
+	if d.mode.Rendezvous.Enabled {
+		adv := d.mode.ServerAddress
+		// If we bound :0, register the concrete listener address.
+		if strings.HasSuffix(adv, ":0") {
+			adv = ln.Addr().String()
+		}
+		go d.registerRendezvous(ctx, adv)
+	}
+
 	go d.acceptLoop(ctx, ln)
 	return nil
+}
+
+func (d *ReverseDialer) rendezvousClient() (rendezvous.Client, error) {
+	if !d.mode.Rendezvous.Enabled {
+		return nil, fmt.Errorf("rendezvous not enabled")
+	}
+	return snowflake.NewBrokerRendezvousClient(snowflake.BrokerRendezvousConfig{
+		BrokerURL:       d.mode.Rendezvous.BrokerURL,
+		FrontDomain:     d.mode.Rendezvous.FrontDomain,
+		UTLSFingerprint: d.mode.Rendezvous.UTLSFingerprint,
+		AuthToken:       d.mode.AuthToken,
+	})
+}
+
+func (d *ReverseDialer) registerRendezvous(ctx context.Context, addr string) {
+	client, err := d.rendezvousClient()
+	if err != nil {
+		return
+	}
+	// Keying is broker-specific; we use auth token as the stable key by convention.
+	_ = client.Publish(ctx, d.mode.AuthToken, addr, 0)
+}
+
+func (d *ReverseDialer) pollRendezvous(ctx context.Context) (string, error) {
+	client, err := d.rendezvousClient()
+	if err != nil {
+		return "", err
+	}
+	return client.Poll(ctx, d.mode.AuthToken)
 }
 
 // acceptLoop accepts incoming connections
@@ -435,6 +547,7 @@ func (d *ReverseDialer) handleIncoming(ctx context.Context, conn net.Conn) {
 		tlsConn := tls.Server(conn, d.tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
+			metrics.IncHandshakeFailure()
 			return
 		}
 		conn = tlsConn
@@ -460,33 +573,92 @@ func (d *ReverseDialer) handleIncoming(ctx context.Context, conn net.Conn) {
 
 // verifyAuth verifies the authentication token
 func (d *ReverseDialer) verifyAuth(conn net.Conn) error {
-	// Read length
-	var lengthBuf [4]byte
-	if _, err := io.ReadFull(conn, lengthBuf[:]); err != nil {
+	if d.authLimiter != nil && d.authLimiter.IsLimited(conn) {
+		metrics.IncReverseAuthRejects()
+		metrics.IncHandshakeFailure()
+		_, _ = conn.Write([]byte{0xFF, 0xFF})
+		return fmt.Errorf("reverse auth rate limited")
+	}
+
+	var header [1 + 8 + reverseAuthNonceSize]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		d.recordAuthFailure(conn)
 		return err
 	}
-	length := int(binary.BigEndian.Uint32(lengthBuf[:]))
-	if length > 4096 {
+
+	ver := header[0]
+
+	expected := []byte(d.mode.AuthToken)
+	if len(expected) > 4096 {
+		d.recordAuthFailure(conn)
+		_, _ = conn.Write([]byte{0xFF, 0xFF})
 		return fmt.Errorf("token too long")
 	}
-
-	// Read token
-	token := make([]byte, length)
+	token := make([]byte, len(expected))
 	if _, err := io.ReadFull(conn, token); err != nil {
+		d.recordAuthFailure(conn)
 		return err
 	}
 
-	// Verify
-	expected := []byte(d.mode.AuthToken)
+	if ver == 0x00 {
+		log.Printf("WARNING: reverse auth legacy version=0x00 rejected")
+		d.recordAuthFailure(conn)
+		_, _ = conn.Write([]byte{0xFF, 0xFF})
+		return fmt.Errorf("legacy reverse auth version rejected")
+	}
+	if ver != reverseAuthVersion {
+		d.recordAuthFailure(conn)
+		_, _ = conn.Write([]byte{0xFF, 0xFF})
+		return fmt.Errorf("unsupported auth version")
+	}
+
+	now := time.Now()
+	tsNanos := int64(binary.BigEndian.Uint64(header[1:9]))
+	tsTime := time.Unix(0, tsNanos)
+	if now.Sub(tsTime).Abs() > reverseAuthTimestampSkew {
+		d.recordAuthFailure(conn)
+		_, _ = conn.Write([]byte{0xFF, 0xFF})
+		return fmt.Errorf("auth timestamp outside allowed skew")
+	}
+
+	var nonce16 [reverseAuthNonceSize]byte
+	copy(nonce16[:], header[9:9+reverseAuthNonceSize])
+	if d.nonceCache == nil || !d.nonceCache.Add(nonce16, now) {
+		d.recordAuthFailure(conn)
+		_, _ = conn.Write([]byte{0xFF, 0xFF})
+		return fmt.Errorf("replayed auth nonce")
+	}
 	if len(token) != len(expected) || subtle.ConstantTimeCompare(token, expected) != 1 {
-		// Send rejection
+		d.recordAuthFailure(conn)
 		_, _ = conn.Write([]byte{0xFF, 0xFF})
 		return fmt.Errorf("invalid token")
 	}
 
-	// Send acceptance
+	if d.authLimiter != nil {
+		d.authLimiter.Clear(conn)
+	}
 	_, _ = conn.Write([]byte{0x00, 0x00})
 	return nil
+}
+
+func (d *ReverseDialer) recordAuthFailure(conn net.Conn) {
+	metrics.IncReverseAuthRejects()
+	metrics.IncHandshakeFailure()
+	if d.authLimiter != nil {
+		d.authLimiter.RecordFailure(conn)
+	}
+}
+
+func (d *ReverseDialer) isReplayNonce(nonceBytes []byte, now time.Time) bool {
+	if len(nonceBytes) != reverseAuthNonceSize {
+		return true
+	}
+	var nonce16 [reverseAuthNonceSize]byte
+	copy(nonce16[:], nonceBytes)
+	if d.nonceCache == nil {
+		return true
+	}
+	return !d.nonceCache.Add(nonce16, now)
 }
 
 // Dial simulates a dial operation by returning a pre-established connection
@@ -518,9 +690,14 @@ func (d *ReverseDialer) sendHTTPRegistration(conn net.Conn) error {
 	if path == "" {
 		path = "/_reverse_register"
 	}
+	var nonce [reverseAuthNonceSize]byte
+	if _, err := cryptorand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("generate nonce: %w", err)
+	}
 	payload := map[string]any{
 		"role":      d.mode.Role,
-		"timestamp": time.Now().Unix(),
+		"timestamp": time.Now().UnixNano(),
+		"nonce":     hex.EncodeToString(nonce[:]),
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, "http://reverse.local"+path, io.NopCloser(bytes.NewReader(body)))
@@ -571,6 +748,33 @@ func (d *ReverseDialer) verifyHTTPRegistration(conn net.Conn) (net.Conn, error) 
 			_, _ = io.WriteString(conn, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
 			return nil, fmt.Errorf("invalid registration token")
 		}
+	}
+	var regPayload struct {
+		Timestamp int64  `json:"timestamp"`
+		Nonce     string `json:"nonce"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&regPayload); err != nil {
+		d.recordAuthFailure(conn)
+		_, _ = io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return nil, fmt.Errorf("invalid registration payload: %w", err)
+	}
+	now := time.Now()
+	ts := time.Unix(0, regPayload.Timestamp)
+	if now.Sub(ts).Abs() > reverseAuthTimestampSkew {
+		d.recordAuthFailure(conn)
+		_, _ = io.WriteString(conn, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return nil, fmt.Errorf("registration timestamp skew too large")
+	}
+	nonceBytes, err := hex.DecodeString(regPayload.Nonce)
+	if err != nil || len(nonceBytes) != reverseAuthNonceSize {
+		d.recordAuthFailure(conn)
+		_, _ = io.WriteString(conn, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return nil, fmt.Errorf("invalid registration nonce")
+	}
+	if d.isReplayNonce(nonceBytes, now) {
+		d.recordAuthFailure(conn)
+		_, _ = io.WriteString(conn, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return nil, fmt.Errorf("replayed registration nonce")
 	}
 	_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok")
 	return &bufferedConn{Conn: conn, r: br}, nil

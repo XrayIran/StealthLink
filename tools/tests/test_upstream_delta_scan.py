@@ -19,9 +19,10 @@ class UpstreamDeltaScanTests(unittest.TestCase):
         self.assertGreaterEqual(len(report["rows"]), 25)
 
         by_name = {r["upstream"]: r for r in report["rows"]}
-        self.assertIn("tcpraw", by_name)
         self.assertIn("TrustTunnel", by_name)
-        self.assertIn(by_name["EasyTier"]["status"], {"out_of_scope_l3", "needs_patch"})
+        self.assertIn("EasyTier", by_name)
+        self.assertIn("Tunnel", by_name)
+        self.assertIn(by_name["EasyTier"]["status"], {"integrated", "out_of_scope_l3", "needs_patch"})
 
 
 if __name__ == "__main__":

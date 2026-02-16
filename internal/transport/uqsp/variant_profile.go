@@ -1,6 +1,7 @@
 // Package uqsp — per-variant profile auto-tuning.
 // ApplyVariantProfile normalizes config defaults based on the detected variant
-// (4a–4e) so that each variant gets sensible overlay, congestion, and carrier
+// (HTTP+, TCP+, TLS+, UDP+, TLS) so that each variant gets sensible overlay,
+// congestion, and carrier
 // settings without requiring the operator to configure every knob manually.
 package uqsp
 
@@ -39,7 +40,7 @@ func ApplyVariantProfile(cfg *config.Config) {
 	}
 }
 
-// 4a: XHTTP/TLS — CDN-friendly, anti-DPI baseline
+// HTTP+: XHTTP/TLS — CDN-friendly, anti-DPI baseline
 func applyProfile4a(cfg *config.Config) {
 	u := &cfg.Transport.UQSP
 
@@ -48,7 +49,7 @@ func applyProfile4a(cfg *config.Config) {
 		u.Carrier.Type = "xhttp"
 	}
 
-	// ECH enabled by default for 4a (Encrypted Client Hello)
+	// ECH enabled by default for HTTP+ (Encrypted Client Hello)
 	if !u.Behaviors.ECH.Enabled && u.Behaviors.ECH.PublicName != "" {
 		u.Behaviors.ECH.Enabled = true
 	}
@@ -94,11 +95,11 @@ func applyProfile4a(cfg *config.Config) {
 		}
 	}
 
-	log.Printf("variant 4a profile applied: carrier=%s ech=%t tls_frag=%t vision=%t",
+	log.Printf("variant HTTP+ profile applied: carrier=%s ech=%t tls_frag=%t vision=%t",
 		u.Carrier.Type, u.Behaviors.ECH.Enabled, u.Behaviors.TLSFrag.Enabled, u.Behaviors.Vision.Enabled)
 }
 
-// 4b: RawTCP — obfs4/noize for heavily censored environments
+// TCP+: RawTCP — obfs4/noize for heavily censored environments
 func applyProfile4b(cfg *config.Config) {
 	u := &cfg.Transport.UQSP
 
@@ -133,11 +134,11 @@ func applyProfile4b(cfg *config.Config) {
 		}
 	}
 
-	log.Printf("variant 4b profile applied: carrier=%s obfs4=%t iat=%d awg=%t",
+	log.Printf("variant TCP+ profile applied: carrier=%s obfs4=%t iat=%d awg=%t",
 		u.Carrier.Type, u.Behaviors.Obfs4.Enabled, u.Behaviors.Obfs4.IATMode, u.Behaviors.AWG.Enabled)
 }
 
-// 4c: TLSMirror — lookalike TLS with Reality/ShadowTLS/Mirror overlays
+// TLS+: TLSMirror — lookalike TLS with Reality/ShadowTLS/Mirror overlays
 func applyProfile4c(cfg *config.Config) {
 	u := &cfg.Transport.UQSP
 
@@ -163,7 +164,7 @@ func applyProfile4c(cfg *config.Config) {
 	// Validate Reality keys are present when Reality is enabled
 	if u.Behaviors.Reality.Enabled {
 		if u.Behaviors.Reality.PrivateKey == "" && u.Behaviors.Reality.ServerPublicKey == "" {
-			log.Printf("WARNING: variant 4c Reality overlay enabled but no keys configured")
+			log.Printf("WARNING: variant TLS+ Reality overlay enabled but no keys configured")
 		}
 		if len(u.Behaviors.Reality.ServerNames) == 0 && u.Behaviors.Reality.Dest != "" {
 			u.Behaviors.Reality.ServerNames = []string{u.Behaviors.Reality.Dest}
@@ -176,13 +177,13 @@ func applyProfile4c(cfg *config.Config) {
 			u.Behaviors.ShadowTLS.Version = 3 // default to latest version
 		}
 		if u.Behaviors.ShadowTLS.Password == "" {
-			log.Printf("WARNING: variant 4c ShadowTLS overlay enabled but no password configured")
+			log.Printf("WARNING: variant TLS+ ShadowTLS overlay enabled but no password configured")
 		}
 	}
 
-	// PQ signature overlay for 4c when pq_kem is enabled
+	// PQ signature overlay for TLS+ when pq_kem is enabled
 	if u.Security.PQKEM {
-		log.Printf("variant 4c: PQKEM enabled, post-quantum signature overlay active")
+		log.Printf("variant TLS+: PQKEM enabled, post-quantum signature overlay active")
 	}
 
 	// XMux Rotation limits (Requirement 2.1-2.4)
@@ -201,12 +202,12 @@ func applyProfile4c(cfg *config.Config) {
 		}
 	}
 
-	log.Printf("variant 4c profile applied: carrier=%s reality=%t shadowtls=%t tlsmirror=%t anytls=%t pq=%t",
+	log.Printf("variant TLS+ profile applied: carrier=%s reality=%t shadowtls=%t tlsmirror=%t anytls=%t pq=%t",
 		u.Carrier.Type, u.Behaviors.Reality.Enabled, u.Behaviors.ShadowTLS.Enabled,
 		u.Behaviors.TLSMirror.Enabled, u.Behaviors.AnyTLS.Enabled, u.Security.PQKEM)
 }
 
-// 4d: UDP/QUIC — native datagram support, high-throughput
+// UDP+: UDP/QUIC — native datagram support, high-throughput
 func applyProfile4d(cfg *config.Config) {
 	u := &cfg.Transport.UQSP
 
@@ -228,7 +229,7 @@ func applyProfile4d(cfg *config.Config) {
 		u.Datagrams.RelayMode = "native"
 	}
 
-	// Congestion: brutal by default for 4d (throughput-optimized)
+	// Congestion: brutal by default for UDP+ (throughput-optimized)
 	if u.Congestion.Algorithm == "" {
 		u.Congestion.Algorithm = "brutal"
 		u.Congestion.Pacing = "aggressive"
@@ -242,12 +243,12 @@ func applyProfile4d(cfg *config.Config) {
 		u.Obfuscation.Profile = "salamander"
 	}
 
-	log.Printf("variant 4d profile applied: carrier=%s capsules_udp=%t capsules_ip=%t cc=%s/%s bw=%dMbps",
+	log.Printf("variant UDP+ profile applied: carrier=%s capsules_udp=%t capsules_ip=%t cc=%s/%s bw=%dMbps",
 		u.Carrier.Type, u.Capsules.ConnectUDP, u.Capsules.ConnectIP,
 		u.Congestion.Algorithm, u.Congestion.Pacing, u.Congestion.BandwidthMbps)
 }
 
-// 4e: Trust — maximum stealth behind CDN with CSTP keepalive
+// TLS: Trust — maximum stealth behind CDN with CSTP keepalive
 func applyProfile4e(cfg *config.Config) {
 	u := &cfg.Transport.UQSP
 
@@ -256,7 +257,7 @@ func applyProfile4e(cfg *config.Config) {
 		u.Carrier.Type = "trusttunnel"
 	}
 
-	// CSTP framing enabled by default for 4e
+	// CSTP framing enabled by default for TLS
 	if !u.Behaviors.CSTP.Enabled {
 		u.Behaviors.CSTP.Enabled = true
 		if u.Behaviors.CSTP.DPDInterval == 0 {
@@ -266,7 +267,7 @@ func applyProfile4e(cfg *config.Config) {
 			u.Behaviors.CSTP.MTU = 1360
 		}
 	}
-	// AnyTLS is an optional TLS-profile hardening layer in 4e.
+	// AnyTLS is an optional TLS-profile hardening layer in TLS mode.
 	if !u.Behaviors.AnyTLS.Enabled && u.Behaviors.AnyTLS.Password != "" {
 		u.Behaviors.AnyTLS.Enabled = true
 	}
@@ -286,12 +287,12 @@ func applyProfile4e(cfg *config.Config) {
 		}
 	}
 
-	// Reverse mode + WARP are the default template for 4e
+	// Reverse mode + WARP are the default template for TLS mode.
 	if !u.Reverse.Enabled && cfg.WARP.Enabled {
-		log.Printf("variant 4e: WARP enabled, consider enabling reverse mode for full-stealth")
+		log.Printf("variant TLS: WARP enabled, consider enabling reverse mode for full-stealth")
 	}
 
-	log.Printf("variant 4e profile applied: carrier=%s cstp=%t tls_frag=%t anytls=%t reverse=%t warp=%t",
+	log.Printf("variant TLS profile applied: carrier=%s cstp=%t tls_frag=%t anytls=%t reverse=%t warp=%t",
 		u.Carrier.Type, u.Behaviors.CSTP.Enabled, u.Behaviors.TLSFrag.Enabled,
 		u.Behaviors.AnyTLS.Enabled, u.Reverse.Enabled, cfg.WARP.Enabled)
 }

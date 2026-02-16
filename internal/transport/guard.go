@@ -5,19 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 )
 
-type guardFailState struct {
-	failures int
-	lastFail time.Time
-}
-
-var (
-	guardFailMu sync.Mutex
-	guardFails  = map[string]guardFailState{}
-)
+var guardLimiter = NewPeerRateLimiter(6, 2*time.Minute)
 
 // SendGuard writes a short pre-shared token before higher-level handshakes.
 // No-op when guard is empty. Token length is 1 byte followed by the token.
@@ -73,52 +64,17 @@ func RecvGuard(r net.Conn, guard string) error {
 }
 
 func guardPeerKey(conn net.Conn) string {
-	if conn == nil || conn.RemoteAddr() == nil {
-		return ""
-	}
-	return conn.RemoteAddr().String()
+	return guardLimiter.PeerKey(conn)
 }
 
 func isGuardRateLimited(conn net.Conn) bool {
-	key := guardPeerKey(conn)
-	if key == "" {
-		return false
-	}
-	guardFailMu.Lock()
-	defer guardFailMu.Unlock()
-	state, ok := guardFails[key]
-	if !ok {
-		return false
-	}
-	if time.Since(state.lastFail) > 2*time.Minute {
-		delete(guardFails, key)
-		return false
-	}
-	return state.failures >= 6
+	return guardLimiter.IsLimited(conn)
 }
 
 func recordGuardFailure(conn net.Conn) {
-	key := guardPeerKey(conn)
-	if key == "" {
-		return
-	}
-	guardFailMu.Lock()
-	defer guardFailMu.Unlock()
-	state := guardFails[key]
-	if time.Since(state.lastFail) > 2*time.Minute {
-		state.failures = 0
-	}
-	state.failures++
-	state.lastFail = time.Now()
-	guardFails[key] = state
+	guardLimiter.RecordFailure(conn)
 }
 
 func clearGuardFailures(conn net.Conn) {
-	key := guardPeerKey(conn)
-	if key == "" {
-		return
-	}
-	guardFailMu.Lock()
-	delete(guardFails, key)
-	guardFailMu.Unlock()
+	guardLimiter.Clear(conn)
 }

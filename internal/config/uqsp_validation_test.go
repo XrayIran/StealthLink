@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestApplyUQSPDefaultsSetsCarrierFingerprints(t *testing.T) {
 	cfg := &Config{}
@@ -29,6 +32,20 @@ func TestValidateUQSPRejectsReverseWithoutAuthToken(t *testing.T) {
 	}
 }
 
+func TestValidateUQSPRejectsReverseRendezvousWithoutBrokerURL(t *testing.T) {
+	cfg := &Config{}
+	cfg.ApplyUQSPDefaults()
+	cfg.Transport.Type = "uqsp"
+	cfg.Transport.UQSP.Reverse.Enabled = true
+	cfg.Transport.UQSP.Reverse.Role = "listener"
+	cfg.Transport.UQSP.Reverse.AuthToken = "token"
+	cfg.Transport.UQSP.Reverse.Rendezvous.Enabled = true
+	cfg.Transport.UQSP.Reverse.Rendezvous.BrokerURL = ""
+	if err := cfg.ValidateUQSP(); err == nil {
+		t.Fatal("expected rendezvous broker_url validation error")
+	}
+}
+
 func TestValidateUQSPRejectsMissingCarrierFingerprint(t *testing.T) {
 	cfg := &Config{}
 	cfg.ApplyUQSPDefaults()
@@ -49,13 +66,27 @@ func TestValidateUQSPRuntimeMode(t *testing.T) {
 	}
 }
 
+func TestValidateUQSPRuntimeMaxConcurrentDials(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.ApplyUQSPDefaults()
+	cfg.Transport.UQSP.Runtime.MaxConcurrentDials = 0
+	if err := cfg.ValidateUQSP(); err == nil {
+		t.Fatal("expected runtime.max_concurrent_dials validation error")
+	}
+}
+
 func TestValidateUQSPVariantProfile(t *testing.T) {
 	cfg := &Config{}
 	cfg.Transport.Type = "uqsp"
 	cfg.ApplyUQSPDefaults()
-	cfg.Transport.UQSP.VariantProfile = "4d"
+	cfg.Transport.UQSP.VariantProfile = VariantUDPPlus
 	if err := cfg.ValidateUQSP(); err != nil {
 		t.Fatalf("expected valid variant_profile, got: %v", err)
+	}
+	cfg.Transport.UQSP.VariantProfile = "4d"
+	if err := cfg.ValidateUQSP(); err == nil {
+		t.Fatal("expected legacy 4d variant_profile to be rejected")
 	}
 	cfg.Transport.UQSP.VariantProfile = "bad"
 	if err := cfg.ValidateUQSP(); err == nil {
@@ -67,6 +98,13 @@ func TestUQSPRuntimeModeDefaultsToUnified(t *testing.T) {
 	cfg := &Config{}
 	if got := cfg.UQSPRuntimeMode(); got != "unified" {
 		t.Fatalf("expected unified default runtime mode, got %q", got)
+	}
+	if got := cfg.Transport.UQSP.Runtime.MaxConcurrentDials; got != 0 {
+		t.Fatalf("expected zero value before defaults, got %d", got)
+	}
+	cfg.ApplyUQSPDefaults()
+	if got := cfg.Transport.UQSP.Runtime.MaxConcurrentDials; got != 16 {
+		t.Fatalf("expected default max_concurrent_dials=16, got %d", got)
 	}
 	cfg.Transport.UQSP.Runtime.Mode = "legacy"
 	if got := cfg.UQSPRuntimeMode(); got != "legacy" {
@@ -259,5 +297,94 @@ func TestValidateUQSPRejectsKCPBadBatchSize(t *testing.T) {
 	cfg.Transport.UQSP.Carrier.KCP.BatchSize = 0
 	if err := cfg.ValidateUQSP(); err == nil {
 		t.Fatal("expected kcp batch_size validation error")
+	}
+}
+
+func TestValidateUQSPVariantCarrierValid(t *testing.T) {
+	cases := []struct {
+		variant string
+		carrier string
+	}{
+		{VariantHTTPPlus, "xhttp"},
+		{VariantHTTPPlus, "quic"},
+		{VariantTCPPlus, "faketcp"},
+		{VariantTCPPlus, "icmptun"},
+		{VariantTLSPlus, "xhttp"},
+		{VariantTLSPlus, "anytls"},
+		{VariantUDPPlus, "quic"},
+		{VariantUDPPlus, "masque"},
+		{VariantUDPPlus, "kcp"},
+		{VariantTLS, "trusttunnel"},
+		{VariantTLS, "webtunnel"},
+		{VariantTLS, "anytls"},
+		{VariantTLS, "chisel"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.variant+"_"+tc.carrier, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Transport.Type = "uqsp"
+			cfg.Variant = tc.variant
+			cfg.ApplyUQSPDefaults()
+			cfg.Transport.UQSP.Carrier.Type = tc.carrier
+			// Provide required fields for carriers that need them.
+			if tc.carrier == "anytls" {
+				cfg.Transport.UQSP.Carrier.AnyTLS.Password = "test"
+			}
+			if tc.carrier == "chisel" {
+				cfg.Transport.UQSP.Reverse.Enabled = true
+				cfg.Transport.UQSP.Reverse.AuthToken = "test-token"
+				cfg.Transport.UQSP.Behaviors.CSTP.Enabled = true
+			}
+			if err := cfg.ValidateUQSP(); err != nil {
+				t.Fatalf("expected %s+%s to pass, got: %v", tc.variant, tc.carrier, err)
+			}
+		})
+	}
+}
+
+func TestValidateUQSPVariantCarrierInvalid(t *testing.T) {
+	cases := []struct {
+		variant string
+		carrier string
+	}{
+		{VariantHTTPPlus, "rawtcp"},
+		{VariantHTTPPlus, "trusttunnel"},
+		{VariantTCPPlus, "xhttp"},
+		{VariantTCPPlus, "quic"},
+		{VariantTLSPlus, "rawtcp"},
+		{VariantTLSPlus, "kcp"},
+		{VariantUDPPlus, "trusttunnel"},
+		{VariantUDPPlus, "xhttp"},
+		{VariantTLS, "rawtcp"},
+		{VariantTLS, "quic"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.variant+"_"+tc.carrier, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Transport.Type = "uqsp"
+			cfg.Variant = tc.variant
+			cfg.ApplyUQSPDefaults()
+			cfg.Transport.UQSP.Carrier.Type = tc.carrier
+			err := cfg.ValidateUQSP()
+			if err == nil {
+				t.Fatalf("expected %s+%s to fail", tc.variant, tc.carrier)
+			}
+			if !strings.Contains(err.Error(), "not compatible with variant") {
+				t.Fatalf("expected clear carrier-variant error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateUQSPVariantCarrierSkipsWhenUnset(t *testing.T) {
+	cfg := &Config{}
+	cfg.Transport.Type = "uqsp"
+	cfg.ApplyUQSPDefaults()
+	// No explicit variant set — should skip carrier-variant check.
+	cfg.Transport.UQSP.Carrier.Type = "rawtcp"
+	if err := cfg.ValidateUQSP(); err != nil {
+		if strings.Contains(err.Error(), "not compatible with variant") {
+			t.Fatalf("should skip carrier-variant check when variant is not explicit, got: %v", err)
+		}
 	}
 }

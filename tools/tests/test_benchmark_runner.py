@@ -95,7 +95,7 @@ class BenchmarkRunnerTests(unittest.TestCase):
     def test_load_baseline_metrics_from_profiles_schema_v2(self) -> None:
         structured = {
             "profiles": {
-                "4a": {
+                "HTTP+": {
                     "off": {"tcp_mbps": 100.0, "udp_mbps": 200.0, "latency_ms": 3.0},
                     "on": {"tcp_mbps": 90.0, "udp_mbps": 180.0, "latency_ms": 6.0},
                 }
@@ -105,8 +105,8 @@ class BenchmarkRunnerTests(unittest.TestCase):
             import json
             json.dump(structured, f)
             f.flush()
-            loaded_off = benchmark_runner.load_baseline_metrics(f.name, mode_profile="4a", warp="off")
-            loaded_on = benchmark_runner.load_baseline_metrics(f.name, mode_profile="4a", warp="on")
+            loaded_off = benchmark_runner.load_baseline_metrics(f.name, mode_profile="HTTP+", warp="off")
+            loaded_on = benchmark_runner.load_baseline_metrics(f.name, mode_profile="HTTP+", warp="on")
         self.assertEqual(loaded_off["tcp_mbps"], 100.0)
         self.assertEqual(loaded_off["udp_mbps"], 200.0)
         self.assertEqual(loaded_off["latency_ms"], 3.0)
